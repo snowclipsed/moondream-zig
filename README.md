@@ -1,2 +1,2 @@
-# llm-vis-zig
+# mooondream-zig
 An LLM visualizer in zig.
