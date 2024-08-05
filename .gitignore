@@ -50,4 +50,16 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+
+#object files
+test
+moondream
+*.json
+
+#files
 src/main
+.venv
+src/test.zig
+src/tokenizer.zig
+
