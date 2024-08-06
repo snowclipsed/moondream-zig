@@ -62,4 +62,6 @@ src/main
 .venv
 src/test.zig
 src/tokenizer.zig
+*.bin
+*.safetensors
 

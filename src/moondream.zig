@@ -3,21 +3,29 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const ThreadPool = mem.Thread.Pool;
+
+const DEFAULT_VECTOR_WIDTH: usize = std.simd.suggestVectorLength(f16) orelse 4;
+const simd_align = @alignOf(@Vector(DEFAULT_VECTOR_WIDTH, f16));
+
+comptime {
+    @setFloatMode(.optimized);
+}
+
 // vector math functions
 
 // function taken from cgbur/llama2.zig
 // applies softmax on a vector
-fn softmax(x: []f32) void {
+fn softmax(x: []f16) void {
     assert(x.len > 0);
     // max of x for numerical stability
-    var max: f32 = x[0];
+    var max: f16 = x[0];
     for (x[1..]) |val| {
         if (val > max) {
             max = val;
         }
     }
     // exp and sum
-    var sum: f32 = 0.0;
+    var sum: f16 = 0.0;
     for (x) |*val| {
         val.* = std.math.exp(val.* - max); // https://stackoverflow.com/questions/42599498/numerically-stable-softmax
         sum += val.*;
@@ -28,18 +36,18 @@ fn softmax(x: []f32) void {
     }
 }
 
-// This function accumulates an f32 array b into another f32 array a
-fn accumulate(a: []f32, b: []f32) void {
+// This function accumulates an f16 array b into another f16 array a
+fn accumulate(a: []f16, b: []f16) void {
     assert(a.len == b.len);
     for (0..a.len) |i| {
         a[i] += b[i];
     }
 }
 
-// Returns index of the max value in an f32 array
-fn argmax(x: []f32) usize {
+// Returns index of the max value in an f16 array
+fn argmax(x: []f16) usize {
     assert(x.len > 0);
-    var max: f32 = x[0];
+    var max: f16 = x[0];
     var maxi: usize = 0;
     for (1..x.len) |i| {
         if (x[i] > max) {
@@ -50,7 +58,98 @@ fn argmax(x: []f32) usize {
     return maxi;
 }
 
+//config
+
+// const ConfigReader = extern struct {
+//     const Self = @This();
+//     dim: i32, // transformer dimension
+//     hidden_dim: i32, // for ffn layers
+//     n_layers: i32, // number of layers
+//     n_heads: i32, // number of query heads
+//     n_kv_heads: i32, // number of key/value heads (can be < query heads because of multiquery)
+//     vocab_size: i32, // vocabulary size, usually 256 (byte-level)
+//     seq_len: i32, // max sequence length
+
+//     fn config(self: Self) Config {
+//         return Config{
+//             .dim = @intCast(self.dim),
+//             .hidden_dim = @intCast(self.hidden_dim),
+//             .n_layers = @intCast(self.n_layers),
+//             .n_heads = @intCast(self.n_heads),
+//             .n_kv_heads = @intCast(self.n_kv_heads),
+//             .vocab_size = @intCast(self.vocab_size),
+//             .seq_len = @intCast(self.seq_len),
+//         };
+//     }
+// };
+
+const Config = struct {
+
+    // TODO: Add stuff to config as required
+    //text
+    dim: usize, //text transformer dim, 2048
+    hidden_dim: usize, // hidden fc dim
+    n_layers: usize, //number of transformer layers, 24 for text model
+    n_heads: usize, //number of attn heads per layer
+    head_dim: usize, //size of attn heads per layer
+    seq_len: usize, // sequence length, 2048
+
+    // vision
+    img_channels: usize, // number of channels per patch, RGB has 3
+    img_dim: usize,
+    patch_size: usize, // size of patch, 14x14 default
+    vit_dim: usize, // width of each patch embedding created from linear patch embedding layer, 1152 default
+    hidden_features: usize,
+};
+
 // weights
+/// Struct defines the weights of moondream
+/// All weights are transposed
+/// Naming convention :
+/// "t_" prefix : text_model (phi 1.5)
+/// "v_" prefix : vision_model (vision encoder)
+/// "_w" suffix : weights
+/// "_b" suffix : biases
+const Weights = struct {
+    //text model weights
+    word_token_embedding: [*]f16, //(dim, vocab_size)
+    //attn layer norm
+    t_ln_w: [*]f16, // (layer, dim)
+    t_ln_b: [*]f16, // (layer, dim)
+    //attn qkv
+    t_Wqkv_w: [*]f16, // (layer, dim, n_heads*head_dim*3)
+    t_Wqkv_b: [*]f16, // (layer, n_heads*head_dim*3)
+    //fully connected
+    t_fc1_w: [*]f16, // (layer, hidden_dim, dim)
+    t_fc1_b: [*]f16, // (layer, hidden_dim)
+    t_fc2_w: [*]f16, // (layer, dim, hidden_dim)
+    t_fc2_b: [*]f16, // (layer, dim)
+    // output
+    t_out_proj_w: [*]f16, // (layer, seqlen, dim)
+    t_out_proj_bias: [*]f16, // (layer, dim)
+
+    // vision model weights;
+    v_patch_embedding_linear_w: [*]f16, // (vit_dim, patch_size * path_size * channels)
+    v_patch_embedding_linear_b: [*]f16, // (vit_dim)
+
+    v_pos_embedding: [*]f16, // (1, (img_dim/patch_dim)^2, vit_dim)
+    // (img_dim/patch_dim)^2 is basically the number of patches in an image of size img_dim x img_dim
+    // the first dim 1 allows it to be broadcast across all the images in a batch
+    // this is useful if we break down a larger image into multiple images of img_dim x img_dim
+
+    v_Wqkv_w: [*]f16, // (vit_dim, vit_dim*3)
+    v_Wqkv_b: [*]f16, // (vit_dim * 3)
+
+    v_fc1_w: [*]f16, // (hidden_features, vit_dim)
+    v_fc1_b: [*]f16, // (hidden_features)
+
+    v_fc2_w: [*]f16, // (vit_dim, hidden_features)
+    v_fc2_b: [*]f16, // (vit_dim)
+
+    v_out_proj_w: [*]f16, // (vit_dim, vit_dim)
+    v_out_proj_b: [*]f16, // (vit_dim)
+
+};
 
 // runstate
 
@@ -197,11 +296,11 @@ const Tokenizer = struct {
 
 // tests
 test "softmax" {
-    var x = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var x = [_]f16{ 1.0, 2.0, 3.0, 4.0 };
 
     softmax(&x);
 
-    var sum: f32 = 0.0;
+    var sum: f16 = 0.0;
     for (0..x.len) |value| {
         sum += x[value];
     }
@@ -224,6 +323,7 @@ test "tokenizer" {
     try std.testing.expectEqual(null, tokenizer.lookup("AAAAAAAAAAAAAAAA")); // null value check
     try std.testing.expectEqual(50256, tokenizer.lookup("<|endoftext|>")); // null value check
 
+    // checking encoding
     const input: []const u8 = "Moondream is a small VLM that punches above its weight.";
     const tokenization = try tokenizer.encode(input);
     const tokenization_slice: []u32 = tokenization.items;
