@@ -56,12 +56,17 @@ dkms.conf
 test
 moondream
 *.json
+*.bin
+*.safetensors
+.zig-cache
+zig-out/
+
 
 #files
 src/main
 .venv
 src/test.zig
 src/tokenizer.zig
-*.bin
-*.safetensors
+
+OpenBLAS
 
