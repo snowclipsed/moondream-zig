@@ -182,6 +182,12 @@ const Weights = struct {
         self.t_Wqkv_b = self.memory[offset .. offset + sizes.t_Wqkv_b];
         offset += sizes.t_Wqkv_b;
 
+        self.t_out_proj_w = self.memory[offset .. offset + sizes.t_out_proj_w];
+        offset += sizes.t_out_proj_w;
+
+        self.t_out_proj_bias = self.memory[offset .. offset + sizes.t_out_proj_bias];
+        offset += sizes.t_out_proj_bias;
+
         self.t_fc1_w = self.memory[offset .. offset + sizes.t_fc1_w];
         offset += sizes.t_fc1_w;
 
@@ -193,12 +199,6 @@ const Weights = struct {
 
         self.t_fc2_b = self.memory[offset .. offset + sizes.t_fc2_b];
         offset += sizes.t_fc2_b;
-
-        self.t_out_proj_w = self.memory[offset .. offset + sizes.t_out_proj_w];
-        offset += sizes.t_out_proj_w;
-
-        self.t_out_proj_bias = self.memory[offset .. offset + sizes.t_out_proj_bias];
-        offset += sizes.t_out_proj_bias;
 
         self.v_patch_embedding_linear_w = self.memory[offset .. offset + sizes.v_patch_embedding_linear_w];
         offset += sizes.v_patch_embedding_linear_w;
@@ -215,6 +215,12 @@ const Weights = struct {
         self.v_Wqkv_b = self.memory[offset .. offset + sizes.v_Wqkv_b];
         offset += sizes.v_Wqkv_b;
 
+        self.v_out_proj_w = self.memory[offset .. offset + sizes.v_out_proj_w];
+        offset += sizes.v_out_proj_w;
+
+        self.v_out_proj_b = self.memory[offset .. offset + sizes.v_out_proj_b];
+        offset += sizes.v_out_proj_b;
+
         self.v_fc1_w = self.memory[offset .. offset + sizes.v_fc1_w];
         offset += sizes.v_fc1_w;
 
@@ -226,12 +232,6 @@ const Weights = struct {
 
         self.v_fc2_b = self.memory[offset .. offset + sizes.v_fc2_b];
         offset += sizes.v_fc2_b;
-
-        self.v_out_proj_w = self.memory[offset .. offset + sizes.v_out_proj_w];
-        offset += sizes.v_out_proj_w;
-
-        self.v_out_proj_b = self.memory[offset .. offset + sizes.v_out_proj_b];
-        offset += sizes.v_out_proj_b;
 
         return self;
     }
@@ -278,12 +278,12 @@ const Weights = struct {
             .v_pos_embedding_size = 1 * ((config.img_dim / config.patch_size) * (config.img_dim / config.patch_size)) * config.vit_dim,
             .v_Wqkv_w_size = config.vit_dim * config.vit_dim * 3,
             .v_Wqkv_b_size = config.vit_dim * 3,
+            .v_out_proj_w_size = config.vit_dim * config.vit_dim,
+            .v_out_proj_b_size = config.vit_dim,
             .v_fc1_w_size = config.hidden_features * config.vit_dim,
             .v_fc1_b_size = config.hidden_features,
             .v_fc2_w_size = config.vit_dim * config.hidden_features,
             .v_fc2_b_size = config.vit_dim,
-            .v_out_proj_w_size = config.vit_dim * config.vit_dim,
-            .v_out_proj_b_size = config.vit_dim,
         };
     }
 
@@ -439,6 +439,10 @@ const Tokenizer = struct {
 
 // inference
 
+// main
+
+pub fn main() !void {}
+
 // tests
 test "softmax" {
     var x = [_]f16{ 1.0, 2.0, 3.0, 4.0 };
@@ -479,3 +483,5 @@ test "tokenizer" {
         try std.testing.expect(token == expected_tokenization[i]);
     }
 }
+
+// main
