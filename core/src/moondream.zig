@@ -58,7 +58,7 @@ fn argmax(x: []f16) usize {
 
 const ConfigReader = extern struct {
     const Self = @This();
-    vocab_size: i32, // vocabulary size, usually 256 (byte-level)
+    vocab: i32, // vocabulary size, usually 256 (byte-level)
     dim: i32, // transformer dimension
     hidden_dim: i32, // for ffn layers
     n_layers: i32, // number of transformer layers, 24 for text model
@@ -69,13 +69,13 @@ const ConfigReader = extern struct {
     // vision
     img_channels: i32, // number of channels per patch, RGB has 3
     img_dim: i32,
-    patch_size: i32, // size of patch, 14x14 default
+    patch: i32, // size of patch, 14x14 default
     vit_dim: i32, // width of each patch embedding created from linear patch embedding layer, 1152 default
     hidden_features: i32, // the number of hidden features, equivalent to hidden_dim in text model, 4304 default
 
     fn config(self: Self) Config {
         return Config{
-            .vocab_size = @intCast(self.vocab_size),
+            .vocab = @intCast(self.vocab),
             .dim = @intCast(self.dim),
             .hidden_dim = @intCast(self.hidden_dim),
             .n_layers = @intCast(self.n_layers),
@@ -84,7 +84,7 @@ const ConfigReader = extern struct {
             .seq_len = @intCast(self.seq_len),
             .img_channels = @intCast(self.img_channels),
             .img_dim = @intCast(self.img_dim),
-            .patch_size = @intCast(self.patch_size),
+            .patch = @intCast(self.patch),
             .vit_dim = @intCast(self.vit_dim),
             .hidden_features = @intCast(self.hidden_features),
         };
@@ -95,7 +95,7 @@ const Config = struct {
 
     // TODO: Add stuff to config as required
     //text
-    vocab_size: usize,
+    vocab: usize,
     dim: usize, //text transformer dim, 2048
     hidden_dim: usize, // hidden fc dim
     n_layers: usize, //number of transformer layers, 24 for text model
@@ -106,7 +106,7 @@ const Config = struct {
     // vision
     img_channels: usize, // number of channels per patch, RGB has 3
     img_dim: usize,
-    patch_size: usize, // size of patch, 14x14 default
+    patch: usize, // size of patch, 14x14 default
     vit_dim: usize, // width of each patch embedding created from linear patch embedding layer, 1152 default
     hidden_features: usize,
 };
@@ -125,41 +125,72 @@ const Weights = struct {
     memory: []f16,
 
     // Slices for specific weights
-    //text model weights
 
-    word_token_embedding: []f16, // (dim, vocab_size)
+    ///Text model start///
+    word_token_embedding: []f16, // (dim, vocab)
+
+    /// Transformer layer start
+
     // attn layer norm
     t_ln_w: []f16, // (layer, dim)
     t_ln_b: []f16, // (layer, dim)
     // attn qkv
     t_Wqkv_w: []f16, // (layer, dim, n_heads*head_dim*3)
     t_Wqkv_b: []f16, // (layer, n_heads*head_dim*3)
+    // output
+    t_out_proj_w: []f16, // (layer, seqlen, dim)
+    t_out_proj_bias: []f16, // (layer, dim)
     // fully connected
     t_fc1_w: []f16, // (layer, hidden_dim, dim)
     t_fc1_b: []f16, // (layer, hidden_dim)
     t_fc2_w: []f16, // (layer, dim, hidden_dim)
     t_fc2_b: []f16, // (layer, dim)
-    // output
-    t_out_proj_w: []f16, // (layer, seqlen, dim)
-    t_out_proj_bias: []f16, // (layer, dim)
-    // vision model weights
-    v_patch_embedding_linear_w: []f16, // (vit_dim, patch_size * patch_size * channels)
+
+    ///Transformer layer end ///
+
+    // lm head
+    t_linear_w: []f16, //(vocab, dim)
+    t_linear_b: []f16, //(vocab)
+    t_ln_out_w: []f16, //(dim)
+    t_ln_out_b: []f16, //(dim)
+    //Text model end///
+
+    /// Vision model start ///
+
+    // combining patch embeddngs and pos
+    v_patch_embedding_linear_w: []f16, // (vit_dim, patch * patch * channels)
     v_patch_embedding_linear_b: []f16, // (vit_dim)
     v_pos_embedding: []f16, // (1, (img_dim/patch_dim)^2, vit_dim)
+
+    /// Vision Transformer Start
+    // attention qkv
     v_Wqkv_w: []f16, // (vit_dim, vit_dim*3)
     v_Wqkv_b: []f16, // (vit_dim * 3)
+
+    //attn out
+    v_out_proj_w: []f16, // (vit_dim, vit_dim)
+    v_out_proj_b: []f16, // (vit_dim)
+
+    //ViT fc
     v_fc1_w: []f16, // (hidden_features, vit_dim)
     v_fc1_b: []f16, // (hidden_features)
     v_fc2_w: []f16, // (vit_dim, hidden_features)
     v_fc2_b: []f16, // (vit_dim)
-    v_out_proj_w: []f16, // (vit_dim, vit_dim)
-    v_out_proj_b: []f16, // (vit_dim)
+
+    //ViT norm
+    v_norm1_w: []f16, // (hidden_features)
+    v_norm1_b: []f16, // (hidden_features)
+    v_norm2_w: []f16, // (hidden_features)
+    v_norm2_b: []f16, // (hidden_features)
+
+    // Vision Transformer End
+    // projection
 
     fn init(config: *const Config, data: []const u8) !Weights {
         const sizes = calculateSizes(config);
-        const total_size = calculateTotalSize(config);
+        const total = calculateTotalSize(config);
 
-        if (data.len < total_size * @sizeOf(f16)) {
+        if (data.len < total * @sizeOf(f16)) {
             return error.InsufficientData;
         }
         var self: Weights = undefined;
@@ -168,6 +199,8 @@ const Weights = struct {
 
         // Set slices for each weight
         self.word_token_embedding = self.memory[offset .. offset + sizes.word_token_embedding];
+
+        // text model
         offset += sizes.word_token_embedding;
 
         self.t_ln_w = self.memory[offset .. offset + sizes.t_ln_w];
@@ -199,6 +232,20 @@ const Weights = struct {
 
         self.t_fc2_b = self.memory[offset .. offset + sizes.t_fc2_b];
         offset += sizes.t_fc2_b;
+
+        self.t_linear_w = self.memory[offset .. offset + sizes.t_linear_w];
+        offset += sizes.t_linear_w;
+
+        self.t_linear_b = self.memory[offset .. offset + sizes.t_linear_b];
+        offset += sizes.t_linear_b;
+
+        self.t_ln_out_w = self.memory[offset .. offset + sizes.t_ln_out_w];
+        offset += sizes.t_ln_out_w;
+
+        self.t_ln_out_b = self.memory[offset .. offset + sizes.t_ln_out_b];
+        offset += sizes.t_ln_out_b;
+
+        // vision model
 
         self.v_patch_embedding_linear_w = self.memory[offset .. offset + sizes.v_patch_embedding_linear_w];
         offset += sizes.v_patch_embedding_linear_w;
@@ -233,57 +280,89 @@ const Weights = struct {
         self.v_fc2_b = self.memory[offset .. offset + sizes.v_fc2_b];
         offset += sizes.v_fc2_b;
 
+        self.v_norm1_w = self.memory[offset .. offset + sizes.v_norm1_w];
+        offset += sizes.v_norm1_w;
+
+        self.v_norm1_b = self.memory[offset .. offset + sizes.v_norm1_b];
+        offset += sizes.v_norm1_b;
+
+        self.v_norm2_w = self.memory[offset .. offset + sizes.v_norm2_w];
+        offset += sizes.v_norm2_w;
+
+        self.v_norm2_b = self.memory[offset .. offset + sizes.v_norm2_b];
+        offset += sizes.v_norm2_b;
         return self;
     }
 
     fn calculateSizes(config: Config) struct {
-        word_token_embedding_size: usize,
-        t_ln_w_size: usize,
-        t_ln_b_size: usize,
-        t_Wqkv_w_size: usize,
-        t_Wqkv_b_size: usize,
-        t_fc1_w_size: usize,
-        t_fc1_b_size: usize,
-        t_fc2_w_size: usize,
-        t_fc2_b_size: usize,
-        t_out_proj_w_size: usize,
-        t_out_proj_bias_size: usize,
-        v_patch_embedding_linear_w_size: usize,
-        v_patch_embedding_linear_b_size: usize,
-        v_pos_embedding_size: usize,
-        v_Wqkv_w_size: usize,
-        v_Wqkv_b_size: usize,
-        v_fc1_w_size: usize,
-        v_fc1_b_size: usize,
-        v_fc2_w_size: usize,
-        v_fc2_b_size: usize,
-        v_out_proj_w_size: usize,
-        v_out_proj_b_size: usize,
+        //text
+        word_token_embedding: usize,
+        t_ln_w: usize,
+        t_ln_b: usize,
+        t_Wqkv_w: usize,
+        t_Wqkv_b: usize,
+        t_fc1_w: usize,
+        t_fc1_b: usize,
+        t_fc2_w: usize,
+        t_fc2_b: usize,
+        t_out_proj_w: usize,
+        t_out_proj_bias: usize,
+        t_linear_w: usize,
+        t_linear_b: usize,
+        t_ln_out_w: usize,
+        t_ln_out_b: usize,
+        // vision
+        v_patch_embedding_linear_w: usize,
+        v_patch_embedding_linear_b: usize,
+        v_pos_embedding: usize,
+        v_Wqkv_w: usize,
+        v_Wqkv_b: usize,
+        v_fc1_w: usize,
+        v_fc1_b: usize,
+        v_fc2_w: usize,
+        v_fc2_b: usize,
+        v_out_proj_w: usize,
+        v_out_proj_b: usize, //TODO : move this up before fc1_w
+        v_norm1_w: usize,
+        v_norm1_b: usize,
+        v_norm2_w: usize,
+        v_norm2_b: usize,
     } {
         return .{
             // TODO : Recheck this once
-            .word_token_embedding_size = config.dim * config.vocab_size,
-            .t_ln_w_size = config.n_layers * config.dim,
-            .t_ln_b_size = config.n_layers * config.dim,
-            .t_Wqkv_w_size = config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
-            .t_Wqkv_b_size = config.n_layers * config.n_heads * config.head_dim * 3,
-            .t_fc1_w_size = config.n_layers * config.hidden_dim * config.dim,
-            .t_fc1_b_size = config.n_layers * config.hidden_dim,
-            .t_fc2_w_size = config.n_layers * config.dim * config.hidden_dim,
-            .t_fc2_b_size = config.n_layers * config.dim,
-            .t_out_proj_w_size = config.n_layers * config.seq_len * config.dim,
-            .t_out_proj_bias_size = config.n_layers * config.dim,
-            .v_patch_embedding_linear_w_size = config.vit_dim * config.patch_size * config.patch_size * config.img_channels,
-            .v_patch_embedding_linear_b_size = config.vit_dim,
-            .v_pos_embedding_size = 1 * ((config.img_dim / config.patch_size) * (config.img_dim / config.patch_size)) * config.vit_dim,
-            .v_Wqkv_w_size = config.vit_dim * config.vit_dim * 3,
-            .v_Wqkv_b_size = config.vit_dim * 3,
-            .v_out_proj_w_size = config.vit_dim * config.vit_dim,
-            .v_out_proj_b_size = config.vit_dim,
-            .v_fc1_w_size = config.hidden_features * config.vit_dim,
-            .v_fc1_b_size = config.hidden_features,
-            .v_fc2_w_size = config.vit_dim * config.hidden_features,
-            .v_fc2_b_size = config.vit_dim,
+            // text model
+            .word_token_embedding = config.dim * config.vocab,
+            .t_ln_w = config.n_layers * config.dim,
+            .t_ln_b = config.n_layers * config.dim,
+            .t_Wqkv_w = config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
+            .t_Wqkv_b = config.n_layers * config.n_heads * config.head_dim * 3,
+            .t_fc1_w = config.n_layers * config.hidden_dim * config.dim,
+            .t_fc1_b = config.n_layers * config.hidden_dim,
+            .t_fc2_w = config.n_layers * config.dim * config.hidden_dim,
+            .t_fc2_b = config.n_layers * config.dim,
+            .t_out_proj_w = config.n_layers * config.seq_len * config.dim,
+            .t_out_proj_bias = config.n_layers * config.dim,
+            .t_linear_w = config.vocab * config.dim,
+            .t_linear_b = config.vocab,
+            .t_ln_out_w = config.dim,
+            .t_ln_out_b = config.dim,
+
+            //vision model
+            .v_patch_embedding_linear_w = config.vit_dim * config.patch * config.patch * config.img_channels,
+            .v_patch_embedding_linear_b = config.vit_dim,
+            .v_pos_embedding = 1 * ((config.img_dim / config.patch) * (config.img_dim / config.patch)) * config.vit_dim,
+            .v_Wqkv_w = config.vit_dim * config.vit_dim * 3,
+            .v_Wqkv_b = config.vit_dim * 3,
+            .v_out_proj_w = config.vit_dim * config.vit_dim,
+            .v_out_proj_b = config.vit_dim,
+            .v_fc1_w = config.hidden_features * config.vit_dim,
+            .v_fc1_b = config.hidden_features,
+            .v_fc2_w = config.vit_dim * config.hidden_features,
+            .v_fc2_b = config.vit_dim,
+            .v_norm1_w = config.hidden_features,
+            .v_norm1_b = config.hidden_features,
+            .v_norm2_w = config.hidden_features,
+            .v_norm2_b = config.hidden_features,
         };
     }
 
