@@ -3,9 +3,12 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Thread = std.Thread;
-const c = @cImport({
-    @cInclude("ggml.h");
-});
+// const c = @cImport({
+//     @cInclude("ggml.h");
+// });
+
+// TODO: Remove GGML eventually.
+
 // vector math functions
 
 // function taken from cgbur/llama2.zig
@@ -58,6 +61,8 @@ fn argmax(x: []f16) usize {
 
 const ConfigReader = extern struct {
     const Self = @This();
+
+    // Text model
     vocab: i32, // vocabulary size, usually 256 (byte-level)
     dim: i32, // transformer dimension
     hidden_dim: i32, // for ffn layers
@@ -68,10 +73,12 @@ const ConfigReader = extern struct {
 
     // vision
     img_channels: i32, // number of channels per patch, RGB has 3
-    img_dim: i32,
-    n_vit_layers: i32,
-    patch: i32, // size of patch, 14x14 default
+    img_dim: i32, // dimension of the the image, 378x378 default
+    patch_size: i32, // size of patch, 14x14 default
     vit_dim: i32, // width of each patch embedding created from linear patch embedding layer, 1152 default
+    n_vit_layers: i32,
+    n_vit_heads: i32,
+    vit_head_dim: i32,
     hidden_features: i32, // the number of hidden features, equivalent to hidden_dim in text model, 4304 default
 
     fn config(self: Self) Config {
@@ -85,9 +92,11 @@ const ConfigReader = extern struct {
             .seq_len = @intCast(self.seq_len),
             .img_channels = @intCast(self.img_channels),
             .img_dim = @intCast(self.img_dim),
-            .n_vit_layers = @intCast(self.n_vit_layers),
-            .patch = @intCast(self.patch),
+            .patch_size = @intCast(self.patch_size),
             .vit_dim = @intCast(self.vit_dim),
+            .n_vit_layers = @intCast(self.n_vit_layers),
+            .n_vit_heads = @intCast(self.n_vit_heads),
+            .vit_head_dim = @intCast(self.vit_head_dim),
             .hidden_features = @intCast(self.hidden_features),
         };
     }
@@ -95,27 +104,26 @@ const ConfigReader = extern struct {
 
 const Config = struct {
 
-    // TODO: Add stuff to config as required
-    //text
+    // Text Model
     vocab: usize,
     dim: usize, //text transformer dim, 2048
     hidden_dim: usize, // hidden fc dim
     n_layers: usize, //number of transformer layers, 24 for text model
     n_heads: usize, //number of attn heads per layer
-    head_dim: usize, //size of attn heads per layer
+    head_dim: usize, //size of attn heads
     seq_len: usize, // sequence length, 2048
 
-    // vision
+    // Vision Model
     img_channels: usize, // number of channels per patch, RGB has 3
     img_dim: usize, // dimension of the the image, 378x378 default
-    //TODO : add number of vision transformer layers
-    n_vit_layers: usize, // number of ViT layers, 27 default for the vision model
-    patch: usize, // size of patch, 14x14 default
+    patch_size: usize, // size of patch, 14x14 default
     vit_dim: usize, // width of each patch embedding created from linear patch embedding layer, 1152 default
-    hidden_features: usize,
+    n_vit_layers: usize, // number of ViT layers, 27 default for the vision model
+    n_vit_heads: usize, // number of attn heads for each attn layer, 16 default
+    vit_head_dim: usize, // size of each attn head, 72 default
+    hidden_features: usize, // size of hidden features in ViT fc layers, 4304 in length
 };
 
-// weights
 /// Struct defines the weights of moondream
 /// All weights are transposed
 /// Naming convention :
@@ -133,7 +141,7 @@ const Weights = struct {
     ///Text model start///
     word_token_embedding: []f16, // (dim, vocab)
 
-    /// Transformer layer start
+    // Transformer layer start
 
     // attn layer norm
     t_ln_w: []f16, // (layer, dim)
@@ -150,7 +158,7 @@ const Weights = struct {
     t_fc2_w: []f16, // (layer, dim, hidden_dim)
     t_fc2_b: []f16, // (layer, dim)
 
-    ///Transformer layer end ///
+    //Transformer layer end //
 
     // lm head
     t_linear_w: []f16, //(vocab, dim)
@@ -159,7 +167,7 @@ const Weights = struct {
     t_ln_out_b: []f16, //(dim)
     //Text model end///
 
-    /// Vision model start ///
+    // Vision model start //
 
     // combining patch embeddngs and pos
     v_patch_embedding_linear_w: []f16, // (vit_dim, patch * patch * channels)
@@ -211,6 +219,7 @@ const Weights = struct {
         self.memory = @alignCast(@ptrCast(data));
         var offset: usize = 0;
 
+        // Memory mapping of slices
         // Set slices for each weight
         self.word_token_embedding = self.memory[offset .. offset + sizes.word_token_embedding];
 
@@ -391,14 +400,13 @@ const Weights = struct {
             .t_ln_out_b = config.dim,
 
             //Vision model
-            //TODO: Multiply the number of layers with the repeating vision block tensor sizes
-            .v_patch_embedding_linear_w = config.vit_dim * config.patch * config.patch * config.img_channels,
+            .v_patch_embedding_linear_w = config.vit_dim * config.patch_size * config.patch_size * config.img_channels,
             .v_patch_embedding_linear_b = config.vit_dim,
-            .v_pos_embedding = 1 * ((config.img_dim / config.patch) * (config.img_dim / config.patch)) * config.vit_dim,
+            .v_pos_embedding = 1 * ((config.img_dim / config.patch_size) * (config.img_dim / config.patch_size)) * config.vit_dim,
 
             // ViT block begins here //
-            .v_Wqkv_w = config.n_vit_layers * config.vit_dim * config.vit_dim * 3,
-            .v_Wqkv_b = config.n_vit_layers * config.vit_dim * 3,
+            .v_Wqkv_w = config.n_vit_layers * config.vit_dim * config.n_vit_heads * config.vit_head_dim * 3,
+            .v_Wqkv_b = config.n_vit_layers * config.n_vit_heads * config.vit_head_dim * 3,
             .v_out_proj_w = config.n_vit_layers * config.vit_dim * config.vit_dim,
             .v_out_proj_b = config.n_vit_layers * config.vit_dim,
             .v_fc1_w = config.n_vit_layers * config.hidden_features * config.vit_dim,
@@ -574,7 +582,27 @@ const Tokenizer = struct {
 
 // main
 
-pub fn main() !void {}
+pub fn main() !void {
+    const bin_path: ?[]const u8 = "../moondream.bin";
+
+    const checkpoint = try std.fs.cwd().openFile(bin_path.?, .{});
+    const filesize = (try checkpoint.stat()).size;
+
+    std.debug.print("Checkpoint loaded with size {}! \n", .{filesize});
+
+    var config_read: ConfigReader = try checkpoint.reader().readStruct(ConfigReader);
+
+    const config = config_read.config();
+
+    std.debug.print("config: {any} \n", .{config});
+    checkpoint.close();
+
+    // var config_read: ConfigReader = try checkpoint.reader().readStruct(ConfigReader);
+
+    // const data : []align(mem.page_size) u8 = blk:{
+    //     const weights_size : usize = file_size - @sizeOf(ConfigReader);
+    // };
+}
 
 // tests
 test "softmax" {
