@@ -69,6 +69,7 @@ const ConfigReader = extern struct {
     // vision
     img_channels: i32, // number of channels per patch, RGB has 3
     img_dim: i32,
+    n_vit_layers: i32,
     patch: i32, // size of patch, 14x14 default
     vit_dim: i32, // width of each patch embedding created from linear patch embedding layer, 1152 default
     hidden_features: i32, // the number of hidden features, equivalent to hidden_dim in text model, 4304 default
@@ -84,6 +85,7 @@ const ConfigReader = extern struct {
             .seq_len = @intCast(self.seq_len),
             .img_channels = @intCast(self.img_channels),
             .img_dim = @intCast(self.img_dim),
+            .n_vit_layers = @intCast(self.n_vit_layers),
             .patch = @intCast(self.patch),
             .vit_dim = @intCast(self.vit_dim),
             .hidden_features = @intCast(self.hidden_features),
@@ -107,6 +109,7 @@ const Config = struct {
     img_channels: usize, // number of channels per patch, RGB has 3
     img_dim: usize, // dimension of the the image, 378x378 default
     //TODO : add number of vision transformer layers
+    n_vit_layers: usize, // number of ViT layers, 27 default for the vision model
     patch: usize, // size of patch, 14x14 default
     vit_dim: usize, // width of each patch embedding created from linear patch embedding layer, 1152 default
     hidden_features: usize,
@@ -366,8 +369,10 @@ const Weights = struct {
     } {
         return .{
             // TODO : Recheck this once
-            // text model
+            // Text model
             .word_token_embedding = config.dim * config.vocab,
+
+            // Transformer block begins here //
             .t_ln_w = config.n_layers * config.dim,
             .t_ln_b = config.n_layers * config.dim,
             .t_Wqkv_w = config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
@@ -378,28 +383,34 @@ const Weights = struct {
             .t_fc2_b = config.n_layers * config.dim,
             .t_out_proj_w = config.n_layers * config.seq_len * config.dim,
             .t_out_proj_bias = config.n_layers * config.dim,
+            // Transformer block ends here //
+
             .t_linear_w = config.vocab * config.dim,
             .t_linear_b = config.vocab,
             .t_ln_out_w = config.dim,
             .t_ln_out_b = config.dim,
 
-            //vision model
+            //Vision model
             //TODO: Multiply the number of layers with the repeating vision block tensor sizes
             .v_patch_embedding_linear_w = config.vit_dim * config.patch * config.patch * config.img_channels,
             .v_patch_embedding_linear_b = config.vit_dim,
             .v_pos_embedding = 1 * ((config.img_dim / config.patch) * (config.img_dim / config.patch)) * config.vit_dim,
-            .v_Wqkv_w = config.vit_dim * config.vit_dim * 3,
-            .v_Wqkv_b = config.vit_dim * 3,
-            .v_out_proj_w = config.vit_dim * config.vit_dim,
-            .v_out_proj_b = config.vit_dim,
-            .v_fc1_w = config.hidden_features * config.vit_dim,
-            .v_fc1_b = config.hidden_features,
-            .v_fc2_w = config.vit_dim * config.hidden_features,
-            .v_fc2_b = config.vit_dim,
-            .v_norm1_w = config.hidden_features,
-            .v_norm1_b = config.hidden_features,
-            .v_norm2_w = config.hidden_features,
-            .v_norm2_b = config.hidden_features,
+
+            // ViT block begins here //
+            .v_Wqkv_w = config.n_vit_layers * config.vit_dim * config.vit_dim * 3,
+            .v_Wqkv_b = config.n_vit_layers * config.vit_dim * 3,
+            .v_out_proj_w = config.n_vit_layers * config.vit_dim * config.vit_dim,
+            .v_out_proj_b = config.n_vit_layers * config.vit_dim,
+            .v_fc1_w = config.n_vit_layers * config.hidden_features * config.vit_dim,
+            .v_fc1_b = config.n_vit_layers * config.hidden_features,
+            .v_fc2_w = config.n_vit_layers * config.vit_dim * config.hidden_features,
+            .v_fc2_b = config.n_vit_layers * config.vit_dim,
+            .v_norm1_w = config.n_vit_layers * config.hidden_features,
+            .v_norm1_b = config.n_vit_layers * config.hidden_features,
+            .v_norm2_w = config.n_vit_layers * config.hidden_features,
+            .v_norm2_b = config.n_vit_layers * config.hidden_features,
+            // ViT block ends here //
+
             .v_norm_out_w = config.hidden_features,
             .v_norm_out_b = config.hidden_features,
             .v_proj_fc1_w = config.hidden_dim * config.hidden_features * 2,
