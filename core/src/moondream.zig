@@ -105,7 +105,8 @@ const Config = struct {
 
     // vision
     img_channels: usize, // number of channels per patch, RGB has 3
-    img_dim: usize,
+    img_dim: usize, // dimension of the the image, 378x378 default
+    //TODO : add number of vision transformer layers
     patch: usize, // size of patch, 14x14 default
     vit_dim: usize, // width of each patch embedding created from linear patch embedding layer, 1152 default
     hidden_features: usize,
@@ -178,13 +179,23 @@ const Weights = struct {
     v_fc2_b: []f16, // (vit_dim)
 
     //ViT norm
-    v_norm1_w: []f16, // (hidden_features)
-    v_norm1_b: []f16, // (hidden_features)
-    v_norm2_w: []f16, // (hidden_features)
-    v_norm2_b: []f16, // (hidden_features)
+    v_norm1_w: []f16, // (layer, hidden_features)
+    v_norm1_b: []f16, // (layer, hidden_features)
+    v_norm2_w: []f16, // (layer, hidden_features)
+    v_norm2_b: []f16, // (layer, hidden_features)
 
     // Vision Transformer End
+
+    //norm
+    v_norm_out_w: []f16, // (hidden_features)
+    v_norm_out_b: []f16, // (hidden_features)
+
     // projection
+    v_proj_fc1_w: []f16, // (hidden_dim, hidden_features * 2)
+    v_proj_fc1_b: []f16, // (hidden_dim)
+
+    v_proj_fc2_w: []f16, // (hidden_features*2, hidden_dim)
+    v_proj_fc2_b: []f16, // (hidden_features)
 
     fn init(config: *const Config, data: []const u8) !Weights {
         const sizes = calculateSizes(config);
@@ -291,6 +302,25 @@ const Weights = struct {
 
         self.v_norm2_b = self.memory[offset .. offset + sizes.v_norm2_b];
         offset += sizes.v_norm2_b;
+
+        self.v_norm_out_w = self.memory[offset .. offset + sizes.v_norm_out_w];
+        offset += sizes.v_norm_out_w;
+
+        self.v_norm_out_b = self.memory[offset .. offset + sizes.v_norm_out_b];
+        offset += sizes.v_norm_out_b;
+
+        self.v_proj_fc1_w = self.memory[offset .. offset + sizes.v_proj_fc1_w];
+        offset += sizes.v_proj_fc1_w;
+
+        self.v_proj_fc1_b = self.memory[offset .. offset + sizes.v_proj_fc1_b];
+        offset += sizes.v_proj_fc1_b;
+
+        self.v_proj_fc2_w = self.memory[offset .. offset + sizes.v_proj_fc2_w];
+        offset += sizes.v_proj_fc2_w;
+
+        self.v_proj_fc2_b = self.memory[offset .. offset + sizes.v_proj_fc2_b];
+        offset += sizes.v_proj_fc2_b;
+
         return self;
     }
 
@@ -327,6 +357,12 @@ const Weights = struct {
         v_norm1_b: usize,
         v_norm2_w: usize,
         v_norm2_b: usize,
+        v_norm_out_w: usize,
+        v_norm_out_b: usize,
+        v_proj_fc1_w: usize,
+        v_proj_fc1_b: usize,
+        v_proj_fc2_w: usize,
+        v_proj_fc2_b: usize,
     } {
         return .{
             // TODO : Recheck this once
@@ -348,6 +384,7 @@ const Weights = struct {
             .t_ln_out_b = config.dim,
 
             //vision model
+            //TODO: Multiply the number of layers with the repeating vision block tensor sizes
             .v_patch_embedding_linear_w = config.vit_dim * config.patch * config.patch * config.img_channels,
             .v_patch_embedding_linear_b = config.vit_dim,
             .v_pos_embedding = 1 * ((config.img_dim / config.patch) * (config.img_dim / config.patch)) * config.vit_dim,
@@ -363,6 +400,12 @@ const Weights = struct {
             .v_norm1_b = config.hidden_features,
             .v_norm2_w = config.hidden_features,
             .v_norm2_b = config.hidden_features,
+            .v_norm_out_w = config.hidden_features,
+            .v_norm_out_b = config.hidden_features,
+            .v_proj_fc1_w = config.hidden_dim * config.hidden_features * 2,
+            .v_proj_fc1_b = config.hidden_dim,
+            .v_proj_fc2_w = config.hidden_features * 2 * config.hidden_dim,
+            .v_proj_fc2_b = config.hidden_features * 2,
         };
     }
 
