@@ -36,18 +36,19 @@ def convert_safetensors_to_custom_binary(input_file, output_file):
         ]
 
         vision_repeat_layers = [
-            ".attn.proj.bias",
-            ".attn.proj.weight",
-            ".attn.qkv.bias",
+            
             ".attn.qkv.weight",
-            ".mlp.fc1.bias",
+            ".attn.qkv.bias",
+            ".attn.proj.weight",
+            ".attn.proj.bias",
             ".mlp.fc1.weight",
-            ".mlp.fc2.bias",
+            ".mlp.fc1.bias",
             ".mlp.fc2.weight",
-            ".norm1.bias",
+            ".mlp.fc2.bias",
             ".norm1.weight",
+            ".norm1.bias",
+            ".norm2.weight",
             ".norm2.bias",
-            ".norm2.weight"
         ]
 
         vision_end_layers=[
@@ -80,6 +81,7 @@ def convert_safetensors_to_custom_binary(input_file, output_file):
                     np_array = np_array.astype(np.float16)
                 
                 # Write the tensor data directly to the file
+                print(tensor_name, np_array.shape)
                 out_f.write(np_array.tobytes())
 
             # Text model repeat layers for the repeating transformer blocks
@@ -90,10 +92,10 @@ def convert_safetensors_to_custom_binary(input_file, output_file):
                         tensor = f.get_tensor(tensor_name)
                         np_array = tensor.numpy()
                         
-
+                        
                         if np_array.dtype != np.float16:
                             np_array = np_array.astype(np.float16)
-                        
+                        print(tensor_name, np_array.shape)
                         out_f.write(np_array.tobytes())
                     else:
                         print(f"Warning: Tensor {tensor_name} not found in the safetensors file.")
@@ -107,7 +109,7 @@ def convert_safetensors_to_custom_binary(input_file, output_file):
                     # Ensure the data is in float16 format
                     if np_array.dtype != np.float16:
                         np_array = np_array.astype(np.float16)
-                    
+                    print(tensor_name, np_array.shape)
                     # Write the tensor data directly to the file
                     out_f.write(np_array.tobytes())
                 else:
@@ -122,7 +124,7 @@ def convert_safetensors_to_custom_binary(input_file, output_file):
                     # Ensure the data is in float16 format
                     if np_array.dtype != np.float16:
                         np_array = np_array.astype(np.float16)
-                    
+                    print(tensor_name, np_array.shape)
                     # Write the tensor data directly to the file
                     out_f.write(np_array.tobytes())
                 else:
@@ -139,7 +141,7 @@ def convert_safetensors_to_custom_binary(input_file, output_file):
                         # Ensure the data is in float16 format
                         if np_array.dtype != np.float16:
                             np_array = np_array.astype(np.float16)
-                        
+                        print(tensor_name, np_array.shape)
                         # Write the tensor data directly to the file
                         out_f.write(np_array.tobytes())
                     else:
@@ -155,7 +157,22 @@ def convert_safetensors_to_custom_binary(input_file, output_file):
                     # Ensure the data is in float16 format
                     if np_array.dtype != np.float16:
                         np_array = np_array.astype(np.float16)
+                    print(tensor_name, np_array.shape)
+                    # Write the tensor data directly to the file
+                    out_f.write(np_array.tobytes())
+                else:
+                    print(f"Warning: Tensor {tensor_name} not found in the safetensors file.")
+
+                        # Vision end layers
+            for tensor_name in projection_layers:
+                if tensor_name in f.keys():
+                    tensor = f.get_tensor(tensor_name)
+                    np_array = tensor.numpy()
                     
+                    # Ensure the data is in float16 format
+                    if np_array.dtype != np.float16:
+                        np_array = np_array.astype(np.float16)
+                    print(tensor_name, np_array.shape)
                     # Write the tensor data directly to the file
                     out_f.write(np_array.tobytes())
                 else:

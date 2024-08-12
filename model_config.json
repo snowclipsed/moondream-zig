@@ -1,0 +1,17 @@
+{
+    "vocab": 51200,
+    "dim": 2048,
+    "hidden_dim": 8192,
+    "n_layers": 24,
+    "n_heads": 32,
+    "head_dim": 64,
+    "seq_len": 2048,
+    "img_channels": 3,
+    "img_dim": 378,
+    "patch_size": 14,
+    "vit_dim": 1152,
+    "n_vit_layers": 27,
+    "n_vit_heads": 16,
+    "vit_head_dim": 72,
+    "hidden_features": 4304
+  }

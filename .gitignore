@@ -55,7 +55,7 @@ dkms.conf
 #object files
 test
 moondream
-*.json
+tokenizer.json
 *.bin
 *.safetensors
 .zig-cache
@@ -70,3 +70,4 @@ src/tokenizer.zig
 
 OpenBLAS
 
+weightorder.txt

@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Thread = std.Thread;
+const builtin = @import("builtin");
 // const c = @cImport({
 //     @cInclude("ggml.h");
 // });
@@ -132,10 +133,8 @@ const Config = struct {
 /// "_w" suffix : weights
 /// "_b" suffix : biases
 const Weights = struct {
-
-    // Single contiguous memory block for all weights
-    memory: []f16,
-
+    const Self = @This();
+    // TODO: Add Self reference to this struct
     // Slices for specific weights
 
     ///Text model start///
@@ -208,129 +207,147 @@ const Weights = struct {
     v_proj_fc2_w: []f16, // (hidden_features*2, hidden_dim)
     v_proj_fc2_b: []f16, // (hidden_features)
 
-    fn init(config: *const Config, data: []const u8) !Weights {
-        const sizes = calculateSizes(config);
-        const total = calculateTotalSize(config);
+    fn init(config: Config, filename: []const u8, allocator: Allocator) !Weights {
 
-        if (data.len < total * @sizeOf(f16)) {
-            return error.InsufficientData;
+        // Set up slices for each weight
+
+        const sizes = calculateSizes(config);
+        const num_weights = calculateTotalSize(sizes);
+        const file = try std.fs.cwd().openFile(filename, .{});
+        defer file.close();
+
+        std.debug.print("Sizes: {any} \n", .{sizes});
+
+        const file_size = try file.getEndPos();
+        if (file_size != num_weights * @sizeOf(f16)) {
+            std.debug.print("Actual file size = {} \n", .{file_size});
+            std.debug.print("Estimated file size = {} \n", .{num_weights * @sizeOf(f16)});
+            return error.UnexpectedFileSize;
         }
-        var self: Weights = undefined;
-        self.memory = @alignCast(@ptrCast(data));
-        var offset: usize = 0;
+        std.debug.print("File read successfully with {} \n", .{file_size});
+        var data = try allocator.alloc(f16, num_weights);
+        defer allocator.free(data);
+
+        const bytes_read = try file.readAll(std.mem.sliceAsBytes(data));
+        if (bytes_read != file_size) {
+            return error.IncompleteRead;
+        }
+        std.debug.print("Total size = {} \n", .{num_weights});
+        std.debug.print("Number of bytes read = {} \n", .{bytes_read});
 
         // Memory mapping of slices
         // Set slices for each weight
-        self.word_token_embedding = self.memory[offset .. offset + sizes.word_token_embedding];
-
+        var self: Weights = undefined;
+        var offset: usize = 0;
         // text model
+        self.word_token_embedding = data[offset .. offset + sizes.word_token_embedding];
         offset += sizes.word_token_embedding;
 
-        self.t_ln_w = self.memory[offset .. offset + sizes.t_ln_w];
+        self.t_ln_w = data[offset .. offset + sizes.t_ln_w];
         offset += sizes.t_ln_w;
 
-        self.t_ln_b = self.memory[offset .. offset + sizes.t_ln_b];
+        self.t_ln_b = data[offset .. offset + sizes.t_ln_b];
         offset += sizes.t_ln_b;
 
-        self.t_Wqkv_w = self.memory[offset .. offset + sizes.t_Wqkv_w];
+        self.t_Wqkv_w = data[offset .. offset + sizes.t_Wqkv_w];
         offset += sizes.t_Wqkv_w;
 
-        self.t_Wqkv_b = self.memory[offset .. offset + sizes.t_Wqkv_b];
+        self.t_Wqkv_b = data[offset .. offset + sizes.t_Wqkv_b];
         offset += sizes.t_Wqkv_b;
 
-        self.t_out_proj_w = self.memory[offset .. offset + sizes.t_out_proj_w];
+        self.t_out_proj_w = data[offset .. offset + sizes.t_out_proj_w];
         offset += sizes.t_out_proj_w;
 
-        self.t_out_proj_bias = self.memory[offset .. offset + sizes.t_out_proj_bias];
+        self.t_out_proj_bias = data[offset .. offset + sizes.t_out_proj_bias];
         offset += sizes.t_out_proj_bias;
 
-        self.t_fc1_w = self.memory[offset .. offset + sizes.t_fc1_w];
+        self.t_fc1_w = data[offset .. offset + sizes.t_fc1_w];
         offset += sizes.t_fc1_w;
 
-        self.t_fc1_b = self.memory[offset .. offset + sizes.t_fc1_b];
+        self.t_fc1_b = data[offset .. offset + sizes.t_fc1_b];
         offset += sizes.t_fc1_b;
 
-        self.t_fc2_w = self.memory[offset .. offset + sizes.t_fc2_w];
+        self.t_fc2_w = data[offset .. offset + sizes.t_fc2_w];
         offset += sizes.t_fc2_w;
 
-        self.t_fc2_b = self.memory[offset .. offset + sizes.t_fc2_b];
+        self.t_fc2_b = data[offset .. offset + sizes.t_fc2_b];
         offset += sizes.t_fc2_b;
 
-        self.t_linear_w = self.memory[offset .. offset + sizes.t_linear_w];
+        self.t_linear_w = data[offset .. offset + sizes.t_linear_w];
         offset += sizes.t_linear_w;
 
-        self.t_linear_b = self.memory[offset .. offset + sizes.t_linear_b];
+        self.t_linear_b = data[offset .. offset + sizes.t_linear_b];
         offset += sizes.t_linear_b;
 
-        self.t_ln_out_w = self.memory[offset .. offset + sizes.t_ln_out_w];
+        self.t_ln_out_w = data[offset .. offset + sizes.t_ln_out_w];
         offset += sizes.t_ln_out_w;
 
-        self.t_ln_out_b = self.memory[offset .. offset + sizes.t_ln_out_b];
+        self.t_ln_out_b = data[offset .. offset + sizes.t_ln_out_b];
         offset += sizes.t_ln_out_b;
 
         // vision model
 
-        self.v_patch_embedding_linear_w = self.memory[offset .. offset + sizes.v_patch_embedding_linear_w];
+        self.v_patch_embedding_linear_w = data[offset .. offset + sizes.v_patch_embedding_linear_w];
         offset += sizes.v_patch_embedding_linear_w;
 
-        self.v_patch_embedding_linear_b = self.memory[offset .. offset + sizes.v_patch_embedding_linear_b];
+        self.v_patch_embedding_linear_b = data[offset .. offset + sizes.v_patch_embedding_linear_b];
         offset += sizes.v_patch_embedding_linear_b;
 
-        self.v_pos_embedding = self.memory[offset .. offset + sizes.v_pos_embedding];
+        self.v_pos_embedding = data[offset .. offset + sizes.v_pos_embedding];
         offset += sizes.v_pos_embedding;
 
-        self.v_Wqkv_w = self.memory[offset .. offset + sizes.v_Wqkv_w];
+        self.v_Wqkv_w = data[offset .. offset + sizes.v_Wqkv_w];
         offset += sizes.v_Wqkv_w;
 
-        self.v_Wqkv_b = self.memory[offset .. offset + sizes.v_Wqkv_b];
+        self.v_Wqkv_b = data[offset .. offset + sizes.v_Wqkv_b];
         offset += sizes.v_Wqkv_b;
 
-        self.v_out_proj_w = self.memory[offset .. offset + sizes.v_out_proj_w];
+        self.v_out_proj_w = data[offset .. offset + sizes.v_out_proj_w];
         offset += sizes.v_out_proj_w;
 
-        self.v_out_proj_b = self.memory[offset .. offset + sizes.v_out_proj_b];
+        self.v_out_proj_b = data[offset .. offset + sizes.v_out_proj_b];
         offset += sizes.v_out_proj_b;
 
-        self.v_fc1_w = self.memory[offset .. offset + sizes.v_fc1_w];
+        self.v_fc1_w = data[offset .. offset + sizes.v_fc1_w];
         offset += sizes.v_fc1_w;
 
-        self.v_fc1_b = self.memory[offset .. offset + sizes.v_fc1_b];
+        self.v_fc1_b = data[offset .. offset + sizes.v_fc1_b];
         offset += sizes.v_fc1_b;
 
-        self.v_fc2_w = self.memory[offset .. offset + sizes.v_fc2_w];
+        self.v_fc2_w = data[offset .. offset + sizes.v_fc2_w];
         offset += sizes.v_fc2_w;
 
-        self.v_fc2_b = self.memory[offset .. offset + sizes.v_fc2_b];
+        self.v_fc2_b = data[offset .. offset + sizes.v_fc2_b];
         offset += sizes.v_fc2_b;
 
-        self.v_norm1_w = self.memory[offset .. offset + sizes.v_norm1_w];
+        self.v_norm1_w = data[offset .. offset + sizes.v_norm1_w];
         offset += sizes.v_norm1_w;
 
-        self.v_norm1_b = self.memory[offset .. offset + sizes.v_norm1_b];
+        self.v_norm1_b = data[offset .. offset + sizes.v_norm1_b];
         offset += sizes.v_norm1_b;
 
-        self.v_norm2_w = self.memory[offset .. offset + sizes.v_norm2_w];
+        self.v_norm2_w = data[offset .. offset + sizes.v_norm2_w];
         offset += sizes.v_norm2_w;
 
-        self.v_norm2_b = self.memory[offset .. offset + sizes.v_norm2_b];
+        self.v_norm2_b = data[offset .. offset + sizes.v_norm2_b];
         offset += sizes.v_norm2_b;
 
-        self.v_norm_out_w = self.memory[offset .. offset + sizes.v_norm_out_w];
+        self.v_norm_out_w = data[offset .. offset + sizes.v_norm_out_w];
         offset += sizes.v_norm_out_w;
 
-        self.v_norm_out_b = self.memory[offset .. offset + sizes.v_norm_out_b];
+        self.v_norm_out_b = data[offset .. offset + sizes.v_norm_out_b];
         offset += sizes.v_norm_out_b;
 
-        self.v_proj_fc1_w = self.memory[offset .. offset + sizes.v_proj_fc1_w];
+        self.v_proj_fc1_w = data[offset .. offset + sizes.v_proj_fc1_w];
         offset += sizes.v_proj_fc1_w;
 
-        self.v_proj_fc1_b = self.memory[offset .. offset + sizes.v_proj_fc1_b];
+        self.v_proj_fc1_b = data[offset .. offset + sizes.v_proj_fc1_b];
         offset += sizes.v_proj_fc1_b;
 
-        self.v_proj_fc2_w = self.memory[offset .. offset + sizes.v_proj_fc2_w];
+        self.v_proj_fc2_w = data[offset .. offset + sizes.v_proj_fc2_w];
         offset += sizes.v_proj_fc2_w;
 
-        self.v_proj_fc2_b = self.memory[offset .. offset + sizes.v_proj_fc2_b];
+        self.v_proj_fc2_b = data[offset .. offset + sizes.v_proj_fc2_b];
         offset += sizes.v_proj_fc2_b;
 
         return self;
@@ -343,12 +360,12 @@ const Weights = struct {
         t_ln_b: usize,
         t_Wqkv_w: usize,
         t_Wqkv_b: usize,
+        t_out_proj_w: usize,
+        t_out_proj_bias: usize,
         t_fc1_w: usize,
         t_fc1_b: usize,
         t_fc2_w: usize,
         t_fc2_b: usize,
-        t_out_proj_w: usize,
-        t_out_proj_bias: usize,
         t_linear_w: usize,
         t_linear_b: usize,
         t_ln_out_w: usize,
@@ -379,19 +396,18 @@ const Weights = struct {
         return .{
             // TODO : Recheck this once
             // Text model
-            .word_token_embedding = config.dim * config.vocab,
-
+            .word_token_embedding = config.vocab * config.dim,
             // Transformer block begins here //
             .t_ln_w = config.n_layers * config.dim,
             .t_ln_b = config.n_layers * config.dim,
-            .t_Wqkv_w = config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
+            .t_Wqkv_w = config.n_layers * config.n_heads * config.head_dim * 3 * config.dim,
             .t_Wqkv_b = config.n_layers * config.n_heads * config.head_dim * 3,
+            .t_out_proj_w = config.n_layers * config.seq_len * config.dim,
+            .t_out_proj_bias = config.n_layers * config.dim,
             .t_fc1_w = config.n_layers * config.hidden_dim * config.dim,
             .t_fc1_b = config.n_layers * config.hidden_dim,
             .t_fc2_w = config.n_layers * config.dim * config.hidden_dim,
             .t_fc2_b = config.n_layers * config.dim,
-            .t_out_proj_w = config.n_layers * config.seq_len * config.dim,
-            .t_out_proj_bias = config.n_layers * config.dim,
             // Transformer block ends here //
 
             .t_linear_w = config.vocab * config.dim,
@@ -413,18 +429,18 @@ const Weights = struct {
             .v_fc1_b = config.n_vit_layers * config.hidden_features,
             .v_fc2_w = config.n_vit_layers * config.vit_dim * config.hidden_features,
             .v_fc2_b = config.n_vit_layers * config.vit_dim,
-            .v_norm1_w = config.n_vit_layers * config.hidden_features,
-            .v_norm1_b = config.n_vit_layers * config.hidden_features,
-            .v_norm2_w = config.n_vit_layers * config.hidden_features,
-            .v_norm2_b = config.n_vit_layers * config.hidden_features,
+            .v_norm1_w = config.n_vit_layers * config.vit_dim,
+            .v_norm1_b = config.n_vit_layers * config.vit_dim,
+            .v_norm2_w = config.n_vit_layers * config.vit_dim,
+            .v_norm2_b = config.n_vit_layers * config.vit_dim,
             // ViT block ends here //
 
-            .v_norm_out_w = config.hidden_features,
-            .v_norm_out_b = config.hidden_features,
-            .v_proj_fc1_w = config.hidden_dim * config.hidden_features * 2,
+            .v_norm_out_w = config.vit_dim,
+            .v_norm_out_b = config.vit_dim,
+            .v_proj_fc1_w = config.hidden_dim * config.vit_head_dim * config.n_heads, //TODO FIGURE OUT WHY THIS IS??
             .v_proj_fc1_b = config.hidden_dim,
-            .v_proj_fc2_w = config.hidden_features * 2 * config.hidden_dim,
-            .v_proj_fc2_b = config.hidden_features * 2,
+            .v_proj_fc2_w = config.dim * config.hidden_dim,
+            .v_proj_fc2_b = config.dim,
         };
     }
 
@@ -435,6 +451,13 @@ const Weights = struct {
         }
         return total;
     }
+
+    fn deinit(self: *Self, allocator: Allocator) void {
+        inline for (std.meta.fields(Self)) |f| {
+            allocator.free(@field(self, f.name));
+        }
+        self.* = undefined;
+    }
 };
 
 // runstate
@@ -444,6 +467,7 @@ const Weights = struct {
 // Tokens, their scores, and the max token length. Supports initialization
 // from a file and encoding text into tokens via the `encode` method.
 const Tokenizer = struct {
+    // TODO : Add handling external tokens to tokenizer
     const Self = @This();
     tokens: std.StringHashMap(u32),
     merges: std.ArrayList([]const u8),
@@ -583,25 +607,36 @@ const Tokenizer = struct {
 // main
 
 pub fn main() !void {
-    const bin_path: ?[]const u8 = "../moondream.bin";
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    const checkpoint = try std.fs.cwd().openFile(bin_path.?, .{});
-    const filesize = (try checkpoint.stat()).size;
+    // Constants //
+    const bin_path: []const u8 = "../moondream.bin";
+    const config_path: ?[]const u8 = "../model_config.json";
 
-    std.debug.print("Checkpoint loaded with size {}! \n", .{filesize});
+    // Start of loading config file //
+    const config_file = try std.fs.cwd().openFile(config_path.?, .{});
+    defer config_file.close();
 
-    var config_read: ConfigReader = try checkpoint.reader().readStruct(ConfigReader);
+    const config_size = (try config_file.stat()).size; // store the size of the config file so we can allocate the buffer properly
 
-    const config = config_read.config();
+    const buffer = try allocator.alloc(u8, config_size);
+    defer allocator.free(buffer);
+    _ = try config_file.readAll(buffer);
 
-    std.debug.print("config: {any} \n", .{config});
-    checkpoint.close();
+    var json_tree = try std.json.parseFromSlice(ConfigReader, allocator, buffer, .{});
+    defer json_tree.deinit();
 
-    // var config_read: ConfigReader = try checkpoint.reader().readStruct(ConfigReader);
+    const config = json_tree.value.config();
 
-    // const data : []align(mem.page_size) u8 = blk:{
-    //     const weights_size : usize = file_size - @sizeOf(ConfigReader);
-    // };
+    // End of loading config file //
+
+    // Start of loading model checkpoint //
+    // TODO: Add NULL checking for the bin path
+    var weights = try Weights.init(config, bin_path, allocator);
+    // End of loading model checkpoint
+    defer weights.deinit(allocator);
 }
 
 // tests
