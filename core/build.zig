@@ -10,22 +10,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe.addIncludePath(b.path("./dependencies/ggml/include/"));
-    exe.addIncludePath(b.path("./dependencies/ggml/include/ggml"));
-    exe.addCSourceFiles(.{
-        .files = &.{
-            "./dependencies/ggml/src/ggml.c",
-            "./dependencies/ggml/src/ggml-alloc.c",
-            "./dependencies/ggml/src/ggml-backend.c",
-            "./dependencies/ggml/src/ggml-quants.c",
-        },
-        .flags = &.{
-            "-std=c11",
-            "-D_GNU_SOURCE",
-            "-D_XOPEN_SOURCE=600",
-        },
-    });
-    exe.linkLibC();
+    // exe.addIncludePath(b.path("./dependencies/ggml/include/"));
+    // exe.addIncludePath(b.path("./dependencies/ggml/include/ggml"));
+    // exe.addCSourceFiles(.{
+    //     .files = &.{
+    //         "./dependencies/ggml/src/ggml.c",
+    //         "./dependencies/ggml/src/ggml-alloc.c",
+    //         "./dependencies/ggml/src/ggml-backend.c",
+    //         "./dependencies/ggml/src/ggml-quants.c",
+    //     },
+    //     .flags = &.{
+    //         "-std=c11",
+    //         "-D_GNU_SOURCE",
+    //         "-D_XOPEN_SOURCE=600",
+    //     },
+    // });
+    // exe.linkLibC();
     // exe.linkLibCpp();
     b.installArtifact(exe);
 
