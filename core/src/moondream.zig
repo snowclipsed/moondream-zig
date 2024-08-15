@@ -14,17 +14,17 @@ const V: usize = 32; // Vector size (adjust as necessary)
 // applies softmax on a vector
 
 // REDO this function with vectors
-fn softmax(x: []f16) void {
+fn softmax(x: []f32) void {
     assert(x.len > 0);
     // max of x for numerical stability
-    var max: f16 = x[0];
+    var max: f32 = x[0];
     for (x[1..]) |val| {
         if (val > max) {
             max = val;
         }
     }
     // exp and sum
-    var sum: f16 = 0.0;
+    var sum: f32 = 0.0;
     for (x) |*val| {
         val.* = std.math.exp(val.* - max); // https://stackoverflow.com/questions/42599498/numerically-stable-softmax
         sum += val.*;
@@ -36,18 +36,18 @@ fn softmax(x: []f16) void {
 }
 
 // REDO this function with vectors.
-// This function accumulates an f16 array b into another f16 array a
-fn accumulate(a: []f16, b: []f16) void {
+// This function accumulates an f32 array b into another f32 array a
+fn accumulate(a: []f32, b: []f32) void {
     assert(a.len == b.len);
     for (0..a.len) |i| {
         a[i] += b[i];
     }
 }
 
-// Returns index of the max value in an f16 array
-fn argmax(x: []f16) usize {
+// Returns index of the max value in an f32 array
+fn argmax(x: []f32) usize {
     assert(x.len > 0);
-    var max: f16 = x[0];
+    var max: f32 = x[0];
     var maxi: usize = 0;
     for (1..x.len) |i| {
         if (x[i] > max) {
@@ -291,74 +291,74 @@ const Weights = struct {
     // Slices for specific weights
 
     ///Text model start///
-    word_token_embedding: []f16, // (dim, vocab)
+    word_token_embedding: []f32, // (dim, vocab)
 
     // Transformer layer start
 
     // attn layer norm
-    t_ln_w: []f16, // (layer, dim)
-    t_ln_b: []f16, // (layer, dim)
+    t_ln_w: []f32, // (layer, dim)
+    t_ln_b: []f32, // (layer, dim)
     // attn qkv
-    t_Wqkv_w: []f16, // (layer, dim, n_heads*head_dim*3)
-    t_Wqkv_b: []f16, // (layer, n_heads*head_dim*3)
+    t_Wqkv_w: []f32, // (layer, dim, n_heads*head_dim*3)
+    t_Wqkv_b: []f32, // (layer, n_heads*head_dim*3)
     // output
-    t_out_proj_w: []f16, // (layer, seqlen, dim)
-    t_out_proj_bias: []f16, // (layer, dim)
+    t_out_proj_w: []f32, // (layer, seqlen, dim)
+    t_out_proj_bias: []f32, // (layer, dim)
     // fully connected
-    t_fc1_w: []f16, // (layer, hidden_dim, dim)
-    t_fc1_b: []f16, // (layer, hidden_dim)
-    t_fc2_w: []f16, // (layer, dim, hidden_dim)
-    t_fc2_b: []f16, // (layer, dim)
+    t_fc1_w: []f32, // (layer, hidden_dim, dim)
+    t_fc1_b: []f32, // (layer, hidden_dim)
+    t_fc2_w: []f32, // (layer, dim, hidden_dim)
+    t_fc2_b: []f32, // (layer, dim)
 
     //Transformer layer end //
 
     // lm head
-    t_linear_w: []f16, //(vocab, dim)
-    t_linear_b: []f16, //(vocab)
-    t_ln_out_w: []f16, //(dim)
-    t_ln_out_b: []f16, //(dim)
+    t_linear_w: []f32, //(vocab, dim)
+    t_linear_b: []f32, //(vocab)
+    t_ln_out_w: []f32, //(dim)
+    t_ln_out_b: []f32, //(dim)
     //Text model end///
 
     // Vision model start //
 
     // combining patch embeddngs and pos
-    v_patch_embedding_linear_w: []f16, // (vit_dim, patch * patch * channels)
-    v_patch_embedding_linear_b: []f16, // (vit_dim)
-    v_pos_embedding: []f16, // (1, (img_dim/patch_dim)^2, vit_dim)
+    v_patch_embedding_linear_w: []f32, // (vit_dim, patch * patch * channels)
+    v_patch_embedding_linear_b: []f32, // (vit_dim)
+    v_pos_embedding: []f32, // (1, (img_dim/patch_dim)^2, vit_dim)
 
     /// Vision Transformer Start
     // attention qkv
-    v_Wqkv_w: []f16, // (vit_dim, vit_dim*3)
-    v_Wqkv_b: []f16, // (vit_dim * 3)
+    v_Wqkv_w: []f32, // (vit_dim, vit_dim*3)
+    v_Wqkv_b: []f32, // (vit_dim * 3)
 
     //attn out
-    v_out_proj_w: []f16, // (vit_dim, vit_dim)
-    v_out_proj_b: []f16, // (vit_dim)
+    v_out_proj_w: []f32, // (vit_dim, vit_dim)
+    v_out_proj_b: []f32, // (vit_dim)
 
     //ViT fc
-    v_fc1_w: []f16, // (hidden_features, vit_dim)
-    v_fc1_b: []f16, // (hidden_features)
-    v_fc2_w: []f16, // (vit_dim, hidden_features)
-    v_fc2_b: []f16, // (vit_dim)
+    v_fc1_w: []f32, // (hidden_features, vit_dim)
+    v_fc1_b: []f32, // (hidden_features)
+    v_fc2_w: []f32, // (vit_dim, hidden_features)
+    v_fc2_b: []f32, // (vit_dim)
 
     //ViT norm
-    v_norm1_w: []f16, // (layer, hidden_features)
-    v_norm1_b: []f16, // (layer, hidden_features)
-    v_norm2_w: []f16, // (layer, hidden_features)
-    v_norm2_b: []f16, // (layer, hidden_features)
+    v_norm1_w: []f32, // (layer, hidden_features)
+    v_norm1_b: []f32, // (layer, hidden_features)
+    v_norm2_w: []f32, // (layer, hidden_features)
+    v_norm2_b: []f32, // (layer, hidden_features)
 
     // Vision Transformer End
 
     //norm
-    v_norm_out_w: []f16, // (hidden_features)
-    v_norm_out_b: []f16, // (hidden_features)
+    v_norm_out_w: []f32, // (hidden_features)
+    v_norm_out_b: []f32, // (hidden_features)
 
     // projection
-    v_proj_fc1_w: []f16, // (hidden_dim, hidden_features * 2)
-    v_proj_fc1_b: []f16, // (hidden_dim)
+    v_proj_fc1_w: []f32, // (hidden_dim, hidden_features * 2)
+    v_proj_fc1_b: []f32, // (hidden_dim)
 
-    v_proj_fc2_w: []f16, // (hidden_features*2, hidden_dim)
-    v_proj_fc2_b: []f16, // (hidden_features)
+    v_proj_fc2_w: []f32, // (hidden_features*2, hidden_dim)
+    v_proj_fc2_b: []f32, // (hidden_features)
 
     fn init(config: Config, filename: []const u8, allocator: Allocator) !Weights {
 
@@ -370,13 +370,13 @@ const Weights = struct {
         defer file.close();
 
         const file_size = try file.getEndPos();
-        if (file_size != num_weights * @sizeOf(f16)) {
+        if (file_size != num_weights * @sizeOf(f32)) {
             std.debug.print("Actual file size = {} \n", .{file_size});
-            std.debug.print("Estimated file size = {} \n", .{num_weights * @sizeOf(f16)});
+            std.debug.print("Estimated file size = {} \n", .{num_weights * @sizeOf(f32)});
             return error.UnexpectedFileSize;
         }
         std.debug.print("{s} read successfully with {} parameters. \n", .{ filename, num_weights });
-        var data = try allocator.alloc(f16, num_weights);
+        var data = try allocator.alloc(f32, num_weights);
         defer allocator.free(data);
 
         const bytes_read = try file.readAll(std.mem.sliceAsBytes(data));
@@ -762,7 +762,7 @@ pub fn main() !void {
     const allocator = arena.allocator();
 
     // Constants //
-    const bin_path: []const u8 = "../moondream.bin";
+    const bin_path: []const u8 = "../moondream_f32.bin";
     const config_path: ?[]const u8 = "../model_config.json";
 
     // Start of loading config file //
@@ -794,11 +794,11 @@ pub fn main() !void {
 
 // tests
 test "softmax" {
-    var x = [_]f16{ 1.0, 2.0, 3.0, 4.0 };
+    var x = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
 
     softmax(&x);
 
-    var sum: f16 = 0.0;
+    var sum: f32 = 0.0;
     for (0..x.len) |value| {
         sum += x[value];
     }
