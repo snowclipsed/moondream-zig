@@ -546,38 +546,38 @@ const Weights = struct {
         return .{
             // TODO : Recheck this once
             // Text model
-            .word_token_embedding = config.vocab * config.dim,
+            .word_token_embedding = config.dim * config.vocab,
             // Transformer block begins here //
             .t_ln_w = config.n_layers * config.dim,
             .t_ln_b = config.n_layers * config.dim,
-            .t_Wqkv_w = config.n_layers * config.n_heads * config.head_dim * 3 * config.dim,
+            .t_Wqkv_w = config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
             .t_Wqkv_b = config.n_layers * config.n_heads * config.head_dim * 3,
-            .t_out_proj_w = config.n_layers * config.seq_len * config.dim,
+            .t_out_proj_w = config.n_layers * config.dim * config.seq_len,
             .t_out_proj_bias = config.n_layers * config.dim,
-            .t_fc1_w = config.n_layers * config.hidden_dim * config.dim,
+            .t_fc1_w = config.n_layers * config.dim * config.hidden_dim,
             .t_fc1_b = config.n_layers * config.hidden_dim,
-            .t_fc2_w = config.n_layers * config.dim * config.hidden_dim,
+            .t_fc2_w = config.n_layers * config.hidden_dim * config.dim,
             .t_fc2_b = config.n_layers * config.dim,
             // Transformer block ends here //
 
-            .t_linear_w = config.vocab * config.dim,
+            .t_linear_w = config.dim * config.vocab,
             .t_linear_b = config.vocab,
             .t_ln_out_w = config.dim,
             .t_ln_out_b = config.dim,
 
             //Vision model
-            .v_patch_embedding_linear_w = config.vit_dim * config.patch_size * config.patch_size * config.img_channels,
+            .v_patch_embedding_linear_w = config.patch_size * config.patch_size * config.img_channels * config.vit_dim,
             .v_patch_embedding_linear_b = config.vit_dim,
-            .v_pos_embedding = 1 * ((config.img_dim / config.patch_size) * (config.img_dim / config.patch_size)) * config.vit_dim,
+            .v_pos_embedding = config.vit_dim * ((config.img_dim / config.patch_size) * (config.img_dim / config.patch_size)) * 1,
 
             // ViT block begins here //
             .v_Wqkv_w = config.n_vit_layers * config.vit_dim * config.n_vit_heads * config.vit_head_dim * 3,
             .v_Wqkv_b = config.n_vit_layers * config.n_vit_heads * config.vit_head_dim * 3,
             .v_out_proj_w = config.n_vit_layers * config.vit_dim * config.vit_dim,
             .v_out_proj_b = config.n_vit_layers * config.vit_dim,
-            .v_fc1_w = config.n_vit_layers * config.hidden_features * config.vit_dim,
+            .v_fc1_w = config.n_vit_layers * config.vit_dim * config.hidden_features,
             .v_fc1_b = config.n_vit_layers * config.hidden_features,
-            .v_fc2_w = config.n_vit_layers * config.vit_dim * config.hidden_features,
+            .v_fc2_w = config.n_vit_layers * config.hidden_features * config.vit_dim,
             .v_fc2_b = config.n_vit_layers * config.vit_dim,
             .v_norm1_w = config.n_vit_layers * config.vit_dim,
             .v_norm1_b = config.n_vit_layers * config.vit_dim,
@@ -587,9 +587,9 @@ const Weights = struct {
 
             .v_norm_out_w = config.vit_dim,
             .v_norm_out_b = config.vit_dim,
-            .v_proj_fc1_w = config.hidden_dim * config.vit_head_dim * config.n_heads, //TODO FIGURE OUT WHY THIS IS??
+            .v_proj_fc1_w = config.vit_head_dim * config.n_heads * config.hidden_dim, //TODO FIGURE OUT WHY THIS IS??
             .v_proj_fc1_b = config.hidden_dim,
-            .v_proj_fc2_w = config.dim * config.hidden_dim,
+            .v_proj_fc2_w = config.hidden_dim * config.dim,
             .v_proj_fc2_b = config.dim,
         };
     }
