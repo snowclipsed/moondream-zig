@@ -4,8 +4,9 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const Thread = std.Thread;
 const builtin = @import("builtin");
-
-// TODO: Remove GGML eventually.
+const T: usize = 64; // Tile size (adjust as necessary)
+const V: usize = 32; // Vector size (adjust as necessary)
+// TODO : add std.simd.suggestvectorlength
 
 // vector math functions
 
@@ -56,9 +57,6 @@ fn argmax(x: []f16) usize {
     }
     return maxi;
 }
-
-const T: usize = 64; // Tile size (adjust as necessary)
-const V: usize = 32; // Vector size (adjust as necessary)
 
 /// Matrix Multiplication
 pub fn MatMul(allocator: std.mem.Allocator, A: []const f32, B: []const f32, C: []f32, M: usize, N: usize, K: usize) !void {
