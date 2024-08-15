@@ -810,7 +810,7 @@ test "tokenizer" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    var tokenizer = try Tokenizer.fromFile("tokenizer.bin", allocator);
+    var tokenizer = try Tokenizer.fromFile("../tokenizer.bin", allocator);
     defer tokenizer.deinit();
 
     //checking vocab size and merge list size

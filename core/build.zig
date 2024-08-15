@@ -29,6 +29,32 @@ pub fn build(b: *std.Build) void {
     // exe.linkLibCpp();
     b.installArtifact(exe);
 
+    const test_targets = [_]std.Target.Query{
+        .{}, // native
+        // .{
+        //     .cpu_arch = .x86_64,
+        //     .os_tag = .linux,
+        // },
+        // .{
+        //     .cpu_arch = .aarch64,
+        //     .os_tag = .macos,
+        // },
+    };
+    const test_step = b.step("test", "Run unit tests");
+
+    for (test_targets) |test_target| {
+        const unit_tests = b.addTest(.{
+            .root_source_file = b.path("src/moondream.zig"),
+            .target = b.resolveTargetQuery(test_target),
+        });
+
+        unit_tests.linkSystemLibrary("openblas");
+        unit_tests.linkLibC();
+
+        const run_unit_tests = b.addRunArtifact(unit_tests);
+        test_step.dependOn(&run_unit_tests.step);
+    }
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 
