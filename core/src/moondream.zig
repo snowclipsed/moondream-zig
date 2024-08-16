@@ -6,6 +6,7 @@ const Thread = std.Thread;
 const builtin = @import("builtin");
 const T: usize = 64; // Tile size (adjust as necessary)
 const V: usize = 32; // Vector size (adjust as necessary)
+const simd_align = @alignOf(@Vector(V, f32));
 // TODO : add std.simd.suggestvectorlength
 
 // vector math functions
@@ -59,7 +60,7 @@ fn argmax(x: []f32) usize {
 }
 
 /// Matrix Multiplication
-pub fn MatMul(allocator: std.mem.Allocator, A: []const f32, B: []const f32, C: []f32, M: usize, N: usize, K: usize) !void {
+pub fn matmul(allocator: std.mem.Allocator, A: []const f32, B: []const f32, C: []f32, M: usize, N: usize, K: usize) !void {
     const num_threads = try std.Thread.getCpuCount();
 
     // Calculate the number of tiles in each dimension
@@ -612,6 +613,19 @@ const Weights = struct {
 
 // runstate
 
+const RunState = struct {
+    const Self = @This();
+
+    x: []align(simd_align) f32,
+    q: []align(simd_align) f32,
+    k: []align(simd_align) f32,
+    v: []align(simd_align) f32,
+    k_cache: []align(simd_align) f32,
+    v_cache: []align(simd_align) f32,
+    attn: []align(simd_align) f32,
+    logits: []align(simd_align) f32,
+};
+
 // tokenizer
 
 // Tokens, their scores, and the max token length. Supports initialization
@@ -732,6 +746,8 @@ const Tokenizer = struct {
         std.debug.print("merge list size: {}\n", .{self.merges.items.len});
     }
 
+    // TODO: Write Decode Function.
+
     fn deinit(self: *Self) void {
         var token_it = self.tokens.keyIterator();
         while (token_it.next()) |key| {
@@ -748,11 +764,19 @@ const Tokenizer = struct {
 
 // attention
 
-// transformer
+// RoPE
 
-// vision encoder
+// transformer
+const Transformer = struct {};
+
+// vision transformer
+const visionTransformer = struct {};
+
+// forward loop
+pub fn forward() !void {}
 
 // inference
+pub fn generate() !void {}
 
 // main
 
@@ -833,4 +857,17 @@ test "tokenizer" {
     }
 }
 
-// main
+test "matrix_multiplies" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const w = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0 };
+    const x = [_]f32{ 1.0, 2.0, 3.0 };
+    var xout = [_]f32{ 0.0, 0.0, 0.0 };
+
+    try matmul(allocator, &w, &x, &xout, 3, 1, 3);
+    try std.testing.expect(xout[0] == 1.0 + 4.0 + 9.0);
+    try std.testing.expect(xout[1] == 4.0 + 10.0 + 18.0);
+    try std.testing.expect(xout[2] == 7.0 + 16.0 + 27.0);
+}
