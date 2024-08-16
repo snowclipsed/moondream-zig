@@ -622,8 +622,24 @@ const RunState = struct {
     v: []align(simd_align) f32,
     k_cache: []align(simd_align) f32,
     v_cache: []align(simd_align) f32,
-    attn: []align(simd_align) f32,
-    logits: []align(simd_align) f32,
+
+    fn init(allocator: Allocator, config: Config) !Self {
+        return Self{
+            .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            .q = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
+            .k = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
+            .v = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
+            .k_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim), // TODO : REPLACE WITH KV DIM
+            .v_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
+        };
+    }
+
+    fn deinit(self: *Self, allocator: Allocator) void {
+        inline for (std.meta.fields(Self)) |f| {
+            allocator.free(@field(self, f.name));
+        }
+        self.* = undefined;
+    }
 };
 
 // tokenizer
@@ -762,15 +778,54 @@ const Tokenizer = struct {
     }
 };
 
-// attention
-
 // RoPE
 
-// transformer
-const Transformer = struct {};
+// attention
+fn attention() !void {}
 
 // vision transformer
-const visionTransformer = struct {};
+const VisionTransformerLayer = struct {};
+
+// text model
+const TextModel = struct {
+    const Self = @This();
+    config: Config,
+    weights: Weights,
+    tokenizer: Tokenizer,
+    state: RunState,
+    allocator: Allocator,
+
+    fn init(config: Config, weights: Weights, tokenizer: Tokenizer, state: RunState, allocator: Allocator) !TextModel {
+        return TextModel{
+            .config = config,
+            .weights = weights,
+            .tokenizer = tokenizer,
+            .state = state,
+            .allocator = allocator,
+        };
+    }
+
+    fn forward(self: Self, token: usize) !void {
+        // embed
+        const embedding = self.embed(token);
+        std.debug.print("\n embed len for {any} \n", .{embedding.len});
+        std.debug.print("\n embed for {any} \n", .{embedding});
+        // pass through layers
+
+        // layer norm
+
+        // attn
+    }
+
+    fn embed(self: Self, token: usize) []f32 {
+        const dim = self.config.dim;
+        return self.weights.word_token_embedding[token * dim ..][0..dim];
+    }
+};
+
+// vision model
+
+const VisionModel = struct {};
 
 // forward loop
 pub fn forward() !void {}
@@ -812,8 +867,19 @@ pub fn main() !void {
     var weights = try Weights.init(config, bin_path, allocator);
     defer weights.deinit(allocator);
 
-    // End of loading model checkpoint
+    var tokenizer = try Tokenizer.fromFile("../tokenizer.bin", allocator);
+    defer tokenizer.deinit();
 
+    var state = try RunState.init(allocator, config);
+    defer state.deinit(allocator);
+
+    var text_model = try TextModel.init(config, weights, tokenizer, state, allocator);
+    // defer text_model.deinit;
+    // End of loading model checkpoint
+    const text = "hello!";
+    const token = try tokenizer.encode(text);
+    std.debug.print("\n token : {}", .{token.items[0]});
+    try text_model.forward(token.items[0]);
 }
 
 // tests
