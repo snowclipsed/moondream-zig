@@ -808,8 +808,10 @@ const TextModel = struct {
     fn forward(self: Self, token: usize) !void {
         // embed
         const embedding = self.embed(token);
+        // TODO : clean up these print statements
         std.debug.print("\n embed len for {any} \n", .{embedding.len});
         std.debug.print("\n embed for {any} \n", .{embedding});
+
         // pass through layers
 
         // layer norm
