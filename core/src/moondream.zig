@@ -59,8 +59,30 @@ fn argmax(x: []f32) usize {
     return maxi;
 }
 
+// taken from cgbur/llama2.zig
+// make this work with SIMD
+fn rmsnorm(o: []f32, x: []f32, w: []f32) void {
+    assert(o.len == x.len);
+    assert(o.len == w.len);
+
+    // sum of squares
+    var sum: f32 = 0.0;
+    for (x) |val| {
+        sum += val * val;
+    }
+    sum /= @floatFromInt(x.len);
+    sum += 1e-5;
+    sum = 1.0 / std.math.sqrt(sum);
+
+    // normalize and scale
+    for (0..o.len) |i| {
+        o[i] = x[i] * sum * w[i];
+    }
+}
+
 /// Matrix Multiplication
 pub fn matmul(allocator: std.mem.Allocator, A: []const f32, B: []const f32, C: []f32, M: usize, N: usize, K: usize) !void {
+    // TODO : add size checking for all the matrices using assert.
     const num_threads = try std.Thread.getCpuCount();
 
     // Calculate the number of tiles in each dimension
@@ -617,6 +639,8 @@ const RunState = struct {
     const Self = @This();
 
     x: []align(simd_align) f32,
+    xb: []align(simd_align) f32,
+    kqvb: []align(simd_align) f32, // buffer for combined kqv
     q: []align(simd_align) f32,
     k: []align(simd_align) f32,
     v: []align(simd_align) f32,
@@ -626,6 +650,8 @@ const RunState = struct {
     fn init(allocator: Allocator, config: Config) !Self {
         return Self{
             .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            .kqvb = try allocator.alignedAlloc(f32, simd_align, config.dim * 3),
             .q = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
             .k = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
             .v = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
@@ -780,9 +806,6 @@ const Tokenizer = struct {
 
 // RoPE
 
-// attention
-fn attention() !void {}
-
 // vision transformer
 const VisionTransformerLayer = struct {};
 
@@ -809,16 +832,34 @@ const TextModel = struct {
         // embed
         const embedding = self.embed(token);
         // TODO : clean up these print statements
-        std.debug.print("\n embed len for {any} \n", .{embedding.len});
-        std.debug.print("\n embed for {any} \n", .{embedding});
+        std.debug.print("\n embed len for token {any}: {any} \n", .{ token, embedding.len });
+        // std.debug.print("\n embed for {any} \n", .{embedding}); // embedding for a single token
+        @memcpy(self.state.x, embedding); // copy embedding to activation for processing
 
         // pass through layers
+
+        for (0..self.config.n_layers) |l| {
+            if (self.config.head_dim * self.config.n_heads != self.config.dim) {
+                return error.UnexpectedHiddenSize;
+            }
+
+            // multiply the embedding (self.state.x) by Wkqv and get combined kqv
+            // split that into k,q,v
+            //  x (1, 2048)  @ W (2048 * 6144) = out (1 * 6144)
+            // offset for the weights will be : config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
+
+            // matmuls for combined kqv
+            try matmul(self.allocator, self.state.x, self.weights.t_Wqkv_w[l * self.config.dim * self.config.dim * 3 .. l + 1 * self.config.dim * self.config.dim * 3], self.state.kqvb, 1, self.config.dim * 3, self.config.dim);
+        }
 
         // layer norm
 
         // attn
     }
 
+    fn attention() !void {}
+
+    /// compute embedding for a single token
     fn embed(self: Self, token: usize) []f32 {
         const dim = self.config.dim;
         return self.weights.word_token_embedding[token * dim ..][0..dim];
@@ -882,6 +923,9 @@ pub fn main() !void {
     const token = try tokenizer.encode(text);
     std.debug.print("\n token : {}", .{token.items[0]});
     try text_model.forward(token.items[0]);
+
+    // We only need to pass tokens one by one into the transformer loop because of KV cache!
+
 }
 
 // tests
