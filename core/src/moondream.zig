@@ -36,15 +36,6 @@ fn softmax(x: []f32) void {
     }
 }
 
-// REDO this function with vectors.
-// This function accumulates an f32 array b into another f32 array a
-fn accumulate(a: []f32, b: []f32) void {
-    assert(a.len == b.len);
-    for (0..a.len) |i| {
-        a[i] += b[i];
-    }
-}
-
 // Returns index of the max value in an f32 array
 fn argmax(x: []f32) usize {
     assert(x.len > 0);
@@ -77,6 +68,29 @@ fn rmsnorm(o: []f32, x: []f32, w: []f32) void {
     // normalize and scale
     for (0..o.len) |i| {
         o[i] = x[i] * sum * w[i];
+    }
+}
+
+pub fn accumulate(accum: []f32, x: []const f32) void {
+    std.debug.assert(accum.len == x.len);
+    const len = accum.len;
+
+    const VectorSize = std.simd.suggestVectorLength(f32) orelse 8;
+
+    const VectorType = @Vector(VectorSize, f32);
+    var i: usize = 0;
+
+    // Process in SIMD-sized chunks
+    while (i + VectorSize <= len) : (i += VectorSize) {
+        var v_accum = @as(*align(4) VectorType, @ptrCast(accum[i..].ptr)).*;
+        const v_x = @as(*align(4) const VectorType, @ptrCast(x[i..].ptr)).*;
+        v_accum += v_x;
+        @as(*align(4) VectorType, @ptrCast(accum[i..].ptr)).* = v_accum;
+    }
+
+    // Handle remaining elements
+    while (i < len) : (i += 1) {
+        accum[i] += x[i];
     }
 }
 
@@ -310,7 +324,6 @@ const Config = struct {
 /// "_b" suffix : biases
 const Weights = struct {
     const Self = @This();
-    // TODO: Add Self reference to this struct
     // Slices for specific weights
 
     ///Text model start///
@@ -567,7 +580,6 @@ const Weights = struct {
         v_proj_fc2_b: usize,
     } {
         return .{
-            // TODO : Recheck this once
             // Text model
             .word_token_embedding = config.dim * config.vocab,
             // Transformer block begins here //
@@ -640,7 +652,7 @@ const RunState = struct {
 
     x: []align(simd_align) f32,
     xb: []align(simd_align) f32,
-    kqvb: []align(simd_align) f32, // buffer for combined kqv
+    qkv_combined: []align(simd_align) f32, // a buffer that holds the combined kqv
     q: []align(simd_align) f32,
     k: []align(simd_align) f32,
     v: []align(simd_align) f32,
@@ -651,7 +663,7 @@ const RunState = struct {
         return Self{
             .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
-            .kqvb = try allocator.alignedAlloc(f32, simd_align, config.dim * 3),
+            .qkv_combined = try allocator.alignedAlloc(f32, simd_align, config.dim * 3),
             .q = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
             .k = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
             .v = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
@@ -849,7 +861,18 @@ const TextModel = struct {
             // offset for the weights will be : config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
 
             // matmuls for combined kqv
-            try matmul(self.allocator, self.state.x, self.weights.t_Wqkv_w[l * self.config.dim * self.config.dim * 3 .. l + 1 * self.config.dim * self.config.dim * 3], self.state.kqvb, 1, self.config.dim * 3, self.config.dim);
+            try matmul(self.allocator, self.state.x, self.weights.t_Wqkv_w[l * self.config.dim * self.config.dim * 3 .. (l + 1) * self.config.dim * self.config.dim * 3], self.state.qkv_combined, 1, self.config.dim * 3, self.config.dim);
+
+            accumulate(self.state.qkv_combined, self.weights.t_Wqkv_b[l * self.config.dim * 3 .. (l + 1) * self.config.dim * self.config.dim * 3]);
+
+            // TODO: Split into k, q, v
+
+            @memcpy(self.state.q, self.state.qkv_combined[0..self.config.dim]);
+            @memcpy(self.state.k, self.state.qkv_combined[self.config.dim .. self.config.dim * 2]);
+            @memcpy(self.state.v, self.state.qkv_combined[self.config.dim * 2 .. self.config.dim * 3]);
+
+            // std.debug.print("\n q vector size : {any} \n k vector size : {any} \n v vector size : {any} \n ", .{ self.state.q.len, self.state.k.len, self.state.v.len });
+
         }
 
         // layer norm
