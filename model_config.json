@@ -6,6 +6,8 @@
     "n_heads": 32,
     "head_dim": 64,
     "seq_len": 2048,
+    "rope_theta": 10000.0,
+    "max_pos_embeddings": 2048, 
     "img_channels": 3,
     "img_dim": 378,
     "patch_size": 14,

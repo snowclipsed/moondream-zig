@@ -261,6 +261,8 @@ const ConfigReader = extern struct {
     n_heads: i32, // number of attn heads per layer
     head_dim: i32, // size of attn heads per layer
     seq_len: i32, // max sequence length
+    rope_theta: f32,
+    max_pos_embeddings: i32,
 
     // vision
     img_channels: i32, // number of channels per patch, RGB has 3
@@ -281,6 +283,8 @@ const ConfigReader = extern struct {
             .n_heads = @intCast(self.n_heads),
             .head_dim = @intCast(self.head_dim),
             .seq_len = @intCast(self.seq_len),
+            .rope_theta = self.rope_theta,
+            .max_pos_embeddings = @intCast(self.max_pos_embeddings),
             .img_channels = @intCast(self.img_channels),
             .img_dim = @intCast(self.img_dim),
             .patch_size = @intCast(self.patch_size),
@@ -303,6 +307,8 @@ const Config = struct {
     n_heads: usize, //number of attn heads per layer
     head_dim: usize, //size of attn heads
     seq_len: usize, // sequence length, 2048
+    rope_theta: f32,
+    max_pos_embeddings: usize,
 
     // Vision Model
     img_channels: usize, // number of channels per patch, RGB has 3
@@ -930,17 +936,21 @@ pub fn main() !void {
     // Start of loading model checkpoint //
     // TODO: Add NULL checking for the bin path
 
+    // loading weights //
     var weights = try Weights.init(config, bin_path, allocator);
     defer weights.deinit(allocator);
 
+    // loading tokenizer //
     var tokenizer = try Tokenizer.fromFile("../tokenizer.bin", allocator);
     defer tokenizer.deinit();
 
+    // loading runstate //
     var state = try RunState.init(allocator, config);
     defer state.deinit(allocator);
 
+    // initializing text model //
     var text_model = try TextModel.init(config, weights, tokenizer, state, allocator);
-    // defer text_model.deinit;
+
     // End of loading model checkpoint
     const text = "hello!";
     const token = try tokenizer.encode(text);
