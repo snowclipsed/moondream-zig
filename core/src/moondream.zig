@@ -882,11 +882,6 @@ const Tokenizer = struct {
     }
 };
 
-// RoPE
-
-// vision transformer
-const VisionTransformerLayer = struct {};
-
 // text model
 const TextModel = struct {
     const Self = @This();
@@ -922,8 +917,6 @@ const TextModel = struct {
             if (self.config.head_dim * self.config.n_heads != self.config.dim) {
                 return error.UnexpectedHiddenSize;
             }
-
-            // TODO : Add Layer Norm.
 
             const norm = try layer_norm(self.state.x, self.weights.t_ln_w[l * self.config.dim .. (l + 1) * self.config.dim], self.weights.t_ln_b[l * self.config.dim .. (l + 1) * self.config.dim], 1e-5, self.allocator);
             self.allocator.free(norm);
@@ -983,6 +976,9 @@ const TextModel = struct {
             accumulate(self.state.xb2, self.weights.t_out_proj_bias[l * self.config.dim ..][0..self.config.dim]);
 
             // TODO: Add residual connections
+            // TODO: Add FFN
+            // residual connection back to x
+            accumulate(self.state.x, self.state.xb2);
         }
     }
 
@@ -1069,7 +1065,6 @@ const TextModel = struct {
             const normalized = (x[i] - mean) * inv_std;
             output[i] = normalized * weight[i] + bias[i];
         }
-
         return output;
     }
 
@@ -1118,8 +1113,6 @@ const TextModel = struct {
         }
     }
 
-    fn attention() !void {} // TODO: Transfer attention to this function
-
     /// compute embedding for a single token
     fn embed(self: Self, token: usize) []f32 {
         return self.weights.word_token_embedding[token * self.config.dim ..][0..self.config.dim];
@@ -1129,9 +1122,6 @@ const TextModel = struct {
 // vision model
 
 const VisionModel = struct {};
-
-// forward loop
-pub fn forward() !void {}
 
 // inference
 pub fn generate() !void {}
