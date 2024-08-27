@@ -708,6 +708,7 @@ const RunState = struct {
 
     x: []align(simd_align) f32,
     xb: []align(simd_align) f32,
+    xb2: []align(simd_align) f32,
     qkv_combined: []align(simd_align) f32, // a buffer that holds the combined kqv
     q: []align(simd_align) f32,
     k: []align(simd_align) f32,
@@ -723,6 +724,7 @@ const RunState = struct {
         return Self{
             .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            .xb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .qkv_combined = try allocator.alignedAlloc(f32, simd_align, config.dim * 3),
             .q = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
             .k = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
@@ -921,13 +923,18 @@ const TextModel = struct {
                 return error.UnexpectedHiddenSize;
             }
 
+            // TODO : Add Layer Norm.
+
+            const norm = try layer_norm(self.state.x, self.weights.t_ln_w[l * self.config.dim .. (l + 1) * self.config.dim], self.weights.t_ln_b[l * self.config.dim .. (l + 1) * self.config.dim], 1e-5, self.allocator);
+            self.allocator.free(norm);
+            @memcpy(self.state.xb, norm);
             // multiply the embedding (self.state.x) by Wkqv and get combined kqv
             // split that into k,q,v
             //  x (1, 2048)  @ W (2048 * 6144) = out (1 * 6144)
             // offset for the weights will be : config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
 
             // matmuls for combined kqv
-            try matmul(self.allocator, self.state.x, self.weights.t_Wqkv_w[l * self.config.dim * self.config.dim * 3 .. (l + 1) * self.config.dim * self.config.dim * 3], self.state.qkv_combined, 1, self.config.dim * 3, self.config.dim);
+            try matmul(self.allocator, self.state.xb, self.weights.t_Wqkv_w[l * self.config.dim * self.config.dim * 3 .. (l + 1) * self.config.dim * self.config.dim * 3], self.state.qkv_combined, 1, self.config.dim * 3, self.config.dim);
 
             accumulate(self.state.qkv_combined, self.weights.t_Wqkv_b[l * self.config.dim * 3 .. (l + 1) * self.config.dim * self.config.dim * 3]);
 
@@ -962,22 +969,108 @@ const TextModel = struct {
 
                 softmax(attn[0 .. pos + 1]);
 
-                const xb = self.state.x[head * self.config.head_dim ..][0..self.config.head_dim];
-                @memset(xb, 0);
+                const xb2 = self.state.xb[head * self.config.head_dim ..][0..self.config.head_dim];
+                @memset(xb2, 0);
                 for (0..pos) |t_step| {
                     const v = self.state.v_cache[l_off + t_step * self.config.head_dim + (head / self.config.head_dim) * self.config.head_dim ..][0..self.config.head_dim];
                     const a = attn[t_step];
 
-                    vector_weighted_sum(xb, v, a);
+                    vector_weighted_sum(xb2, v, a);
                 }
             }
 
-            try matmul(self.allocator, self.weights.t_out_proj_w[l * self.config.dim * self.config.dim ..][0 .. self.config.dim * self.config.dim], self.state.x, self.state.xb, self.config.dim, self.config.dim, self.config.dim);
-            accumulate(self.state.xb, self.weights.t_out_proj_bias);
+            try matmul(self.allocator, self.weights.t_out_proj_w[l * self.config.dim * self.config.dim ..][0 .. self.config.dim * self.config.dim], self.state.xb, self.state.xb2, self.config.dim, self.config.dim, self.config.dim);
+            accumulate(self.state.xb2, self.weights.t_out_proj_bias[l * self.config.dim ..][0..self.config.dim]);
+
+            // TODO: Add residual connections
+        }
+    }
+
+    // fn layer_norm(input: []const f32, gamma: []const f32, beta: []const f32, epsilon: f32) []f32 {
+    //     const len = input.len;
+
+    //     // Calculate mean
+    //     var mean: f32 = 0.0;
+    //     for (input) |val| {
+    //         mean += val;
+    //     }
+    //     mean /= @floatFromInt(len);
+
+    //     // Calculate variance
+    //     var variance: f32 = 0.0;
+    //     for (input) |val| {
+    //         variance += (val - mean) * (val - mean);
+    //     }
+    //     variance /= @floatFromInt(len);
+
+    //     // Normalize, scale, and shift
+    //     var normalized: [len]f32 = undefined;
+    //     for (0..input.len) |i| {
+    //         normalized[i] = (input[i] - mean) / std.math.sqrt(variance + epsilon);
+    //         normalized[i] = gamma[i] * normalized[i] + beta[i];
+    //     }
+
+    //     return normalized;
+    // }
+    pub fn layer_norm(
+        x: []f32,
+        weight: []const f32,
+        bias: []const f32,
+        eps: f32,
+        allocator: std.mem.Allocator,
+    ) ![]f32 {
+        const len = x.len;
+        const VecLen = V;
+        const Vec = @Vector(VecLen, f32);
+
+        var sum: Vec = @splat(0);
+        var sum_sq: Vec = @splat(0);
+
+        // Calculate mean and variance
+        var i: usize = 0;
+        while (i + VecLen <= len) : (i += VecLen) {
+            const v = @as(Vec, x[i..][0..VecLen].*);
+            sum += v;
+            sum_sq += v * v;
         }
 
-        // layer norm
+        var mean: f32 = @reduce(.Add, sum) / @as(f32, @floatFromInt(len));
+        var variance: f32 = @reduce(.Add, sum_sq) / @as(f32, @floatFromInt(len)) - mean * mean;
 
+        // Handle remaining elements
+        while (i < len) : (i += 1) {
+            mean += (x[i] - mean) / @as(f32, @floatFromInt(i + 1));
+            const diff = x[i] - mean;
+            variance += (diff * diff - variance) / @as(f32, @floatFromInt(i + 1));
+        }
+
+        // Prepare normalization factors
+        const inv_std = 1.0 / @sqrt(variance + eps);
+        const vec_mean: Vec = @splat(mean);
+        const vec_inv_std: Vec = @splat(inv_std);
+
+        // Allocate output buffer
+        var output = try allocator.alloc(f32, len);
+        errdefer allocator.free(output);
+
+        // Normalize and scale
+        i = 0;
+        while (i + VecLen <= len) : (i += VecLen) {
+            const v = @as(Vec, x[i..][0..VecLen].*);
+            const w = @as(Vec, weight[i..][0..VecLen].*);
+            const b = @as(Vec, bias[i..][0..VecLen].*);
+            const normalized = (v - vec_mean) * vec_inv_std;
+            const result = normalized * w + b;
+            @as(*Vec, @alignCast(@ptrCast(output[i..].ptr))).* = result;
+        }
+
+        // Handle remaining elements
+        while (i < len) : (i += 1) {
+            const normalized = (x[i] - mean) * inv_std;
+            output[i] = normalized * weight[i] + bias[i];
+        }
+
+        return output;
     }
 
     fn set_cos_sin_cache(self: Self, tokens: std.ArrayList(u32)) !void {
