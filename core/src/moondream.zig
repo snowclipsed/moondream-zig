@@ -664,6 +664,9 @@ const RunState = struct {
     v: []align(simd_align) f32,
     k_cache: []align(simd_align) f32,
     v_cache: []align(simd_align) f32,
+    cos_cache: []align(simd_align) f32,
+    sin_cache: []align(simd_align) f32,
+    inv_freq: []align(simd_align) f32,
 
     fn init(allocator: Allocator, config: Config) !Self {
         return Self{
@@ -675,6 +678,9 @@ const RunState = struct {
             .v = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
             .k_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim), // TODO : REPLACE WITH KV DIM
             .v_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
+            .cos_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
+            .sin_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
+            .inv_freq = try allocator.alignedAlloc(f32, simd_align, config.dim / 2),
         };
     }
 
@@ -846,7 +852,9 @@ const TextModel = struct {
         };
     }
 
-    fn forward(self: Self, token: usize) !void {
+    fn forward(self: Self, tokens: std.ArrayList(u32), pos: usize) !void {
+        const token = tokens.items[pos];
+
         // embed
         const embedding = self.embed(token);
         // TODO : clean up these print statements
@@ -871,13 +879,15 @@ const TextModel = struct {
 
             accumulate(self.state.qkv_combined, self.weights.t_Wqkv_b[l * self.config.dim * 3 .. (l + 1) * self.config.dim * self.config.dim * 3]);
 
-            // TODO: Split into k, q, v
-
             @memcpy(self.state.q, self.state.qkv_combined[0..self.config.dim]);
             @memcpy(self.state.k, self.state.qkv_combined[self.config.dim .. self.config.dim * 2]);
             @memcpy(self.state.v, self.state.qkv_combined[self.config.dim * 2 .. self.config.dim * 3]);
 
-            // std.debug.print("\n q vector size : {any} \n k vector size : {any} \n v vector size : {any} \n ", .{ self.state.q.len, self.state.k.len, self.state.v.len });
+            // Apply RoPE to Q and K
+            try self.apply_rope(self.state.q, pos);
+            try self.apply_rope(self.state.k, pos);
+
+            // TODO : Add KV caching.
 
         }
 
@@ -886,12 +896,57 @@ const TextModel = struct {
         // attn
     }
 
-    fn attention() !void {}
+    // TODO : Implement frequency caching
+    fn set_cos_sin_cache(self: Self, tokens: std.ArrayList(u32)) !void {
+        // TODO : Double check if this is correct or not. This could be a point of failure!
+
+        // compute inverse frequncy
+        var i: usize = 0;
+        while (i < self.config.dim / 2) : (i += 1) {
+            const x = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(self.config.dim));
+            self.state.inv_freq[i] = 1.0 / std.math.pow(f32, self.config.rope_theta, x);
+        }
+
+        var position_freqs = try self.allocator.alloc(f32, self.config.seq_len * self.config.dim / 2);
+        defer self.allocator.free(position_freqs);
+
+        for (0..tokens.items.len) |pos| {
+            for (0..self.state.inv_freq.len) |j| {
+                position_freqs[pos * self.config.dim / 2 + j] = @as(f32, @floatFromInt(pos)) * self.state.inv_freq[j];
+            }
+        }
+        // TODO : Use SIMD for the computation!
+        // Compute and cache cosine and sine values
+        for (0..position_freqs.len) |itr| {
+            const cos_val = @cos(position_freqs[itr]);
+            const sin_val = @sin(position_freqs[itr]);
+
+            // Store values twice to create the full dim-dimensional embedding
+            self.state.cos_cache[itr] = cos_val;
+            self.state.cos_cache[itr + self.config.seq_len * self.config.dim / 2] = cos_val;
+            self.state.sin_cache[itr] = sin_val;
+            self.state.sin_cache[itr + self.config.seq_len * self.config.dim / 2] = sin_val;
+        }
+    }
+
+    fn apply_rope(self: Self, vec: []f32, pos: usize) !void {
+        const cos = self.state.cos_cache[pos * self.config.dim .. (pos + 1) * self.config.dim];
+        const sin = self.state.sin_cache[pos * self.config.dim .. (pos + 1) * self.config.dim];
+
+        var i: usize = 0;
+        while (i < self.config.dim) : (i += 2) {
+            const temp1 = vec[i];
+            const temp2 = vec[i + 1];
+            vec[i] = temp1 * cos[i] - temp2 * sin[i];
+            vec[i + 1] = temp1 * sin[i] + temp2 * cos[i];
+        }
+    }
+
+    fn attention() !void {} // TODO: Transfer attention to this function
 
     /// compute embedding for a single token
     fn embed(self: Self, token: usize) []f32 {
-        const dim = self.config.dim;
-        return self.weights.word_token_embedding[token * dim ..][0..dim];
+        return self.weights.word_token_embedding[token * self.config.dim ..][0..self.config.dim];
     }
 };
 
@@ -952,10 +1007,18 @@ pub fn main() !void {
     var text_model = try TextModel.init(config, weights, tokenizer, state, allocator);
 
     // End of loading model checkpoint
-    const text = "hello!";
-    const token = try tokenizer.encode(text);
-    std.debug.print("\n token : {}", .{token.items[0]});
-    try text_model.forward(token.items[0]);
+    const text = "Hello, world!";
+    const tokens = try tokenizer.encode(text);
+
+    // precomputing frequencies
+    try text_model.set_cos_sin_cache(tokens);
+    // precomputation done!
+
+    // main generation loop
+    for (0..tokens.items.len) |pos| {
+        std.debug.print("\n token : {}", .{tokens.items[pos]});
+        try text_model.forward(tokens, pos);
+    }
 
     // We only need to pass tokens one by one into the transformer loop because of KV cache!
 
