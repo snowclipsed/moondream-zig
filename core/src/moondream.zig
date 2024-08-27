@@ -887,8 +887,13 @@ const TextModel = struct {
             try self.apply_rope(self.state.q, pos);
             try self.apply_rope(self.state.k, pos);
 
-            // TODO : Add KV caching.
+            // TODO : Check KV Caching is correct or not. This could be a point of failure.
 
+            const l_off = l * self.config.seq_len * self.config.dim; // using dim instead of kv dim
+            const k_cache_row = self.state.k_cache[l_off + pos * self.config.dim ..][0..self.config.dim]; // using dim instead of kv dim
+            const v_cache_row = self.state.v_cache[l_off + pos * self.config.dim ..][0..self.config.dim];
+            @memcpy(k_cache_row, self.state.k);
+            @memcpy(v_cache_row, self.state.v);
         }
 
         // layer norm
@@ -896,7 +901,6 @@ const TextModel = struct {
         // attn
     }
 
-    // TODO : Implement frequency caching
     fn set_cos_sin_cache(self: Self, tokens: std.ArrayList(u32)) !void {
         // TODO : Double check if this is correct or not. This could be a point of failure!
 
