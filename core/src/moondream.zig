@@ -248,6 +248,56 @@ fn tiledMultiplyKernel(A: []const f32, B: []const f32, local_C: *[T][T]f32, N: u
     }
 }
 
+// copied from https://github.com/cgbur/llama2.zig/blob/main/src/main.zig#L489
+fn vector_dot_product(x: []const f32, y: []const f32) f32 {
+    assert(x.len == y.len);
+    const vector_width = V;
+    const vec_len = x.len / vector_width; // num of SIMD vectors
+    const vec_rem = x.len % vector_width; // num of f32 in the last SIMD vector
+
+    // do the bulk of the work with SIMD
+    var sum: @Vector(vector_width, f32) = @splat(0.0);
+    var offset: usize = 0;
+    for (0..vec_len) |_| {
+        const xvec: @Vector(vector_width, f32) = x[offset..][0..vector_width].*;
+        const yvec: @Vector(vector_width, f32) = y[offset..][0..vector_width].*;
+        sum += xvec * yvec;
+        offset += vector_width;
+    }
+
+    // handle the last few elements with normal scalar ops
+    var sum_rem: f32 = 0.0;
+    for (0..vec_rem) |i| {
+        sum_rem += x[offset + i] * y[offset + i];
+    }
+
+    // reduce the SIMD vector to a scalar
+    return @reduce(.Add, sum) + sum_rem;
+}
+
+fn vector_weighted_sum(xout: []f32, x: []const f32, y: f32) void {
+    assert(xout.len == x.len);
+    const vector_width = V;
+    const vec_len = x.len / vector_width; // num of SIMD vectors
+    const vec_rem = x.len % vector_width; // num of f32 in the last SIMD vector
+
+    // do the bulk of the work with SIMD
+    var offset: usize = 0;
+    const yvector: @Vector(vector_width, f32) = @splat(y);
+    for (0..vec_len) |_| {
+        var xoutvec: @Vector(vector_width, f32) = xout[offset..][0..vector_width].*;
+        const xvec: @Vector(vector_width, f32) = x[offset..][0..vector_width].*;
+        xoutvec += xvec * yvector;
+        xout[offset..][0..vector_width].* = xoutvec;
+        offset += vector_width;
+    }
+
+    // handle the last few elements with normal scalar operations
+    for (0..vec_rem) |i| {
+        xout[offset + i] += x[offset + i] * y;
+    }
+}
+
 //config
 
 const ConfigReader = extern struct {
@@ -662,6 +712,7 @@ const RunState = struct {
     q: []align(simd_align) f32,
     k: []align(simd_align) f32,
     v: []align(simd_align) f32,
+    attn: []align(simd_align) f32,
     k_cache: []align(simd_align) f32,
     v_cache: []align(simd_align) f32,
     cos_cache: []align(simd_align) f32,
@@ -676,6 +727,7 @@ const RunState = struct {
             .q = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
             .k = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
             .v = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
+            .attn = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.seq_len),
             .k_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim), // TODO : REPLACE WITH KV DIM
             .v_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
             .cos_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
@@ -894,11 +946,37 @@ const TextModel = struct {
             const v_cache_row = self.state.v_cache[l_off + pos * self.config.dim ..][0..self.config.dim];
             @memcpy(k_cache_row, self.state.k);
             @memcpy(v_cache_row, self.state.v);
+
+            // attention
+            for (0..self.config.n_heads) |head| {
+                const q = self.state.q[head * self.config.head_dim ..][0..self.config.head_dim];
+                const attn = self.state.attn[head * self.config.seq_len ..][0..self.config.seq_len];
+
+                for (0..pos + 1) |t_step| {
+                    const k = self.state.k_cache[l_off + t_step * self.config.dim + (head / self.config.n_heads) * self.config.head_dim ..][0..self.config.head_dim];
+                    var score: f32 = vector_dot_product(q, k);
+
+                    score /= std.math.sqrt(@as(f32, @floatFromInt(self.config.head_dim)));
+                    attn[t_step] = score;
+                }
+
+                softmax(attn[0 .. pos + 1]);
+
+                const xb = self.state.x[head * self.config.head_dim ..][0..self.config.head_dim];
+                @memset(xb, 0);
+                for (0..pos) |t_step| {
+                    const v = self.state.v_cache[l_off + t_step * self.config.head_dim + (head / self.config.head_dim) * self.config.head_dim ..][0..self.config.head_dim];
+                    const a = attn[t_step];
+
+                    vector_weighted_sum(xb, v, a);
+                }
+            }
+
+            try matmul(self.allocator, self.weights.t_out_proj_w[l * self.config.dim * self.config.dim ..][0 .. self.config.dim * self.config.dim], self.state.x, self.state.xb, self.config.dim, self.config.dim, self.config.dim);
         }
 
         // layer norm
 
-        // attn
     }
 
     fn set_cos_sin_cache(self: Self, tokens: std.ArrayList(u32)) !void {
@@ -1011,7 +1089,7 @@ pub fn main() !void {
     var text_model = try TextModel.init(config, weights, tokenizer, state, allocator);
 
     // End of loading model checkpoint
-    const text = "Hello, world!";
+    const text = "Hello, World!";
     const tokens = try tokenizer.encode(text);
 
     // precomputing frequencies
