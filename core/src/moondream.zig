@@ -973,6 +973,7 @@ const TextModel = struct {
             }
 
             try matmul(self.allocator, self.weights.t_out_proj_w[l * self.config.dim * self.config.dim ..][0 .. self.config.dim * self.config.dim], self.state.x, self.state.xb, self.config.dim, self.config.dim, self.config.dim);
+            accumulate(self.state.xb, self.weights.t_out_proj_bias);
         }
 
         // layer norm
