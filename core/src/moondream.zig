@@ -36,6 +36,18 @@ fn softmax(x: []f32) void {
     }
 }
 
+pub fn gelu(input: []f32) void {
+    const sqrt_2_over_pi = std.math.sqrt(2.0 / std.math.pi);
+    const factor = 0.044715;
+
+    for (input) |*value| {
+        const x = value.*;
+        const term = sqrt_2_over_pi * (x + factor * x * x * x);
+        const tanh_term = std.math.tanh(term);
+        value.* = 0.5 * x * (1.0 + tanh_term);
+    }
+}
+
 // Returns index of the max value in an f32 array
 fn argmax(x: []f32) usize {
     assert(x.len > 0);
@@ -97,6 +109,16 @@ pub fn accumulate(accum: []f32, x: []const f32) void {
 /// Matrix Multiplication
 pub fn matmul(allocator: std.mem.Allocator, A: []const f32, B: []const f32, C: []f32, M: usize, N: usize, K: usize) !void {
     // TODO : add size checking for all the matrices using assert.
+
+    std.debug.assert(A.len == M * K); // A should be M x K
+    std.debug.assert(B.len == K * N); // B should be K x N
+    std.debug.assert(C.len == M * N); // C should be M x N
+
+    // TODO : Remove this debug print statements once we are clear about all the dims
+    // std.debug.print("A len = {any}, M * K = {any} \n ", .{ A.len, M * K });
+    // std.debug.print("B len = {any}, K * N = {any} \n ", .{ B.len, K * N });
+    // std.debug.print("C len = {any}, M * N = {any} \n ", .{ C.len, M * N });
+
     const num_threads = try std.Thread.getCpuCount();
 
     // Calculate the number of tiles in each dimension
@@ -719,6 +741,9 @@ const RunState = struct {
     cos_cache: []align(simd_align) f32,
     sin_cache: []align(simd_align) f32,
     inv_freq: []align(simd_align) f32,
+    hb: []align(simd_align) f32,
+    hb2: []align(simd_align) f32,
+    logits: []align(simd_align) f32,
 
     fn init(allocator: Allocator, config: Config) !Self {
         return Self{
@@ -735,6 +760,9 @@ const RunState = struct {
             .cos_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
             .sin_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
             .inv_freq = try allocator.alignedAlloc(f32, simd_align, config.dim / 2),
+            .hb = try allocator.alignedAlloc(f32, simd_align, config.dim * 3),
+            .hb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            .logits = try allocator.alignedAlloc(f32, simd_align, config.vocab),
         };
     }
 
@@ -867,6 +895,34 @@ const Tokenizer = struct {
     }
 
     // TODO: Write Decode Function.
+    fn decode(self: *const Tokenizer, tokens: []const u32) ![]const u8 {
+        var decoded_text = std.ArrayList(u8).init(self.allocator);
+        errdefer decoded_text.deinit();
+
+        for (tokens) |token_id| {
+            var found = false;
+            var token_it = self.tokens.iterator();
+            while (token_it.next()) |entry| {
+                if (entry.value_ptr.* == token_id) {
+                    try decoded_text.appendSlice(entry.key_ptr.*);
+                    try decoded_text.append(' '); // Add a space between tokens
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                return error.TokenNotFound;
+            }
+        }
+
+        // Remove the trailing space if it exists
+        if (decoded_text.items.len > 0 and decoded_text.items[decoded_text.items.len - 1] == ' ') {
+            _ = decoded_text.pop();
+        }
+
+        return decoded_text.toOwnedSlice();
+    }
 
     fn deinit(self: *Self) void {
         var token_it = self.tokens.keyIterator();
@@ -907,7 +963,7 @@ const TextModel = struct {
         // embed
         const embedding = self.embed(token);
         // TODO : clean up these print statements
-        std.debug.print("\n embed len for token {any}: {any} \n", .{ token, embedding.len });
+        // std.debug.print("\n embed len for token {any}: {any} \n", .{ token, embedding.len });
         // std.debug.print("\n embed for {any} \n", .{embedding}); // embedding for a single token
         @memcpy(self.state.x, embedding); // copy embedding to activation for processing
 
@@ -976,9 +1032,34 @@ const TextModel = struct {
             accumulate(self.state.xb2, self.weights.t_out_proj_bias[l * self.config.dim ..][0..self.config.dim]);
 
             // TODO: Add residual connections
-            // TODO: Add FFN
+
             // residual connection back to x
             accumulate(self.state.x, self.state.xb2);
+
+            // TODO: Add FFN
+
+            try matmul(self.allocator, self.state.x, self.weights.t_fc1_w[l * self.config.dim ..][0 .. self.config.dim * 3], self.state.hb, 1, self.config.dim * 3, self.config.dim);
+            accumulate(self.state.hb, self.weights.t_fc1_b);
+            gelu(self.state.hb);
+            try matmul(self.allocator, self.state.hb, self.weights.t_fc2_w[l * self.config.dim * 3 ..][0..self.config.dim], self.state.hb2, 1, self.config.dim, self.config.dim * 3);
+
+            // residual connection from mlp back to x
+
+            accumulate(self.state.x, self.state.hb2);
+
+            // final LN and then linear
+
+            //TODO figure out if you can reuse the norm variable
+            const norm2 = try layer_norm(self.state.x, self.weights.t_ln_out_w[0..self.config.dim][0..self.config.vocab], self.weights.t_ln_out_b, 1e-5, self.allocator);
+            self.allocator.free(norm2);
+
+            @memcpy(self.state.x, norm2);
+            // TODO: Do I need a new variable or can i just keep using self.state.x? Find out.
+
+            try matmul(self.allocator, self.state.x, self.weights.t_linear_w, self.state.logits, 1, self.config.vocab, self.config.dim);
+            accumulate(self.state.logits, self.weights.t_linear_b);
+
+            return self.state.logits;
         }
     }
 
@@ -1181,13 +1262,16 @@ pub fn main() !void {
     // precomputation done!
 
     // main generation loop
+    var timer = try std.time.Timer.start();
     for (0..tokens.items.len) |pos| {
-        std.debug.print("\n token : {}", .{tokens.items[pos]});
+        // std.debug.print("\n token : {}", .{tokens.items[pos]});
         try text_model.forward(tokens, pos);
     }
+    const elapsed_ns = timer.read();
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
+    std.debug.print("\n Generation took : {d:.3} seconds. \n", .{seconds});
 
     // We only need to pass tokens one by one into the transformer loop because of KV cache!
-
 }
 
 // tests
@@ -1245,3 +1329,36 @@ test "matrix_multiplies" {
     try std.testing.expect(xout[1] == 4.0 + 10.0 + 18.0);
     try std.testing.expect(xout[2] == 7.0 + 16.0 + 27.0);
 }
+
+// test "matmul dimension checks" {
+//     const allocator = std.testing.allocator;
+
+//     // Correct dimensions for matrix multiplication
+//     const M: usize = 3;
+//     const N: usize = 4;
+//     const K: usize = 2;
+
+//     // Allocate matrices with correct dimensions
+//     const A = try allocator.alloc(f32, M * K);
+//     defer allocator.free(A);
+//     const B = try allocator.alloc(f32, K * N);
+//     defer allocator.free(B);
+//     const C = try allocator.alloc(f32, M * N);
+//     defer allocator.free(C);
+
+//     // Test with correct dimensions (should not trigger assertion)
+//     try matmul(allocator, A, B, C, M, N, K);
+
+//     // Allocate matrices with incorrect dimensions
+//     const A_wrong = try allocator.alloc(f32, M * (K + 1)); // Incorrect dimension
+//     defer allocator.free(A_wrong);
+//     const B_wrong = try allocator.alloc(f32, K * N);
+//     defer allocator.free(B_wrong);
+//     const C_wrong = try allocator.alloc(f32, M * N);
+//     defer allocator.free(C_wrong);
+
+//     // Test with incorrect dimensions (should trigger assertion)
+//     // This should cause an assertion failure, which we can catch in the test
+//     const result = std.testing.expectError(error.Unexpected, matmul(allocator, A_wrong, B_wrong, C_wrong, M, N, K));
+//     try std.testing.expect(result == error.Unexpected);
+// }
