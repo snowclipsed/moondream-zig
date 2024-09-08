@@ -760,7 +760,7 @@ const RunState = struct {
             .cos_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
             .sin_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
             .inv_freq = try allocator.alignedAlloc(f32, simd_align, config.dim / 2),
-            .hb = try allocator.alignedAlloc(f32, simd_align, config.dim * 3),
+            .hb = try allocator.alignedAlloc(f32, simd_align, config.hidden_dim),
             .hb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .logits = try allocator.alignedAlloc(f32, simd_align, config.vocab),
         };
@@ -784,12 +784,14 @@ const Tokenizer = struct {
     tokens: std.StringHashMap(u32),
     merges: std.ArrayList([]const u8),
     allocator: Allocator,
+    eos_token: u32,
 
     fn init(allocator: Allocator) Tokenizer {
         return .{
             .tokens = std.StringHashMap(u32).init(allocator),
             .merges = std.ArrayList([]const u8).init(allocator),
             .allocator = allocator,
+            .eos_token = 50256,
         };
     }
 
@@ -895,11 +897,11 @@ const Tokenizer = struct {
     }
 
     // TODO: Write Decode Function.
-    fn decode(self: *const Tokenizer, tokens: []const u32) ![]const u8 {
+    fn decode(self: *const Tokenizer, tokens: std.ArrayList(u32)) ![]const u8 {
         var decoded_text = std.ArrayList(u8).init(self.allocator);
         errdefer decoded_text.deinit();
 
-        for (tokens) |token_id| {
+        for (tokens.items) |token_id| {
             var found = false;
             var token_it = self.tokens.iterator();
             while (token_it.next()) |entry| {
@@ -912,6 +914,7 @@ const Tokenizer = struct {
             }
 
             if (!found) {
+                std.debug.print("Tokens : {any} \n", .{tokens.items[token_id]});
                 return error.TokenNotFound;
             }
         }
@@ -960,6 +963,7 @@ const TextModel = struct {
     fn forward(self: Self, tokens: std.ArrayList(u32), pos: usize) !void {
         const token = tokens.items[pos];
 
+        const sqrt: f32 = @floatFromInt(self.config.head_dim);
         // embed
         const embedding = self.embed(token);
         // TODO : clean up these print statements
@@ -974,62 +978,100 @@ const TextModel = struct {
                 return error.UnexpectedHiddenSize;
             }
 
-            const norm = try layer_norm(self.state.x, self.weights.t_ln_w[l * self.config.dim .. (l + 1) * self.config.dim], self.weights.t_ln_b[l * self.config.dim .. (l + 1) * self.config.dim], 1e-5, self.allocator);
-            self.allocator.free(norm);
-            @memcpy(self.state.xb, norm);
+            // First layernorm
+            @memcpy(self.state.xb, self.state.x);
+
+            try layer_norm(
+                self.state.xb,
+                self.weights.t_ln_w[l * self.config.dim .. (l + 1) * self.config.dim],
+                self.weights.t_ln_b[l * self.config.dim .. (l + 1) * self.config.dim],
+                1e-5,
+            );
+
             // multiply the embedding (self.state.x) by Wkqv and get combined kqv
             // split that into k,q,v
             //  x (1, 2048)  @ W (2048 * 6144) = out (1 * 6144)
             // offset for the weights will be : config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
 
             // matmuls for combined kqv
-            try matmul(self.allocator, self.state.xb, self.weights.t_Wqkv_w[l * self.config.dim * self.config.dim * 3 .. (l + 1) * self.config.dim * self.config.dim * 3], self.state.qkv_combined, 1, self.config.dim * 3, self.config.dim);
+            // xb (1, 2048) @ Wqkv (2048, 6144) -> qkv_combined(1, 6144)
+            try matmul(
+                self.allocator,
+                self.state.xb, // (1, dim)
+                self.weights.t_Wqkv_w[l * self.config.dim * 3 * self.config.n_heads * self.config.head_dim .. (l + 1) * self.config.dim * 3 * self.config.n_heads * self.config.head_dim],
+                self.state.qkv_combined,
+                1,
+                self.config.dim * 3,
+                self.config.dim,
+            );
 
-            accumulate(self.state.qkv_combined, self.weights.t_Wqkv_b[l * self.config.dim * 3 .. (l + 1) * self.config.dim * self.config.dim * 3]);
+            // add bias
+            // qkv_combined (1, 2048) + bias (1, 2048)
+            accumulate(self.state.qkv_combined, self.weights.t_Wqkv_b[l * self.config.n_heads * self.config.head_dim * 3 .. (l + 1) * self.config.n_heads * self.config.head_dim * 3]);
 
-            @memcpy(self.state.q, self.state.qkv_combined[0..self.config.dim]);
-            @memcpy(self.state.k, self.state.qkv_combined[self.config.dim .. self.config.dim * 2]);
-            @memcpy(self.state.v, self.state.qkv_combined[self.config.dim * 2 .. self.config.dim * 3]);
+            // split into q, k, v
+            @memcpy(self.state.q, self.state.qkv_combined[0 .. self.config.n_heads * self.config.head_dim]); // (1, 2048)
+            @memcpy(self.state.k, self.state.qkv_combined[self.config.n_heads * self.config.head_dim .. self.config.n_heads * self.config.head_dim * 2]); // (1, 2048)
+            @memcpy(self.state.v, self.state.qkv_combined[self.config.n_heads * self.config.head_dim * 2 .. self.config.n_heads * self.config.head_dim * 3]); // (1, 2048)
 
             // Apply RoPE to Q and K
+            // TODO: Check implementation, could be a breakage point
             try self.apply_rope(self.state.q, pos);
             try self.apply_rope(self.state.k, pos);
 
-            // TODO : Check KV Caching is correct or not. This could be a point of failure.
-
+            // define kv cache
+            // the offset for each layer for the key and value vectors will be:
             const l_off = l * self.config.seq_len * self.config.dim; // using dim instead of kv dim
-            const k_cache_row = self.state.k_cache[l_off + pos * self.config.dim ..][0..self.config.dim]; // using dim instead of kv dim
-            const v_cache_row = self.state.v_cache[l_off + pos * self.config.dim ..][0..self.config.dim];
+
+            // we define a pointer to a row of k and v cache
+            const k_cache_row = self.state.k_cache[l_off + pos * self.config.dim .. l_off + (pos + 1) * self.config.dim]; // using dim instead of kv dim, size 2048
+            const v_cache_row = self.state.v_cache[l_off + pos * self.config.dim .. l_off + (pos + 1) * self.config.dim]; // size 2048
+
+            // we then update the kv cache for that specific row using the pointer
             @memcpy(k_cache_row, self.state.k);
             @memcpy(v_cache_row, self.state.v);
 
             // attention
-            for (0..self.config.n_heads) |head| {
-                const q = self.state.q[head * self.config.head_dim ..][0..self.config.head_dim];
-                const attn = self.state.attn[head * self.config.seq_len ..][0..self.config.seq_len];
 
-                for (0..pos + 1) |t_step| {
-                    const k = self.state.k_cache[l_off + t_step * self.config.dim + (head / self.config.n_heads) * self.config.head_dim ..][0..self.config.head_dim];
+            for (0..self.config.n_heads) |head| {
+                // extract query vector for the head
+                const q = self.state.q[head * self.config.head_dim .. (head + 1) * self.config.head_dim];
+                // define slice of attn weights for this head
+                const attn = self.state.attn[head * self.config.seq_len .. (head + 1) * self.config.seq_len];
+
+                for (0..pos + 1) |t| {
+                    const k = self.state.k_cache[l_off + t * self.config.dim + head * self.config.head_dim .. l_off + t * self.config.dim + (head + 1) * self.config.head_dim];
                     var score: f32 = vector_dot_product(q, k);
 
-                    score /= std.math.sqrt(@as(f32, @floatFromInt(self.config.head_dim)));
-                    attn[t_step] = score;
+                    score /= std.math.sqrt(sqrt);
+                    attn[t] = score;
                 }
 
                 softmax(attn[0 .. pos + 1]);
 
-                const xb2 = self.state.xb[head * self.config.head_dim ..][0..self.config.head_dim];
-                @memset(xb2, 0);
-                for (0..pos) |t_step| {
-                    const v = self.state.v_cache[l_off + t_step * self.config.head_dim + (head / self.config.head_dim) * self.config.head_dim ..][0..self.config.head_dim];
-                    const a = attn[t_step];
+                // attn for V
+                const xb = self.state.xb[head * self.config.head_dim .. (head + 1) * self.config.head_dim];
 
-                    vector_weighted_sum(xb2, v, a);
+                @memset(xb, 0.0);
+                for (0..pos + 1) |t| {
+                    const v = self.state.v_cache[l_off + t * self.config.head_dim + head * self.config.head_dim .. l_off + t * self.config.head_dim + (head + 1) * self.config.head_dim];
+                    const a = attn[t];
+
+                    vector_weighted_sum(xb, v, a);
                 }
             }
 
-            try matmul(self.allocator, self.weights.t_out_proj_w[l * self.config.dim * self.config.dim ..][0 .. self.config.dim * self.config.dim], self.state.xb, self.state.xb2, self.config.dim, self.config.dim, self.config.dim);
-            accumulate(self.state.xb2, self.weights.t_out_proj_bias[l * self.config.dim ..][0..self.config.dim]);
+            try matmul(
+                self.allocator,
+                self.state.xb, // (1, 2048)
+                self.weights.t_out_proj_w[l * self.config.dim * self.config.dim .. (l + 1) * self.config.dim * self.config.dim], // (2048, 2048)
+                self.state.xb2, // (1, 2048)
+                1,
+                self.config.dim,
+                self.config.dim,
+            );
+
+            accumulate(self.state.xb2, self.weights.t_out_proj_bias[l * self.config.dim .. (l + 1) * self.config.dim]);
 
             // TODO: Add residual connections
 
@@ -1038,159 +1080,163 @@ const TextModel = struct {
 
             // TODO: Add FFN
 
-            try matmul(self.allocator, self.state.x, self.weights.t_fc1_w[l * self.config.dim ..][0 .. self.config.dim * 3], self.state.hb, 1, self.config.dim * 3, self.config.dim);
-            accumulate(self.state.hb, self.weights.t_fc1_b);
+            // upcasting
+            // X (1, 2048) @ fc1 (2048,8192) -> hb (1, 8192)
+
+            try matmul(
+                self.allocator,
+                self.state.x,
+                self.weights.t_fc1_w[l * self.config.dim * self.config.hidden_dim .. (l + 1) * self.config.dim * self.config.hidden_dim],
+                self.state.hb,
+                1,
+                self.config.hidden_dim,
+                self.config.dim,
+            );
+
+            accumulate(self.state.hb, self.weights.t_fc1_b[l * self.config.hidden_dim .. (l + 1) * self.config.hidden_dim]);
+            // hb (1, 8192) + fc1b (1, 8192)
+
             gelu(self.state.hb);
-            try matmul(self.allocator, self.state.hb, self.weights.t_fc2_w[l * self.config.dim * 3 ..][0..self.config.dim], self.state.hb2, 1, self.config.dim, self.config.dim * 3);
+
+            // hb (1,8192) @ t_fc2_w(8192, 2048) -> hb2(1, 2048)
+
+            try matmul(
+                self.allocator,
+                self.state.hb,
+                self.weights.t_fc2_w[l * self.config.hidden_dim * self.config.dim .. (l + 1) * self.config.hidden_dim * self.config.dim],
+                self.state.hb2,
+                1,
+                self.config.dim,
+                self.config.hidden_dim,
+            );
+            // hb2 (1, 2048) + self.weights (1, 2048)
+
+            accumulate(self.state.hb2, self.weights.t_fc2_b[l * self.config.dim .. (l + 1) * self.config.dim]);
 
             // residual connection from mlp back to x
 
+            // x (1, 2048) + hb2(1, 2048)
             accumulate(self.state.x, self.state.hb2);
 
             // final LN and then linear
 
-            //TODO figure out if you can reuse the norm variable
-            const norm2 = try layer_norm(self.state.x, self.weights.t_ln_out_w[0..self.config.dim][0..self.config.vocab], self.weights.t_ln_out_b, 1e-5, self.allocator);
-            self.allocator.free(norm2);
+            try layer_norm(
+                self.state.x,
+                self.weights.t_ln_out_w,
+                self.weights.t_ln_out_b,
+                1e-5,
+            );
 
-            @memcpy(self.state.x, norm2);
-            // TODO: Do I need a new variable or can i just keep using self.state.x? Find out.
-
-            try matmul(self.allocator, self.state.x, self.weights.t_linear_w, self.state.logits, 1, self.config.vocab, self.config.dim);
+            try matmul(
+                self.allocator,
+                self.state.x,
+                self.weights.t_linear_w,
+                self.state.logits,
+                1,
+                self.config.vocab,
+                self.config.dim,
+            );
             accumulate(self.state.logits, self.weights.t_linear_b);
-
-            return self.state.logits;
+            // std.debug.print("logits : {any} \n", .{self.state.logits[0..10]});
+            // std.debug.print("================= \n", .{});
         }
     }
 
-    // fn layer_norm(input: []const f32, gamma: []const f32, beta: []const f32, epsilon: f32) []f32 {
-    //     const len = input.len;
-
-    //     // Calculate mean
-    //     var mean: f32 = 0.0;
-    //     for (input) |val| {
-    //         mean += val;
-    //     }
-    //     mean /= @floatFromInt(len);
-
-    //     // Calculate variance
-    //     var variance: f32 = 0.0;
-    //     for (input) |val| {
-    //         variance += (val - mean) * (val - mean);
-    //     }
-    //     variance /= @floatFromInt(len);
-
-    //     // Normalize, scale, and shift
-    //     var normalized: [len]f32 = undefined;
-    //     for (0..input.len) |i| {
-    //         normalized[i] = (input[i] - mean) / std.math.sqrt(variance + epsilon);
-    //         normalized[i] = gamma[i] * normalized[i] + beta[i];
-    //     }
-
-    //     return normalized;
-    // }
     pub fn layer_norm(
-        x: []f32,
+        inputs: []f32,
         weight: []const f32,
         bias: []const f32,
         eps: f32,
-        allocator: std.mem.Allocator,
-    ) ![]f32 {
-        const len = x.len;
-        const VecLen = V;
-        const Vec = @Vector(VecLen, f32);
+    ) !void {
+        const len = inputs.len;
+        if (len == 0) return error.EmptyInput;
+        if (len != weight.len or len != bias.len) return error.DimensionMismatch;
 
-        var sum: Vec = @splat(0);
-        var sum_sq: Vec = @splat(0);
-
-        // Calculate mean and variance
-        var i: usize = 0;
-        while (i + VecLen <= len) : (i += VecLen) {
-            const v = @as(Vec, x[i..][0..VecLen].*);
-            sum += v;
-            sum_sq += v * v;
+        // Compute the mean
+        var mean: f32 = 0.0;
+        for (inputs) |x| {
+            mean += x;
         }
+        const n: f32 = @floatFromInt(len);
+        mean /= n;
 
-        var mean: f32 = @reduce(.Add, sum) / @as(f32, @floatFromInt(len));
-        var variance: f32 = @reduce(.Add, sum_sq) / @as(f32, @floatFromInt(len)) - mean * mean;
-
-        // Handle remaining elements
-        while (i < len) : (i += 1) {
-            mean += (x[i] - mean) / @as(f32, @floatFromInt(i + 1));
-            const diff = x[i] - mean;
-            variance += (diff * diff - variance) / @as(f32, @floatFromInt(i + 1));
+        // Compute the variance
+        var variance: f32 = 0.0;
+        for (inputs) |x| {
+            const diff = x - mean;
+            variance += diff * diff;
         }
+        variance /= n;
 
-        // Prepare normalization factors
-        const inv_std = 1.0 / @sqrt(variance + eps);
-        const vec_mean: Vec = @splat(mean);
-        const vec_inv_std: Vec = @splat(inv_std);
+        // Compute standard deviation
+        const std_ = @sqrt(variance + eps);
 
-        // Allocate output buffer
-        var output = try allocator.alloc(f32, len);
-        errdefer allocator.free(output);
+        // Normalize the inputs
+        for (inputs, 0..inputs.len) |*x, i| {
+            if (std_ > 1e-5) {
+                x.* = (x.* - mean) / std_ * weight[i] + bias[i];
+            } else {
+                // If std_ is very small, apply a small scaling factor
+                x.* = (x.* - mean) * 0.01 * weight[i] + bias[i];
+            }
 
-        // Normalize and scale
-        i = 0;
-        while (i + VecLen <= len) : (i += VecLen) {
-            const v = @as(Vec, x[i..][0..VecLen].*);
-            const w = @as(Vec, weight[i..][0..VecLen].*);
-            const b = @as(Vec, bias[i..][0..VecLen].*);
-            const normalized = (v - vec_mean) * vec_inv_std;
-            const result = normalized * w + b;
-            @as(*Vec, @alignCast(@ptrCast(output[i..].ptr))).* = result;
+            // Clip extreme values
+            x.* = std.math.clamp(x.*, eps, 1e5);
+
+            // Check for numerical stability
+            if (std.math.isNan(x.*) or std.math.isInf(x.*)) {
+                std.debug.print("Warning: Output contains NaN or Inf at index {d}. Input: {d}, Weight: {d}, Bias: {d}, Mean: {d}, Std: {d}\n", .{ i, x.*, weight[i], bias[i], mean, std_ });
+                return error.NumericalInstability;
+            }
         }
-
-        // Handle remaining elements
-        while (i < len) : (i += 1) {
-            const normalized = (x[i] - mean) * inv_std;
-            output[i] = normalized * weight[i] + bias[i];
-        }
-        return output;
     }
-
     fn set_cos_sin_cache(self: Self, tokens: std.ArrayList(u32)) !void {
-        // TODO : Double check if this is correct or not. This could be a point of failure!
+        const half_dim = self.config.dim / 2;
 
-        // compute inverse frequncy
+        // Compute inverse frequency
         var i: usize = 0;
-        while (i < self.config.dim / 2) : (i += 1) {
-            const x = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(self.config.dim));
+        while (i < half_dim) : (i += 1) {
+            const x = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(half_dim));
             self.state.inv_freq[i] = 1.0 / std.math.pow(f32, self.config.rope_theta, x);
         }
 
-        var position_freqs = try self.allocator.alloc(f32, self.config.seq_len * self.config.dim / 2);
+        // Allocate position frequencies
+        var position_freqs = try self.allocator.alloc(f32, self.config.seq_len * half_dim);
         defer self.allocator.free(position_freqs);
 
+        // Calculate position frequencies
         for (0..tokens.items.len) |pos| {
-            for (0..self.state.inv_freq.len) |j| {
-                position_freqs[pos * self.config.dim / 2 + j] = @as(f32, @floatFromInt(pos)) * self.state.inv_freq[j];
+            for (0..half_dim) |j| {
+                position_freqs[pos * half_dim + j] = @as(f32, @floatFromInt(pos)) * self.state.inv_freq[j];
             }
         }
-        // TODO : Use SIMD for the computation!
-        // Compute and cache cosine and sine values
-        for (0..position_freqs.len) |itr| {
+
+        // Cache cosine and sine values
+        const cache_len = self.config.seq_len * half_dim;
+        for (0..cache_len) |itr| {
             const cos_val = @cos(position_freqs[itr]);
             const sin_val = @sin(position_freqs[itr]);
 
             // Store values twice to create the full dim-dimensional embedding
             self.state.cos_cache[itr] = cos_val;
-            self.state.cos_cache[itr + self.config.seq_len * self.config.dim / 2] = cos_val;
+            self.state.cos_cache[itr + cache_len] = cos_val;
             self.state.sin_cache[itr] = sin_val;
-            self.state.sin_cache[itr + self.config.seq_len * self.config.dim / 2] = sin_val;
+            self.state.sin_cache[itr + cache_len] = sin_val;
         }
     }
 
     fn apply_rope(self: Self, vec: []f32, pos: usize) !void {
-        const cos = self.state.cos_cache[pos * self.config.dim .. (pos + 1) * self.config.dim];
-        const sin = self.state.sin_cache[pos * self.config.dim .. (pos + 1) * self.config.dim];
+        assert(vec.len == self.config.dim);
+        const half_dim = self.config.dim / 2;
+        const cos = self.state.cos_cache[pos * half_dim .. (pos + 1) * half_dim];
+        const sin = self.state.sin_cache[pos * half_dim .. (pos + 1) * half_dim];
 
         var i: usize = 0;
-        while (i < self.config.dim) : (i += 2) {
-            const temp1 = vec[i];
-            const temp2 = vec[i + 1];
-            vec[i] = temp1 * cos[i] - temp2 * sin[i];
-            vec[i + 1] = temp1 * sin[i] + temp2 * cos[i];
+        while (i < half_dim) : (i += 1) {
+            const temp1 = vec[2 * i];
+            const temp2 = vec[2 * i + 1];
+            vec[2 * i] = temp1 * cos[i] - temp2 * sin[i];
+            vec[2 * i + 1] = temp1 * sin[i] + temp2 * cos[i];
         }
     }
 
@@ -1205,7 +1251,85 @@ const TextModel = struct {
 const VisionModel = struct {};
 
 // inference
-pub fn generate() !void {}
+fn generate(text_model: *TextModel, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
+    var tokens = try text_model.tokenizer.encode(prompt);
+    defer tokens.deinit();
+
+    try text_model.set_cos_sin_cache(tokens);
+
+    var generated_tokens = std.ArrayList(u32).init(allocator);
+    defer generated_tokens.deinit();
+
+    try generated_tokens.appendSlice(tokens.items);
+
+    var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+
+    while (generated_tokens.items.len < tokens.items.len + max_new_tokens) {
+        try text_model.forward(generated_tokens, generated_tokens.items.len - 1);
+
+        const next_token = try sampleNextToken(text_model.state.logits, temperature, top_p, &rng, allocator);
+        try generated_tokens.append(next_token);
+
+        if (next_token == text_model.tokenizer.eos_token) break;
+    }
+    const decoding = try text_model.tokenizer.decode(generated_tokens);
+
+    return decoding;
+}
+
+fn sampleNextToken(logits: []f32, temperature: f32, top_p: f32, rng: *std.rand.DefaultPrng, allocator: Allocator) !u32 {
+    var adjusted_logits = try allocator.alloc(f32, logits.len);
+    defer allocator.free(adjusted_logits);
+
+    // Apply temperature
+    for (logits, 0..) |logit, i| {
+        adjusted_logits[i] = logit / temperature;
+    }
+
+    // Convert to probabilities
+    softmax(adjusted_logits);
+    std.debug.print("Softmax logits : {any}", .{adjusted_logits[0..10]});
+    std.debug.print("\n===========================\n\n", .{});
+
+    // Implement top-p sampling
+    const cumulative_probs = try allocator.alloc(f32, logits.len);
+    defer allocator.free(cumulative_probs);
+
+    @memcpy(cumulative_probs, adjusted_logits);
+    std.sort.pdq(f32, cumulative_probs, {}, std.sort.desc(f32));
+
+    var cumsum: f32 = 0;
+    var cutoff_index: usize = 0;
+    for (cumulative_probs, 0..) |prob, i| {
+        cumsum += prob;
+        if (cumsum > top_p) {
+            cutoff_index = i;
+            break;
+        }
+    }
+
+    // Zero out probabilities below the cutoff
+    for (adjusted_logits) |*prob| {
+        if (prob.* < cumulative_probs[cutoff_index]) {
+            prob.* = 0;
+        }
+    }
+
+    // Renormalize
+    softmax(adjusted_logits);
+
+    // Sample from the distribution
+    const random_value = rng.random().float(f32);
+    var sum: f32 = 0;
+    for (adjusted_logits, 0..) |prob, i| {
+        sum += prob;
+        if (sum > random_value) {
+            return @intCast(i);
+        }
+    }
+
+    return error.SamplingFailed;
+}
 
 // main
 
@@ -1253,25 +1377,22 @@ pub fn main() !void {
     // initializing text model //
     var text_model = try TextModel.init(config, weights, tokenizer, state, allocator);
 
-    // End of loading model checkpoint
-    const text = "Hello, World!";
-    const tokens = try tokenizer.encode(text);
+    const prompt = "this is a whiteboard <image> Hello, World!";
+    const max_new_tokens = 5;
+    const temperature = 0.1;
+    const top_p = 0.9;
 
-    // precomputing frequencies
-    try text_model.set_cos_sin_cache(tokens);
-    // precomputation done!
-
-    // main generation loop
     var timer = try std.time.Timer.start();
-    for (0..tokens.items.len) |pos| {
-        // std.debug.print("\n token : {}", .{tokens.items[pos]});
-        try text_model.forward(tokens, pos);
-    }
+
+    const generated_text = try generate(&text_model, prompt, max_new_tokens, temperature, top_p, allocator);
+    defer allocator.free(generated_text);
+
     const elapsed_ns = timer.read();
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
-    std.debug.print("\n Generation took : {d:.3} seconds. \n", .{seconds});
 
-    // We only need to pass tokens one by one into the transformer loop because of KV cache!
+    std.debug.print("\nPrompt: {s}\n", .{prompt});
+    std.debug.print("Generated text: {s}\n", .{generated_text});
+    std.debug.print("Generation took: {d:.3} seconds.\n", .{seconds});
 }
 
 // tests
