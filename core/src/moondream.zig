@@ -942,7 +942,7 @@ const Tokenizer = struct {
 };
 
 // text model
-const TextModel = struct {
+const Model = struct {
     const Self = @This();
     config: Config,
     weights: Weights,
@@ -950,8 +950,8 @@ const TextModel = struct {
     state: RunState,
     allocator: Allocator,
 
-    fn init(config: Config, weights: Weights, tokenizer: Tokenizer, state: RunState, allocator: Allocator) !TextModel {
-        return TextModel{
+    fn init(config: Config, weights: Weights, tokenizer: Tokenizer, state: RunState, allocator: Allocator) !Model {
+        return Model{
             .config = config,
             .weights = weights,
             .tokenizer = tokenizer,
@@ -960,7 +960,7 @@ const TextModel = struct {
         };
     }
 
-    fn forward(self: Self, tokens: std.ArrayList(u32), pos: usize) !void {
+    fn text_model(self: Self, tokens: std.ArrayList(u32), pos: usize) !void {
         const token = tokens.items[pos];
 
         const sqrt: f32 = @floatFromInt(self.config.head_dim);
@@ -1251,7 +1251,7 @@ const TextModel = struct {
 const VisionModel = struct {};
 
 // inference
-fn generate(text_model: *TextModel, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
+fn generate(text_model: *Model, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
     var tokens = try text_model.tokenizer.encode(prompt);
     defer tokens.deinit();
 
@@ -1265,7 +1265,7 @@ fn generate(text_model: *TextModel, prompt: []const u8, max_new_tokens: usize, t
     var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
 
     while (generated_tokens.items.len < tokens.items.len + max_new_tokens) {
-        try text_model.forward(generated_tokens, generated_tokens.items.len - 1);
+        try text_model.text_model(generated_tokens, generated_tokens.items.len - 1);
 
         const next_token = try sampleNextToken(text_model.state.logits, temperature, top_p, &rng, allocator);
         try generated_tokens.append(next_token);
@@ -1375,7 +1375,7 @@ pub fn main() !void {
     defer state.deinit(allocator);
 
     // initializing text model //
-    var text_model = try TextModel.init(config, weights, tokenizer, state, allocator);
+    var text_model = try Model.init(config, weights, tokenizer, state, allocator);
 
     const prompt = "this is a whiteboard <image> Hello, World!";
     const max_new_tokens = 5;
