@@ -10,6 +10,25 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // Start of adding image libraries //
+
+    // Add dependencies folder as library path to search for your libstb_image.so and libstb_resize2.c file
+
+    exe.addLibraryPath(std.Build.LazyPath{ .src_path = .{
+        .owner = b,
+        .sub_path = "dependencies",
+    } });
+
+    // Link the stb_image library
+    exe.linkSystemLibrary("stb_image");
+    exe.linkSystemLibrary("stb_image_resize2");
+    exe.linkLibC();
+
+    // End of adding image libraries //
+
+    // Linking GGML //
+
     // exe.addIncludePath(b.path("./dependencies/ggml/include/"));
     // exe.addIncludePath(b.path("./dependencies/ggml/include/ggml"));
     // exe.addCSourceFiles(.{
@@ -27,6 +46,9 @@ pub fn build(b: *std.Build) void {
     // });
     // exe.linkLibC();
     // exe.linkLibCpp();
+
+    // End of linking GGML //
+
     b.installArtifact(exe);
 
     const test_targets = [_]std.Target.Query{

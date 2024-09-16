@@ -71,3 +71,4 @@ src/tokenizer.zig
 OpenBLAS
 
 weightorder.txt
+.vscode/settings.json

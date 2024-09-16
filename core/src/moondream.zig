@@ -7,6 +7,11 @@ const builtin = @import("builtin");
 const T: usize = 64; // Tile size (adjust as necessary)
 const V: usize = 32; // Vector size (adjust as necessary)
 const simd_align = @alignOf(@Vector(V, f32));
+const c = @cImport({
+    @cInclude("stb_image.h");
+    @cInclude("stb_image_resize2.h");
+    @cInclude("stdio.h");
+});
 // TODO : add std.simd.suggestvectorlength
 
 // vector math functions
@@ -396,7 +401,7 @@ const Config = struct {
 /// Struct defines the weights of moondream
 /// All weights are transposed
 /// Naming convention :
-/// "t_" prefix : text_model (phi 1.5)
+/// "t_" prefix : model (phi 1.5)
 /// "v_" prefix : vision_model (vision encoder)
 /// "_w" suffix : weights
 /// "_b" suffix : biases
@@ -728,6 +733,7 @@ const Weights = struct {
 const RunState = struct {
     const Self = @This();
 
+    img: []align(simd_align) f32,
     x: []align(simd_align) f32,
     xb: []align(simd_align) f32,
     xb2: []align(simd_align) f32,
@@ -747,6 +753,7 @@ const RunState = struct {
 
     fn init(allocator: Allocator, config: Config) !Self {
         return Self{
+            .img = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
             .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
@@ -1142,6 +1149,58 @@ const Model = struct {
         }
     }
 
+    pub fn preprocess(
+        self: Self,
+        image_path: []const u8,
+        allocator: Allocator,
+    ) ![]f32 {
+        // Load the image
+        const target_height = self.config.img_dim;
+        const target_width = self.config.img_dim;
+
+        const c_image_path = @as([*c]const u8, @ptrCast(image_path.ptr));
+        var width: c_int = 0;
+        var height: c_int = 0;
+        var channels: c_int = 0;
+
+        const img_data = c.stbi_load(c_image_path, &width, &height, &channels, 0);
+        if (img_data == null) {
+            return error.FailedToLoadImage;
+        }
+        defer c.stbi_image_free(img_data);
+
+        std.debug.print("Loaded image with width: {d}, height: {d}, channels: {d}\n", .{ width, height, channels });
+
+        const resized_data = try allocator.alloc(u8, target_height * target_width * self.config.img_channels);
+
+        const result = c.stbir_resize_uint8_srgb(
+            img_data,
+            width,
+            height,
+            0,
+            resized_data.ptr,
+            @as(c_int, @intCast(target_width)),
+            @as(c_int, @intCast(target_height)),
+            0,
+            c.STBIR_RGB,
+        );
+
+        if (result == 0) {
+            return error.FailedToResizeImage;
+        }
+        var float_image = try allocator.alloc(f32, target_width * target_height * @as(usize, @intCast(channels)));
+        const mean = [3]f32{ 0.5, 0.5, 0.5 };
+        const stddev = [3]f32{ 0.5, 0.5, 0.5 };
+
+        for (0..(target_width * target_height * @as(usize, @intCast(channels)))) |i| {
+            const pixel_value: u8 = resized_data[i];
+            const normalized_value = (@as(f32, @floatFromInt(pixel_value)) / 255.0 - mean[i % 3]) / stddev[i % 3];
+            float_image[i] = normalized_value;
+        }
+
+        return float_image;
+    }
+
     pub fn layer_norm(
         inputs: []f32,
         weight: []const f32,
@@ -1246,16 +1305,15 @@ const Model = struct {
     }
 };
 
-// vision model
-
-const VisionModel = struct {};
-
 // inference
-fn generate(text_model: *Model, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
-    var tokens = try text_model.tokenizer.encode(prompt);
+fn generate(model: *Model, image_path: []const u8, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
+    const float_image = try model.preprocess(image_path, allocator);
+    std.debug.print("Image float len : {any} \n", .{float_image.len});
+
+    var tokens = try model.tokenizer.encode(prompt);
     defer tokens.deinit();
 
-    try text_model.set_cos_sin_cache(tokens);
+    try model.set_cos_sin_cache(tokens);
 
     var generated_tokens = std.ArrayList(u32).init(allocator);
     defer generated_tokens.deinit();
@@ -1265,14 +1323,14 @@ fn generate(text_model: *Model, prompt: []const u8, max_new_tokens: usize, tempe
     var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
 
     while (generated_tokens.items.len < tokens.items.len + max_new_tokens) {
-        try text_model.text_model(generated_tokens, generated_tokens.items.len - 1);
+        try model.text_model(generated_tokens, generated_tokens.items.len - 1);
 
-        const next_token = try sampleNextToken(text_model.state.logits, temperature, top_p, &rng, allocator);
+        const next_token = try sampleNextToken(model.state.logits, temperature, top_p, &rng, allocator);
         try generated_tokens.append(next_token);
 
-        if (next_token == text_model.tokenizer.eos_token) break;
+        if (next_token == model.tokenizer.eos_token) break;
     }
-    const decoding = try text_model.tokenizer.decode(generated_tokens);
+    const decoding = try model.tokenizer.decode(generated_tokens);
 
     return decoding;
 }
@@ -1341,6 +1399,7 @@ pub fn main() !void {
     // Constants //
     const bin_path: []const u8 = "../moondream_f32.bin";
     const config_path: ?[]const u8 = "../model_config.json";
+    const image_path: []const u8 = "images/frierenburger.png";
 
     // Start of loading config file //
     const config_file = try std.fs.cwd().openFile(config_path.?, .{}); // TODO: Add filereader inside the init function for config itself.
@@ -1375,7 +1434,7 @@ pub fn main() !void {
     defer state.deinit(allocator);
 
     // initializing text model //
-    var text_model = try Model.init(config, weights, tokenizer, state, allocator);
+    var model = try Model.init(config, weights, tokenizer, state, allocator);
 
     const prompt = "this is a whiteboard <image> Hello, World!";
     const max_new_tokens = 5;
@@ -1384,7 +1443,7 @@ pub fn main() !void {
 
     var timer = try std.time.Timer.start();
 
-    const generated_text = try generate(&text_model, prompt, max_new_tokens, temperature, top_p, allocator);
+    const generated_text = try generate(&model, image_path, prompt, max_new_tokens, temperature, top_p, allocator);
     defer allocator.free(generated_text);
 
     const elapsed_ns = timer.read();
