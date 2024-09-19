@@ -1149,58 +1149,6 @@ const Model = struct {
         }
     }
 
-    pub fn preprocess(
-        self: Self,
-        image_path: []const u8,
-        allocator: Allocator,
-    ) ![]f32 {
-        // Load the image
-        const target_height = self.config.img_dim;
-        const target_width = self.config.img_dim;
-
-        const c_image_path = @as([*c]const u8, @ptrCast(image_path.ptr));
-        var width: c_int = 0;
-        var height: c_int = 0;
-        var channels: c_int = 0;
-
-        const img_data = c.stbi_load(c_image_path, &width, &height, &channels, 0);
-        if (img_data == null) {
-            return error.FailedToLoadImage;
-        }
-        defer c.stbi_image_free(img_data);
-
-        std.debug.print("Loaded image with width: {d}, height: {d}, channels: {d}\n", .{ width, height, channels });
-
-        const resized_data = try allocator.alloc(u8, target_height * target_width * self.config.img_channels);
-
-        const result = c.stbir_resize_uint8_srgb(
-            img_data,
-            width,
-            height,
-            0,
-            resized_data.ptr,
-            @as(c_int, @intCast(target_width)),
-            @as(c_int, @intCast(target_height)),
-            0,
-            c.STBIR_RGB,
-        );
-
-        if (result == 0) {
-            return error.FailedToResizeImage;
-        }
-        var float_image = try allocator.alloc(f32, target_width * target_height * @as(usize, @intCast(channels)));
-        const mean = [3]f32{ 0.5, 0.5, 0.5 };
-        const stddev = [3]f32{ 0.5, 0.5, 0.5 };
-
-        for (0..(target_width * target_height * @as(usize, @intCast(channels)))) |i| {
-            const pixel_value: u8 = resized_data[i];
-            const normalized_value = (@as(f32, @floatFromInt(pixel_value)) / 255.0 - mean[i % 3]) / stddev[i % 3];
-            float_image[i] = normalized_value;
-        }
-
-        return float_image;
-    }
-
     pub fn layer_norm(
         inputs: []f32,
         weight: []const f32,
@@ -1303,12 +1251,69 @@ const Model = struct {
     fn embed(self: Self, token: usize) []f32 {
         return self.weights.word_token_embedding[token * self.config.dim ..][0..self.config.dim];
     }
+
+    pub fn preprocess(
+        self: Self,
+        image_path: []const u8,
+        allocator: Allocator,
+    ) ![]f32 {
+        // Load the image
+        const target_height = self.config.img_dim;
+        const target_width = self.config.img_dim;
+
+        const c_image_path = @as([*c]const u8, @ptrCast(image_path.ptr));
+        var width: c_int = 0;
+        var height: c_int = 0;
+        var channels: c_int = 0;
+
+        const img_data = c.stbi_load(c_image_path, &width, &height, &channels, 0);
+        if (img_data == null) {
+            return error.FailedToLoadImage;
+        }
+        defer c.stbi_image_free(img_data);
+
+        std.debug.print("Loaded image with width: {d}, height: {d}, channels: {d}\n", .{ width, height, channels });
+
+        const resized_data = try allocator.alloc(u8, target_height * target_width * @as(usize, @intCast(channels)));
+
+        const result = c.stbir_resize_uint8_srgb(
+            img_data,
+            width,
+            height,
+            0,
+            resized_data.ptr,
+            @as(c_int, @intCast(target_width)),
+            @as(c_int, @intCast(target_height)),
+            0,
+            if (channels == 3) c.STBIR_RGB else c.STBIR_RGBA,
+        );
+
+        if (result == 0) {
+            return error.FailedToResizeImage;
+        }
+        var float_image = try allocator.alloc(f32, target_width * target_height * @as(usize, @intCast(channels)));
+        const mean = [3]f32{ 0.5, 0.5, 0.5 };
+        const stddev = [3]f32{ 0.5, 0.5, 0.5 };
+
+        for (0..(target_width * target_height * @as(usize, @intCast(channels)))) |i| {
+            const pixel_value: u8 = resized_data[i];
+            // Scale to 0-1 range
+            const scaled_value = @as(f32, @floatFromInt(pixel_value)) / 255.0;
+            // Apply normalization
+            const normalized_value = (scaled_value - mean[i % 3]) / stddev[i % 3];
+            float_image[i] = normalized_value;
+            float_image[i] = scaled_value;
+        }
+
+        return float_image;
+    }
 };
 
 // inference
 fn generate(model: *Model, image_path: []const u8, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
     const float_image = try model.preprocess(image_path, allocator);
     std.debug.print("Image float len : {any} \n", .{float_image.len});
+    std.debug.print("First 10 Image pixels : {any} \n", .{float_image});
 
     var tokens = try model.tokenizer.encode(prompt);
     defer tokens.deinit();
