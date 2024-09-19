@@ -345,6 +345,7 @@ const ConfigReader = extern struct {
     img_channels: i32, // number of channels per patch, RGB has 3
     img_dim: i32, // dimension of the the image, 378x378 default
     patch_size: i32, // size of patch, 14x14 default
+    vit_embed_len: i32, // vision embed len
     vit_dim: i32, // width of each patch embedding created from linear patch embedding layer, 1152 default
     n_vit_layers: i32,
     n_vit_heads: i32,
@@ -365,6 +366,7 @@ const ConfigReader = extern struct {
             .img_channels = @intCast(self.img_channels),
             .img_dim = @intCast(self.img_dim),
             .patch_size = @intCast(self.patch_size),
+            .vit_embed_len = @intCast(self.vit_embed_len),
             .vit_dim = @intCast(self.vit_dim),
             .n_vit_layers = @intCast(self.n_vit_layers),
             .n_vit_heads = @intCast(self.n_vit_heads),
@@ -391,6 +393,7 @@ const Config = struct {
     img_channels: usize, // number of channels per patch, RGB has 3
     img_dim: usize, // dimension of the the image, 378x378 default
     patch_size: usize, // size of patch, 14x14 default
+    vit_embed_len: usize,
     vit_dim: usize, // width of each patch embedding created from linear patch embedding layer, 1152 default
     n_vit_layers: usize, // number of ViT layers, 27 default for the vision model
     n_vit_heads: usize, // number of attn heads for each attn layer, 16 default
@@ -1246,12 +1249,11 @@ const Model = struct {
             vec[2 * i + 1] = temp1 * sin[i] + temp2 * cos[i];
         }
     }
-
-    /// compute embedding for a single token
     fn embed(self: Self, token: usize) []f32 {
         return self.weights.word_token_embedding[token * self.config.dim ..][0..self.config.dim];
     }
 
+    /// This function will load the images and then preprocess them into the required format
     pub fn preprocess(
         self: Self,
         image_path: []const u8,
@@ -1291,29 +1293,46 @@ const Model = struct {
         if (result == 0) {
             return error.FailedToResizeImage;
         }
+
         var float_image = try allocator.alloc(f32, target_width * target_height * @as(usize, @intCast(channels)));
         const mean = [3]f32{ 0.5, 0.5, 0.5 };
         const stddev = [3]f32{ 0.5, 0.5, 0.5 };
 
-        for (0..(target_width * target_height * @as(usize, @intCast(channels)))) |i| {
-            const pixel_value: u8 = resized_data[i];
-            // Scale to 0-1 range
-            const scaled_value = @as(f32, @floatFromInt(pixel_value)) / 255.0;
-            // Apply normalization
-            const normalized_value = (scaled_value - mean[i % 3]) / stddev[i % 3];
-            float_image[i] = normalized_value;
-            float_image[i] = scaled_value;
+        // reorganize the data from (H,W,C) to (C, H, W) format that torch uses
+        // initially data is stored in [R,G,B,R,G,B,R,G,B...R,G,B] format
+        // now we want to store it as [R,R,R,R,R,R,..G,G,G,G,G..B,B,B,B,B] format where the RGB values are contiguous
+        for (0..@as(usize, @intCast(channels))) |ch| {
+            for (0..target_height) |h| {
+                for (0..target_width) |w| {
+                    const src_idx = (h * target_width + w) * @as(usize, @intCast(channels)) + ch;
+                    const dst_idx = ch * target_height * target_width + h * target_width + w;
+
+                    const pixel_value: u8 = resized_data[src_idx];
+                    // scale to 0-1 range
+                    const scaled_value = @as(f32, @floatFromInt(pixel_value)) / 255.0;
+                    // apply normalization
+                    const normalized_value = (scaled_value - mean[ch]) / stddev[ch];
+                    float_image[dst_idx] = normalized_value;
+                }
+            }
         }
 
+        std.debug.print("Image len : {any} \n", .{float_image.len});
         return float_image;
+    }
+    fn vision_encoder(self: Self) !void {
+        std.debug.print("Image len : {any} \n", .{self.state.img.len});
+        // now the vision encoder will take in the float image and divide it into
+        // patches of self.patch_size x self.patch_size (14 x 14)
+        // we have to rearrange the values of the patches
     }
 };
 
 // inference
 fn generate(model: *Model, image_path: []const u8, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
     const float_image = try model.preprocess(image_path, allocator);
-    std.debug.print("Image float len : {any} \n", .{float_image.len});
-    std.debug.print("First 10 Image pixels : {any} \n", .{float_image});
+    model.state.img = @alignCast(@ptrCast(float_image));
+    try model.vision_encoder();
 
     var tokens = try model.tokenizer.encode(prompt);
     defer tokens.deinit();
