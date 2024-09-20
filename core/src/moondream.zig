@@ -737,6 +737,8 @@ const RunState = struct {
     const Self = @This();
 
     img: []align(simd_align) f32,
+    patches: []align(simd_align) f32,
+    patch_emb: []align(simd_align) f32,
     x: []align(simd_align) f32,
     xb: []align(simd_align) f32,
     xb2: []align(simd_align) f32,
@@ -757,6 +759,8 @@ const RunState = struct {
     fn init(allocator: Allocator, config: Config) !Self {
         return Self{
             .img = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
+            .patches = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
+            .patch_emb = try allocator.alignedAlloc(f32, simd_align, (config.img_dim * config.img_dim * config.vit_dim) / (config.patch_size * config.patch_size)),
             .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
@@ -1316,8 +1320,6 @@ const Model = struct {
                 }
             }
         }
-
-        std.debug.print("Image len : {any} \n", .{float_image.len});
         return float_image;
     }
     fn vision_encoder(self: Self) !void {
@@ -1325,13 +1327,54 @@ const Model = struct {
         // now the vision encoder will take in the float image and divide it into
         // patches of self.patch_size x self.patch_size (14 x 14)
         // we have to rearrange the values of the patches
+
+        // calculate the number of patches along height and width, these are the same for now
+        // because we're using tensors which images resized to 378 x 378 through preprocess()
+
+        const channels = self.config.img_channels; // 3 channels
+        const img_h = self.config.img_dim;
+        const img_w = self.config.img_dim;
+        const patch_h = self.config.patch_size;
+        const patch_w = self.config.patch_size;
+        const patch_elements = patch_h * patch_w * channels;
+        const num_patches_h = img_h / patch_h;
+        const num_patches_w = img_h / patch_w;
+        const num_patches = num_patches_h * num_patches_w;
+
+        // we are going to change the format of our image from (C, H, W) to (h * w, channels * p1 * p2)
+        for (0..num_patches_h) |h_patch| {
+            for (0..num_patches_w) |w_patch| {
+                for (0..channels) |ch| {
+                    for (0..patch_h) |h| {
+                        for (0..patch_w) |w| {
+                            const src_idx = ch * img_h * img_w + (h_patch * patch_h + h) * img_w + (w_patch * patch_w + w);
+                            const dest_idx = (h_patch * num_patches_w + w_patch) * channels * patch_h * patch_w + (ch * patch_h * patch_w + h * patch_w + w);
+                            self.state.patches[dest_idx] = self.state.img[src_idx];
+                        }
+                    }
+                }
+            }
+        }
+
+        // we get the patch embedding by doing matmul with the patch embedding linear layer and adding bias
+        // each patch is individually multiplied and then stored into self.state.patches!
+        for (0..num_patches) |patch| {
+            try matmul(self.allocator, self.state.patches[patch * patch_elements .. (patch + 1) * patch_elements], self.weights.v_patch_embedding_linear_w, self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], 1, self.config.vit_dim, patch_elements);
+            accumulate(self.state.patches[patch * patch_elements .. (patch + 1) * patch_elements], self.weights.v_patch_embedding_linear_b);
+        }
+
+        // next up is positional embedding
+
     }
 };
 
 // inference
 fn generate(model: *Model, image_path: []const u8, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
-    const float_image = try model.preprocess(image_path, allocator);
-    model.state.img = @alignCast(@ptrCast(float_image));
+    const preprocessed = try model.preprocess(image_path, allocator);
+    defer allocator.free(preprocessed);
+
+    // Now you can safely use float_image with SIMD operations
+    @memcpy(model.state.img, preprocessed);
     try model.vision_encoder();
 
     var tokens = try model.tokenizer.encode(prompt);
