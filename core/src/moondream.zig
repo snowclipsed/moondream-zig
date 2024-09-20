@@ -739,6 +739,10 @@ const RunState = struct {
     img: []align(simd_align) f32,
     patches: []align(simd_align) f32,
     patch_emb: []align(simd_align) f32,
+    v_x: []align(simd_align) f32,
+    v_q: []align(simd_align) f32,
+    v_k: []align(simd_align) f32,
+    v_v: []align(simd_align) f32,
     x: []align(simd_align) f32,
     xb: []align(simd_align) f32,
     xb2: []align(simd_align) f32,
@@ -761,6 +765,10 @@ const RunState = struct {
             .img = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
             .patches = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
             .patch_emb = try allocator.alignedAlloc(f32, simd_align, (config.img_dim * config.img_dim * config.vit_dim) / (config.patch_size * config.patch_size)),
+            .v_x = try allocator.alignedAlloc(f32, simd_align, (config.img_dim * config.img_dim * config.vit_dim) / (config.patch_size * config.patch_size)),
+            .v_q = try allocator.alignedAlloc(f32, simd_align, config.vit_dim * config.vit_dim),
+            .v_k = try allocator.alignedAlloc(f32, simd_align, config.vit_dim * config.vit_dim),
+            .v_v = try allocator.alignedAlloc(f32, simd_align, config.vit_dim * config.vit_dim),
             .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
@@ -1369,6 +1377,14 @@ const Model = struct {
 
         accumulate(self.state.patch_emb, self.weights.v_pos_embedding);
 
+        // we will now pass our positionally encoded patch embeddings through the ViT blocks.
+        @memcpy(self.state.v_x, self.state.patch_emb);
+
+        for (0..num_patches) |patch| {
+            for (0..self.config.n_vit_layers) |l| {
+                try layer_norm(self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.weights.v_norm1_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim], self.weights.v_norm1_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim], 1e-5);
+            }
+        }
         std.debug.print("Pass! \n", .{});
     }
 };
