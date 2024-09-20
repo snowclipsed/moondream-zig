@@ -111,6 +111,37 @@ pub fn accumulate(accum: []f32, x: []const f32) void {
     }
 }
 
+fn transposeSimd(allocator: std.mem.Allocator, matrix: []const f32, rows: usize, cols: usize) ![]f32 {
+    const transposed = try allocator.alloc(f32, rows * cols);
+    errdefer allocator.free(transposed);
+
+    const VectorType = @Vector(4, f32);
+    const simd_width = 4;
+
+    var i: usize = 0;
+    while (i < rows) : (i += simd_width) {
+        var j: usize = 0;
+        while (j < cols) : (j += 1) {
+            if (i + simd_width <= rows) {
+                const v0 = matrix[(i + 0) * cols + j];
+                const v1 = matrix[(i + 1) * cols + j];
+                const v2 = matrix[(i + 2) * cols + j];
+                const v3 = matrix[(i + 3) * cols + j];
+                const vec = VectorType{ v0, v1, v2, v3 };
+
+                @as(*VectorType, @alignCast(@ptrCast(transposed.ptr + j * rows + i))).* = vec;
+            } else {
+                var k: usize = 0;
+                while (k < rows - i) : (k += 1) {
+                    transposed[j * rows + (i + k)] = matrix[(i + k) * cols + j];
+                }
+            }
+        }
+    }
+
+    return transposed;
+}
+
 /// Matrix Multiplication
 pub fn matmul(allocator: std.mem.Allocator, A: []const f32, B: []const f32, C: []f32, M: usize, N: usize, K: usize) !void {
     // TODO : add size checking for all the matrices using assert.
@@ -740,6 +771,7 @@ const RunState = struct {
     patches: []align(simd_align) f32,
     patch_emb: []align(simd_align) f32,
     v_x: []align(simd_align) f32,
+    v_qkv: []align(simd_align) f32,
     v_q: []align(simd_align) f32,
     v_k: []align(simd_align) f32,
     v_v: []align(simd_align) f32,
@@ -766,9 +798,10 @@ const RunState = struct {
             .patches = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
             .patch_emb = try allocator.alignedAlloc(f32, simd_align, (config.img_dim * config.img_dim * config.vit_dim) / (config.patch_size * config.patch_size)),
             .v_x = try allocator.alignedAlloc(f32, simd_align, (config.img_dim * config.img_dim * config.vit_dim) / (config.patch_size * config.patch_size)),
-            .v_q = try allocator.alignedAlloc(f32, simd_align, config.vit_dim * config.vit_dim),
-            .v_k = try allocator.alignedAlloc(f32, simd_align, config.vit_dim * config.vit_dim),
-            .v_v = try allocator.alignedAlloc(f32, simd_align, config.vit_dim * config.vit_dim),
+            .v_qkv = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.vit_dim * 3 / (config.patch_size * config.patch_size)),
+            .v_q = try allocator.alignedAlloc(f32, simd_align, config.vit_dim),
+            .v_k = try allocator.alignedAlloc(f32, simd_align, config.vit_dim),
+            .v_v = try allocator.alignedAlloc(f32, simd_align, config.vit_dim),
             .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
@@ -1350,7 +1383,7 @@ const Model = struct {
         const num_patches_w = img_h / patch_w;
         const num_patches = num_patches_h * num_patches_w;
 
-        // we are going to change the format of our image from (C, H, W) to (h * w, channels * p1 * p2)
+        // we are going to change the format of our image from (C, H, W) to (h * w, C * p1 * p2) or (729, 3 * 14 * 14)
         for (0..num_patches_h) |h_patch| {
             for (0..num_patches_w) |w_patch| {
                 for (0..channels) |ch| {
@@ -1367,28 +1400,71 @@ const Model = struct {
 
         // we get the patch embedding by doing matmul with the patch embedding linear layer and adding bias
         // each patch is individually multiplied and then stored into self.state.patches!
+
         for (0..num_patches) |patch| {
-            try matmul(self.allocator, self.state.patches[patch * patch_elements .. (patch + 1) * patch_elements], self.weights.v_patch_embedding_linear_w, self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], 1, self.config.vit_dim, patch_elements);
-            accumulate(self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.weights.v_patch_embedding_linear_b);
+            // for each patch, we do matrix multiplication
+            // (1, 3 * 14 * 14)  @ (3 * 14 * 14, 1152)
+            // all this is stored in patch_emb which is (729, 1152)
+            try matmul(
+                self.allocator,
+                self.state.patches[patch * patch_elements .. (patch + 1) * patch_elements],
+                self.weights.v_patch_embedding_linear_w,
+                self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
+                1,
+                self.config.vit_dim,
+                patch_elements,
+            );
+            accumulate(
+                self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
+                self.weights.v_patch_embedding_linear_b,
+            );
         }
 
         // next up is positional embedding, which is directly just accumulated into the patch embedding!
         // x = x + pos_embed
-
-        accumulate(self.state.patch_emb, self.weights.v_pos_embedding);
+        // pos embed dim (729, 1152) + v_pos_embed (1152, 729) ^ Transposed
+        accumulate(self.state.patch_emb, try transposeSimd(self.allocator, self.weights.v_pos_embedding, 1152, 729));
 
         // we will now pass our positionally encoded patch embeddings through the ViT blocks.
+        // v_x (729, 1152)
         @memcpy(self.state.v_x, self.state.patch_emb);
 
-        for (0..num_patches) |patch| {
-            for (0..self.config.n_vit_layers) |l| {
-                try layer_norm(self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.weights.v_norm1_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim], self.weights.v_norm1_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim], 1e-5);
+        for (0..self.config.n_vit_layers) |l| {
+            // we will normalize each patch by iterating over each patch, because our layernorm can only do a single patch vector of inputs
+            for (0..num_patches) |patch| {
+                try layer_norm(
+                    self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
+                    self.weights.v_norm1_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                    self.weights.v_norm1_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                    1e-5,
+                );
+            }
+            // now our patch embedding is normalized, we are going to get the attention weights
+            // we multiply our patch embedding to get the qkv for all the patches all at once for the specific layer
+            // patch_emb (729, 1152) @ v_Wqkv (1152, 3456) = v_qkv (729, 3456)
+            try matmul(
+                self.allocator,
+                self.state.patch_emb,
+                self.weights.v_Wqkv_w[l * self.config.vit_dim * 3 * self.config.vit_dim .. (l + 1) * self.config.vit_dim * 3 * self.config.vit_dim],
+                self.state.v_qkv,
+                num_patches,
+                self.config.vit_dim * 3,
+                self.config.vit_dim,
+            );
+            // next we accumulate the bias for that layer into v_qkv!
+            // we need to iterate over all the patches again to do so!
+            for (0..num_patches) |patch| {
+                // 1 patch from v_qkv (1, 3456) = 1 patch from v_qkv (1, 3456) + Wqkv_b(3456)
+                // over all patches it will be v_qkv(729, 3456)
+                accumulate(
+                    self.state.v_qkv[patch * self.config.vit_dim * 3 .. (patch + 1) * self.config.vit_dim * 3],
+                    self.weights.v_Wqkv_b[l * self.config.vit_dim * 3 .. (l + 1) * self.config.vit_dim * 3],
+                );
             }
         }
-        std.debug.print("Pass! \n", .{});
     }
 };
-
+// std.debug.print("Pass! \n", .{});
 // inference
 fn generate(model: *Model, image_path: []const u8, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
     const preprocessed = try model.preprocess(image_path, allocator);
