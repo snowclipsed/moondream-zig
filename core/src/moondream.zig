@@ -1331,6 +1331,7 @@ const Model = struct {
         // calculate the number of patches along height and width, these are the same for now
         // because we're using tensors which images resized to 378 x 378 through preprocess()
 
+        // just defining constants from the config here
         const channels = self.config.img_channels; // 3 channels
         const img_h = self.config.img_dim;
         const img_w = self.config.img_dim;
@@ -1360,11 +1361,15 @@ const Model = struct {
         // each patch is individually multiplied and then stored into self.state.patches!
         for (0..num_patches) |patch| {
             try matmul(self.allocator, self.state.patches[patch * patch_elements .. (patch + 1) * patch_elements], self.weights.v_patch_embedding_linear_w, self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], 1, self.config.vit_dim, patch_elements);
-            accumulate(self.state.patches[patch * patch_elements .. (patch + 1) * patch_elements], self.weights.v_patch_embedding_linear_b);
+            accumulate(self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.weights.v_patch_embedding_linear_b);
         }
 
-        // next up is positional embedding
+        // next up is positional embedding, which is directly just accumulated into the patch embedding!
+        // x = x + pos_embed
 
+        accumulate(self.state.patch_emb, self.weights.v_pos_embedding);
+
+        std.debug.print("Pass! \n", .{});
     }
 };
 
