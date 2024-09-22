@@ -773,6 +773,8 @@ const RunState = struct {
     patches: []align(simd_align) f32,
     patch_emb: []align(simd_align) f32,
     v_x: []align(simd_align) f32,
+    v_xb: []align(simd_align) f32,
+    v_xb2: []align(simd_align) f32,
     v_qkv: []align(simd_align) f32,
     v_q: []align(simd_align) f32,
     v_k: []align(simd_align) f32,
@@ -803,6 +805,8 @@ const RunState = struct {
             .patches = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
             .patch_emb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
             .v_x = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .v_xb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.hidden_features),
+            .v_xb2 = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
             .v_qkv = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim * 3),
             .v_q = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
             .v_k = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
@@ -1435,13 +1439,14 @@ const Model = struct {
 
         // we will now pass our positionally encoded patch embeddings through the ViT blocks.
         // v_x (729, 1152)
-        @memcpy(self.state.v_x, self.state.patch_emb);
 
         for (0..self.config.n_vit_layers) |l| {
+            @memcpy(self.state.v_x, self.state.patch_emb);
+
             // we will normalize each patch by iterating over each patch, because our layernorm can only do a single patch vector of inputs
             for (0..num_patches) |patch| {
                 try layer_norm(
-                    self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
+                    self.state.v_x[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
                     self.weights.v_norm1_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
                     self.weights.v_norm1_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
                     1e-5,
@@ -1452,7 +1457,7 @@ const Model = struct {
             // patch_emb (729, 1152) @ v_Wqkv (1152, 3456) = v_qkv (729, 3456)
             try matmul(
                 self.allocator,
-                self.state.patch_emb,
+                self.state.v_x,
                 self.weights.v_Wqkv_w[l * self.config.vit_dim * 3 * self.config.vit_dim .. (l + 1) * self.config.vit_dim * 3 * self.config.vit_dim],
                 self.state.v_qkv,
                 num_patches,
@@ -1529,10 +1534,91 @@ const Model = struct {
                 self.config.vit_dim,
             );
 
+            //TODO : investigate if the qkv weights and proj weights use ReLU???
+
             for (0..num_patches) |patch| {
                 accumulate(self.state.v_proj[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.weights.v_out_proj_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim]);
             }
+
+            accumulate(self.state.patch_emb, self.state.v_proj);
+
+            // reusing v_x now and saving patch embed as a residual carry
+            @memcpy(self.state.v_x, self.state.patch_emb);
+
+            // second layernorm
+            for (0..num_patches) |patch| {
+                try layer_norm(
+                    self.state.v_x[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
+                    self.weights.v_norm2_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                    self.weights.v_norm2_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                    1e-5,
+                );
+            }
+
+            // pass the normalized v_x through the first MLP, upcasting it, and storing it in a buffer
+            // v_x(num_patches, vit_dim) @ fc1 (vit_dim, hidden_features) = v_xb(num_patches, hidden_features)
+
+            try matmul(
+                self.allocator,
+                self.state.v_x,
+                self.weights.v_fc1_w[l * self.config.vit_dim * self.config.hidden_features .. (l + 1) * self.config.vit_dim * self.config.hidden_features],
+                self.state.v_xb,
+                num_patches,
+                self.config.hidden_features,
+                self.config.vit_dim,
+            );
+
+            // then we accumulate the fc1 bias into v_xb by iterating over num patches
+            for (0..num_patches) |patch| {
+                // iterate over num_patches (xb (1, hidden_features) = xb (1, hidden_features) + fc1_b (hidden_features)
+                accumulate(
+                    self.state.v_xb[patch * self.config.hidden_features .. (patch + 1) * self.config.hidden_features],
+                    self.weights.v_fc1_b[l * self.config.hidden_features .. (l + 1) * self.config.hidden_features],
+                );
+            }
+
+            // next we will apply GeLU to the fc1 logits (v_xb) to get the activations
+            gelu(self.state.v_xb);
+
+            // after this xb contains the activations from fc1!
+            // now we will downcast it through fc2.
+
+            // for this we will multiply v_xb with the fc2 weights and store it in v_xb2
+            // v_xb(num_patches, hidden_features) @ fc2 (hidden_features, vit_dim) = v_xb2(num_patches, hidden_features)
+            try matmul(
+                self.allocator,
+                self.state.v_xb,
+                self.weights.v_fc2_w[l * self.config.hidden_features * self.config.vit_dim .. (l + 1) * self.config.hidden_features * self.config.vit_dim],
+                self.state.v_xb2,
+                num_patches,
+                self.config.vit_dim,
+                self.config.hidden_features,
+            );
+            // then we accumulate the fc2 bias into v_xb2 by iterating over num patches
+
+            for (0..num_patches) |patch| {
+                // iterate over num_patches (xb2 (1, vit_dim) = xb (1, vit_dim) + fc1_b (vit_dim)
+                accumulate(
+                    self.state.v_xb2[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
+                    self.weights.v_fc1_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                );
+            }
+
+            // now we finally can merge the mlp output into the residual we've been saving all this long
+            accumulate(self.state.patch_emb, self.state.v_xb2);
         }
+        // now for the final layernorm..
+
+        for (0..num_patches) |patch| {
+            try layer_norm(
+                self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
+                self.weights.v_norm_out_w,
+                self.weights.v_norm_out_b,
+                1e-5,
+            );
+        }
+
+        // std.debug.print("Pass! \n", .{});
     }
 };
 // std.debug.print("Pass! \n", .{});
