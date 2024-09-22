@@ -20,7 +20,7 @@ const c = @cImport({
 // applies softmax on a vector
 
 // REDO this function with vectors
-fn softmax(x: []f32) void {
+fn softmax(x: []f32) !void {
     assert(x.len > 0);
     // max of x for numerical stability
     var max: f32 = x[0];
@@ -397,6 +397,7 @@ const ConfigReader = extern struct {
             .img_channels = @intCast(self.img_channels),
             .img_dim = @intCast(self.img_dim),
             .patch_size = @intCast(self.patch_size),
+            .num_patches = @intCast(@divTrunc(self.img_dim, self.patch_size) * @divTrunc(self.img_dim, self.patch_size)),
             .vit_embed_len = @intCast(self.vit_embed_len),
             .vit_dim = @intCast(self.vit_dim),
             .n_vit_layers = @intCast(self.n_vit_layers),
@@ -424,6 +425,7 @@ const Config = struct {
     img_channels: usize, // number of channels per patch, RGB has 3
     img_dim: usize, // dimension of the the image, 378x378 default
     patch_size: usize, // size of patch, 14x14 default
+    num_patches: usize,
     vit_embed_len: usize,
     vit_dim: usize, // width of each patch embedding created from linear patch embedding layer, 1152 default
     n_vit_layers: usize, // number of ViT layers, 27 default for the vision model
@@ -775,6 +777,9 @@ const RunState = struct {
     v_q: []align(simd_align) f32,
     v_k: []align(simd_align) f32,
     v_v: []align(simd_align) f32,
+    v_attn: []align(simd_align) f32,
+    v_output: []align(simd_align) f32,
+    v_proj: []align(simd_align) f32,
     x: []align(simd_align) f32,
     xb: []align(simd_align) f32,
     xb2: []align(simd_align) f32,
@@ -796,12 +801,15 @@ const RunState = struct {
         return Self{
             .img = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
             .patches = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
-            .patch_emb = try allocator.alignedAlloc(f32, simd_align, (config.img_dim * config.img_dim * config.vit_dim) / (config.patch_size * config.patch_size)),
-            .v_x = try allocator.alignedAlloc(f32, simd_align, (config.img_dim * config.img_dim * config.vit_dim) / (config.patch_size * config.patch_size)),
-            .v_qkv = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.vit_dim * 3 / (config.patch_size * config.patch_size)),
-            .v_q = try allocator.alignedAlloc(f32, simd_align, config.vit_dim),
-            .v_k = try allocator.alignedAlloc(f32, simd_align, config.vit_dim),
-            .v_v = try allocator.alignedAlloc(f32, simd_align, config.vit_dim),
+            .patch_emb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .v_x = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .v_qkv = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim * 3),
+            .v_q = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .v_k = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .v_v = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .v_attn = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.num_patches * config.vit_dim),
+            .v_output = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .v_proj = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
             .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
             .xb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
@@ -1102,7 +1110,7 @@ const Model = struct {
                     attn[t] = score;
                 }
 
-                softmax(attn[0 .. pos + 1]);
+                try softmax(attn[0 .. pos + 1]);
 
                 // attn for V
                 const xb = self.state.xb[head * self.config.head_dim .. (head + 1) * self.config.head_dim];
@@ -1381,7 +1389,7 @@ const Model = struct {
         const patch_elements = patch_h * patch_w * channels;
         const num_patches_h = img_h / patch_h;
         const num_patches_w = img_h / patch_w;
-        const num_patches = num_patches_h * num_patches_w;
+        const num_patches = self.config.num_patches;
 
         // we are going to change the format of our image from (C, H, W) to (h * w, C * p1 * p2) or (729, 3 * 14 * 14)
         for (0..num_patches_h) |h_patch| {
@@ -1461,6 +1469,69 @@ const Model = struct {
                     self.weights.v_Wqkv_b[l * self.config.vit_dim * 3 .. (l + 1) * self.config.vit_dim * 3],
                 );
             }
+
+            @memcpy(self.state.v_q, self.state.v_qkv[0 .. num_patches * self.config.vit_dim]);
+            @memcpy(self.state.v_k, self.state.v_qkv[num_patches * self.config.vit_dim .. num_patches * self.config.vit_dim * 2]);
+            @memcpy(self.state.v_v, self.state.v_qkv[num_patches * self.config.vit_dim * 2 .. num_patches * self.config.vit_dim * 3]);
+
+            const head_dim = self.config.vit_dim / self.config.n_vit_heads;
+
+            for (0..self.config.n_vit_heads) |head| {
+                const v_q_head = self.state.v_q[head * head_dim * num_patches .. (head + 1) * head_dim * num_patches];
+                const v_k_head = self.state.v_k[head * head_dim * num_patches .. (head + 1) * head_dim * num_patches];
+                const v_v_head = self.state.v_v[head * head_dim * num_patches .. (head + 1) * head_dim * num_patches];
+
+                // Compute the attention score by taking the dot product of the query and key for this head
+                // v_q_head (num_patches, head_dim) @ v_k_head.T (head_dim, num_patches) = v_attn (num_patches, num_patches)
+                try matmul(
+                    self.allocator,
+                    v_q_head,
+                    v_k_head, // We would need to transpose v_k_head for this operation
+                    self.state.v_attn[head * num_patches * num_patches .. (head + 1) * num_patches * num_patches],
+                    num_patches,
+                    num_patches,
+                    head_dim,
+                );
+
+                // Scale the attention scores by sqrt(head_dim) to stabilize gradients as per the scaled dot-product attention mechanism
+                const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+                for (0..num_patches * num_patches) |i| {
+                    self.state.v_attn[head * num_patches * num_patches + i] *= scale;
+                }
+
+                // Apply softmax to get the attention probabilities
+                // We will be applying softmax row-wise over the num_patches dimension
+                try softmax(self.state.v_attn[head * num_patches * num_patches .. (head + 1) * num_patches * num_patches]);
+
+                // Multiply attention probabilities with value matrix to get the final output for this head
+                // v_attn (num_patches, num_patches) @ v_v_head (num_patches, head_dim) = output (num_patches, head_dim)
+                try matmul(
+                    self.allocator,
+                    self.state.v_attn[head * num_patches * num_patches .. (head + 1) * num_patches * num_patches],
+                    v_v_head,
+                    self.state.v_output[head * num_patches * head_dim .. (head + 1) * num_patches * head_dim],
+                    num_patches,
+                    head_dim,
+                    num_patches,
+                );
+            }
+
+            // Next, we will multiply the final output from all the heads with the attention projection layer for this vit block
+            // v_output (num_patches, vit_dim) @  v_out_proj_w (vit_dim, vit_dim) = v_proj (num_patches, vit_dim)
+
+            try matmul(
+                self.allocator,
+                self.state.v_output,
+                self.weights.v_out_proj_w[l * self.config.vit_dim * self.config.vit_dim .. (l + 1) * self.config.vit_dim * self.config.vit_dim],
+                self.state.v_proj,
+                num_patches,
+                self.config.vit_dim,
+                self.config.vit_dim,
+            );
+
+            for (0..num_patches) |patch| {
+                accumulate(self.state.v_proj[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.weights.v_out_proj_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim]);
+            }
         }
     }
 };
@@ -1509,7 +1580,7 @@ fn sampleNextToken(logits: []f32, temperature: f32, top_p: f32, rng: *std.rand.D
     }
 
     // Convert to probabilities
-    softmax(adjusted_logits);
+    try softmax(adjusted_logits);
     std.debug.print("Softmax logits : {any}", .{adjusted_logits[0..10]});
     std.debug.print("\n===========================\n\n", .{});
 
@@ -1538,7 +1609,7 @@ fn sampleNextToken(logits: []f32, temperature: f32, top_p: f32, rng: *std.rand.D
     }
 
     // Renormalize
-    softmax(adjusted_logits);
+    try softmax(adjusted_logits);
 
     // Sample from the distribution
     const random_value = rng.random().float(f32);
