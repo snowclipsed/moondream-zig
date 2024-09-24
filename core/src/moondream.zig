@@ -772,9 +772,12 @@ const RunState = struct {
     img: []align(simd_align) f32,
     patches: []align(simd_align) f32,
     patch_emb: []align(simd_align) f32,
+    final_emb: []align(simd_align) f32,
+    projection: []align(simd_align) f32,
     v_x: []align(simd_align) f32,
     v_xb: []align(simd_align) f32,
     v_xb2: []align(simd_align) f32,
+    v_xb3: []align(simd_align) f32,
     v_qkv: []align(simd_align) f32,
     v_q: []align(simd_align) f32,
     v_k: []align(simd_align) f32,
@@ -804,9 +807,12 @@ const RunState = struct {
             .img = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
             .patches = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
             .patch_emb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .final_emb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * 2 * config.vit_dim),
+            .projection = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.dim),
             .v_x = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
             .v_xb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.hidden_features),
             .v_xb2 = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .v_xb3 = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.hidden_dim),
             .v_qkv = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim * 3),
             .v_q = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
             .v_k = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
@@ -1618,7 +1624,55 @@ const Model = struct {
             );
         }
 
-        // std.debug.print("Pass! \n", .{});
+        for (0..num_patches) |patch| {
+            // 0 to 1152
+            // 1152 to 2304
+            @memcpy(self.state.final_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim]);
+            @memcpy(self.state.final_emb[(patch + 1) * self.config.vit_dim .. (patch + 2) * self.config.vit_dim], self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim]);
+        }
+
+        // now we will pass the final embed through the projection layers:
+        // first we will upcast to (num patches, hidden_dim)
+        // final_emb (num_patches , vit_dim * 2) @ v_proj_fc1_w (vit_dim * 2, hidden_dim) = v_xb3(num_patches, hidden_dim)
+        try matmul(
+            self.allocator,
+            self.state.final_emb,
+            self.weights.v_proj_fc1_w,
+            self.state.v_xb3,
+            num_patches,
+            self.config.hidden_dim,
+            self.config.vit_dim * 2,
+        );
+
+        // next up, we apply the bias on v_xb3
+        for (0..num_patches) |patch| {
+            accumulate(
+                self.state.v_xb3[patch * self.config.hidden_dim .. (patch + 1) * self.config.hidden_dim],
+                self.weights.v_proj_fc1_b,
+            );
+        }
+
+        // we will then apply GeLU on the logits from the first projection layer:
+        gelu(self.state.v_xb3);
+
+        // after this we will pass the activated v_xb3:
+        // v_xb3(num_patches, hidden_dim) @ v_proj_fc2_w (hidden_dim, dim) = v_xb3(num_patches, dim)
+        try matmul(
+            self.allocator,
+            self.state.v_xb3,
+            self.weights.v_proj_fc2_w,
+            self.state.projection,
+            num_patches,
+            self.config.dim,
+            self.config.hidden_dim,
+        );
+
+        // then we add the final projection bias
+
+        for (0..num_patches) |patch| {
+            accumulate(self.state.projection[patch * self.config.dim .. (patch + 1) * self.config.dim], self.weights.v_proj_fc2_b);
+        }
+        std.debug.print("Pass! \n", .{});
     }
 };
 // std.debug.print("Pass! \n", .{});
