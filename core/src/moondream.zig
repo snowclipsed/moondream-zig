@@ -88,6 +88,67 @@ fn rmsnorm(o: []f32, x: []f32, w: []f32) void {
     }
 }
 
+pub fn checkVectorStability(vector: []const f32, name: []const u8) !void {
+    for (vector, 0..) |value, index| {
+        if (std.math.isNan(value)) {
+            std.debug.print("Warning: NaN detected in {s} at index {d}\n", .{ name, index });
+            return error.NaNDetected;
+        }
+        if (std.math.isInf(value)) {
+            if (value > 0) {
+                std.debug.print("Warning: +Inf detected in {s} at index {d}\n", .{ name, index });
+            } else {
+                std.debug.print("Warning: -Inf detected in {s} at index {d}\n", .{ name, index });
+            }
+            return error.InfDetected;
+        }
+    }
+}
+
+pub fn cos_2d(in: []const f32, out: []f32) !void {
+    if (in.len != out.len) {
+        std.debug.print("Length mismatch in cos_2d: in.len={d}, out.len={d}\n", .{ in.len, out.len });
+        return error.LengthMismatch;
+    }
+
+    const len = in.len;
+    const VectorSize = std.simd.suggestVectorLength(f32) orelse 8;
+    const VectorType = @Vector(VectorSize, f32);
+    var i: usize = 0;
+
+    while (i + VectorSize <= len) : (i += VectorSize) {
+        const v_in = @as(*align(4) const VectorType, @ptrCast(in[i..].ptr)).*;
+        @as(*align(4) VectorType, @ptrCast(out[i..].ptr)).* = @cos(v_in);
+    }
+
+    // Fix the scalar loop - it was using sin instead of cos
+    while (i < len) : (i += 1) {
+        out[i] = std.math.cos(in[i]);
+    }
+}
+
+pub fn sin_2d(in: []const f32, out: []f32) !void {
+    if (in.len != out.len) {
+        std.debug.print("Length mismatch in cos_2d: in.len={d}, out.len={d}\n", .{ in.len, out.len });
+        return error.LengthMismatch;
+    }
+
+    const len = in.len;
+    const VectorSize = std.simd.suggestVectorLength(f32) orelse 8;
+    const VectorType = @Vector(VectorSize, f32);
+    var i: usize = 0;
+
+    while (i + VectorSize <= len) : (i += VectorSize) {
+        const v_in = @as(*align(4) const VectorType, @ptrCast(in[i..].ptr)).*;
+        @as(*align(4) VectorType, @ptrCast(out[i..].ptr)).* = @sin(v_in);
+    }
+
+    // Fix the scalar loop - it was using sin instead of cos
+    while (i < len) : (i += 1) {
+        out[i] = std.math.sin(in[i]);
+    }
+}
+
 pub fn accumulate(accum: []f32, x: []const f32) void {
     std.debug.assert(accum.len == x.len);
     const len = accum.len;
@@ -307,6 +368,8 @@ fn tiledMultiplyKernel(A: []const f32, B: []const f32, local_C: *[T][T]f32, N: u
 }
 
 // copied from https://github.com/cgbur/llama2.zig/blob/main/src/main.zig#L489
+
+// not copied to ops yet.
 fn vector_dot_product(x: []const f32, y: []const f32) f32 {
     assert(x.len == y.len);
     const vector_width = V;
@@ -355,6 +418,140 @@ fn vector_weighted_sum(xout: []f32, x: []const f32, y: f32) void {
         xout[offset + i] += x[offset + i] * y;
     }
 }
+pub fn printMatrix(m: usize, n: usize, matrix: []const f32, rows_to_print: usize, elements_per_row: usize) void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Ensure that rows_to_print does not exceed the number of rows in the matrix
+    const rows = if (rows_to_print <= m) rows_to_print else m;
+
+    // Ensure that elements_per_row does not exceed the number of columns in the matrix
+    const elements = if (elements_per_row <= n) elements_per_row else n;
+
+    // Iterate through the matrix and print elements row by row
+    for (0..rows) |i| {
+        for (0..elements) |j| {
+            const idx = i * n + j;
+            // Print each element with 3 decimal precision, aligned width of 8
+            stdout.print("{:8.3}", .{matrix[idx]}) catch {};
+            stdout.print(" ", .{}) catch {};
+        }
+        stdout.print("\n", .{}) catch {};
+    }
+
+    if (rows < m) {
+        stdout.print("\n... ({} more rows not shown)\n", .{m - rows}) catch {};
+    }
+
+    if (elements < n) {
+        stdout.print("... ({} more elements per row not shown)\n", .{n - elements}) catch {};
+    }
+}
+
+/// Calculate the outer product of two vectors.
+///
+/// A: input vector 1     |
+/// B: input vector 2     |
+/// C: output vector      |
+/// M: length of vector A |
+/// N: length of vector B |
+///
+/// The outer product is calculated as follows:
+/// C[i * N + j] = A[i] * B[j]
+/// We just apply SIMD optimization to the inner loop.
+fn outer(A: []const f32, B: []const f32, C: []f32) void {
+    std.debug.assert(A.len * B.len == C.len);
+
+    const VectorSize = 32;
+    const VectorType = @Vector(VectorSize, f32);
+
+    // operate over A's rows
+    for (0..A.len) |i| {
+        var j: usize = 0;
+        // broadcast the selected element of A to a vector
+        const a_splat = @as(VectorType, @splat(A[i]));
+
+        // we then process B in chunks of VectorSize
+        while (j + VectorSize <= B.len) : (j += VectorSize) {
+            // load B directly as a vector, assuming alignment
+            const b_vec = @as(*align(4) const VectorType, @ptrCast(B[j..].ptr)).*;
+            // multiply and store directly
+            @as(*align(4) VectorType, @ptrCast(C[i * B.len + j ..].ptr)).* = a_splat * b_vec;
+        }
+
+        // handle remaining elements
+        while (j < B.len) : (j += 1) {
+            C[i * B.len + j] = A[i] * B[j];
+        }
+    }
+}
+
+pub fn cat(allocator: Allocator, A: []const f32, B: []const f32, A_M: usize, A_N: usize, B_M: usize, B_N: usize, dim: usize) ![]f32 {
+
+    // we have two cases, we can either concatenate along the rows or the columns
+    // first case: concatenate along the rows
+
+    if (dim == 0) {
+        // check if the number of columns of the two matrices are the same
+        if (A_N != B_N) {
+            return error.InvalidInputSize;
+        }
+
+        // create a new matrix with the correct dimensions
+        // we check whose number of rows is greater
+        const M: usize = A_M + B_M;
+
+        const N = A_N;
+
+        const C = try allocator.alloc(f32, M * N);
+
+        @memcpy(C[0 .. A_M * N], A[0..]);
+        @memcpy(C[A_M * N ..], B[0..]);
+
+        return C;
+    }
+
+    if (dim == 1) {
+        // check if the number of rows of the two matrices are the same
+        if (A_M != B_M) {
+            return error.InvalidInputSize;
+        }
+
+        // create a new matrix with the correct dimensions
+        // we check whose number of columns is greater
+        const M: usize = A_M;
+
+        const N = A_N + B_N;
+
+        const C = try allocator.alloc(f32, M * N);
+
+        for (0..M) |i| {
+            // Copy the i-th row of matrix A
+            @memcpy(C[i * N .. i * N + A_N], A[i * A_N .. (i + 1) * A_N]);
+            // Copy the i-th row of matrix B
+            @memcpy(C[i * N + A_N .. (i + 1) * N], B[i * B_N .. (i + 1) * B_N]);
+        }
+
+        return C;
+    }
+
+    return error.InvalidDimension;
+}
+
+pub fn outerConventional(A: []const f32, B: []const f32, C: []f32, M: usize, N: usize) !void {
+    // Ensure the input vectors and matrix have the correct sizes
+    if (A.len != M or B.len != N) {
+        return error.InvalidInputSize;
+    }
+
+    // Compute the outer product using conventional method
+    var i: usize = 0;
+    while (i < M) : (i += 1) {
+        var j: usize = 0;
+        while (j < N) : (j += 1) {
+            C[i * N + j] = A[i] * B[j];
+        }
+    }
+}
 
 //config
 
@@ -371,6 +568,7 @@ const ConfigReader = extern struct {
     seq_len: i32, // max sequence length
     rope_theta: f32,
     max_pos_embeddings: i32,
+    partial_rotary_factor: f32,
 
     // vision
     img_channels: i32, // number of channels per patch, RGB has 3
@@ -394,6 +592,7 @@ const ConfigReader = extern struct {
             .seq_len = @intCast(self.seq_len),
             .rope_theta = self.rope_theta,
             .max_pos_embeddings = @intCast(self.max_pos_embeddings),
+            .partial_rotary_factor = self.partial_rotary_factor,
             .img_channels = @intCast(self.img_channels),
             .img_dim = @intCast(self.img_dim),
             .patch_size = @intCast(self.patch_size),
@@ -420,6 +619,7 @@ const Config = struct {
     seq_len: usize, // sequence length, 2048
     rope_theta: f32,
     max_pos_embeddings: usize,
+    partial_rotary_factor: f32,
 
     // Vision Model
     img_channels: usize, // number of channels per patch, RGB has 3
@@ -785,22 +985,24 @@ const RunState = struct {
     v_attn: []align(simd_align) f32,
     v_output: []align(simd_align) f32,
     v_proj: []align(simd_align) f32,
-    x: []align(simd_align) f32,
-    xb: []align(simd_align) f32,
-    xb2: []align(simd_align) f32,
-    qkv_combined: []align(simd_align) f32, // a buffer that holds the combined kqv
-    q: []align(simd_align) f32,
-    k: []align(simd_align) f32,
-    v: []align(simd_align) f32,
-    attn: []align(simd_align) f32,
     k_cache: []align(simd_align) f32,
     v_cache: []align(simd_align) f32,
     cos_cache: []align(simd_align) f32,
     sin_cache: []align(simd_align) f32,
-    inv_freq: []align(simd_align) f32,
-    hb: []align(simd_align) f32,
-    hb2: []align(simd_align) f32,
-    logits: []align(simd_align) f32,
+    // emb: []align(simd_align) f32,
+    // ln_in: []align(simd_align) f32,
+    // attn_in: []align(simd_align) f32,
+    // x: []align(simd_align) f32,
+    // xb: []align(simd_align) f32,
+    // mlp_in: []align(simd_align) f32,
+    // t_qkv: []align(simd_align) f32, // a buffer that holds the combined kqv
+    // q: []align(simd_align) f32,
+    // k: []align(simd_align) f32,
+    // v: []align(simd_align) f32,
+    // attn: []align(simd_align) f32,
+    // output: []align(simd_align) f32,
+    // inv_freq: []align(simd_align) f32,
+    // logits: []align(simd_align) f32,
 
     fn init(allocator: Allocator, config: Config) !Self {
         return Self{
@@ -820,22 +1022,24 @@ const RunState = struct {
             .v_attn = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.num_patches * config.vit_dim),
             .v_output = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
             .v_proj = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
-            .x = try allocator.alignedAlloc(f32, simd_align, config.dim),
-            .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
-            .xb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
-            .qkv_combined = try allocator.alignedAlloc(f32, simd_align, config.dim * 3),
-            .q = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
-            .k = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
-            .v = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
-            .attn = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.seq_len),
-            .k_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim), // TODO : REPLACE WITH KV DIM
+            .k_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
             .v_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
-            .cos_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
-            .sin_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.dim),
-            .inv_freq = try allocator.alignedAlloc(f32, simd_align, config.dim / 2),
-            .hb = try allocator.alignedAlloc(f32, simd_align, config.hidden_dim),
-            .hb2 = try allocator.alignedAlloc(f32, simd_align, config.dim),
-            .logits = try allocator.alignedAlloc(f32, simd_align, config.vocab),
+            .cos_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.head_dim / 2),
+            .sin_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.head_dim / 2), // hardcoding the partial rotary factor as 1/2 here
+            // .emb = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            // .ln_in = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            // .attn_in = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            // .x = try allocator.alignedAlloc(f32, simd_align, config.hidden_dim),
+            // .xb = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            // .mlp_in = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            // .t_qkv = try allocator.alignedAlloc(f32, simd_align, config.dim * 3),
+            // .q = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
+            // .k = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
+            // .v = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.head_dim),
+            // .attn = try allocator.alignedAlloc(f32, simd_align, config.n_heads * config.seq_len),
+            // .output = try allocator.alignedAlloc(f32, simd_align, config.dim),
+            // .inv_freq = try allocator.alignedAlloc(f32, simd_align, config.dim / 2),
+            // .logits = try allocator.alignedAlloc(f32, simd_align, config.vocab),
         };
     }
 
@@ -979,22 +1183,39 @@ const Tokenizer = struct {
             var token_it = self.tokens.iterator();
             while (token_it.next()) |entry| {
                 if (entry.value_ptr.* == token_id) {
-                    try decoded_text.appendSlice(entry.key_ptr.*);
-                    try decoded_text.append(' '); // Add a space between tokens
+                    const token = entry.key_ptr.*;
+                    if (token.len > 1) {
+                        switch (token[1]) {
+                            0xA0 => {
+                                if (token[1] == 0xA0) {
+                                    // This is 'Ġ' (0xC4 0xA0 in UTF-8)
+                                    try decoded_text.append(' ');
+                                    try decoded_text.appendSlice(token[2..]);
+                                } else {
+                                    try decoded_text.appendSlice(token);
+                                }
+                            },
+                            0x82 => {
+                                if (token.len > 1 and token[1] == 0x82) {
+                                    // This is 'Ċ' (0xC4 0x82 in UTF-8)
+                                    try decoded_text.append('\n');
+                                    try decoded_text.appendSlice(token[2..]);
+                                } else {
+                                    try decoded_text.appendSlice(token);
+                                }
+                            },
+                            else => try decoded_text.appendSlice(token),
+                        }
+                    }
                     found = true;
                     break;
                 }
             }
 
             if (!found) {
-                std.debug.print("Tokens : {any} \n", .{tokens.items[token_id]});
+                std.debug.print("Token not found: {}\n", .{token_id});
                 return error.TokenNotFound;
             }
-        }
-
-        // Remove the trailing space if it exists
-        if (decoded_text.items.len > 0 and decoded_text.items[decoded_text.items.len - 1] == ' ') {
-            _ = decoded_text.pop();
         }
 
         return decoded_text.toOwnedSlice();
@@ -1033,187 +1254,403 @@ const Model = struct {
         };
     }
 
-    fn text_model(self: Self, tokens: std.ArrayList(u32), pos: usize) !void {
-        const token = tokens.items[pos];
+    fn text_model(self: Self, embeddings: []f32, pos: usize) !void {
+        // each token embedding is of size dim, so we divide by it to see
+        // how many tokens are present
+        // so we perform this assert before making any further calculations
+        assert(embeddings.len % self.config.dim == 0);
 
-        const sqrt: f32 = @floatFromInt(self.config.head_dim);
-        // embed
-        const embedding = self.embed(token);
-        // TODO : clean up these print statements
-        // std.debug.print("\n embed len for token {any}: {any} \n", .{ token, embedding.len });
-        // std.debug.print("\n embed for {any} \n", .{embedding}); // embedding for a single token
-        @memcpy(self.state.x, embedding); // copy embedding to activation for processing
+        // we define our layernorm epsilon constant:
+        const eps = 1e-5;
+        const dim = self.config.dim;
+        const n_heads = self.config.n_heads;
+        const head_dim = self.config.head_dim;
 
-        // pass through layers
+        //now we find the number of tokens, or the query length
+
+        const q_len = embeddings.len / dim;
+
+        // we will add the incoming q_len to the current pos which indicates the sequence length of the key and value vectors
+        // this also allows us to keep track of the current position in the kv cache
+
+        std.debug.print("q_len: {any} \n", .{q_len});
+
+        // other constants
+        //layernorm input
+        const ln_in = try self.allocator.alloc(f32, embeddings.len);
+        defer self.allocator.free(ln_in);
+
+        // qkv states tensor
+        const qkv = try self.allocator.alloc(f32, q_len * dim * 3);
+        defer self.allocator.free(qkv);
+
+        const q = try self.allocator.alloc(f32, q_len * dim);
+        const k = try self.allocator.alloc(f32, q_len * dim);
+        const v = try self.allocator.alloc(f32, q_len * dim);
+        defer self.allocator.free(q);
+        defer self.allocator.free(k);
+        defer self.allocator.free(v);
+
+        const q_r = try self.allocator.alloc(f32, q_len * dim);
+        const k_r = try self.allocator.alloc(f32, q_len * dim);
+        const v_r = try self.allocator.alloc(f32, q_len * dim);
+        // Allocate memory for query_rot and query_pass
+        // Allocate rotary and pass-through parts with proper sizes
+        const rotary_dim = head_dim / 2; // Half for rotation
+        const query_rot = try self.allocator.alloc(f32, n_heads * q_len * rotary_dim);
+        defer self.allocator.free(query_rot);
+        const query_pass = try self.allocator.alloc(f32, n_heads * q_len * rotary_dim);
+        defer self.allocator.free(query_pass);
+        const key_rot = try self.allocator.alloc(f32, n_heads * q_len * rotary_dim);
+        defer self.allocator.free(key_rot);
+        const key_pass = try self.allocator.alloc(f32, n_heads * q_len * rotary_dim);
+        defer self.allocator.free(key_pass);
+        const kv_seq_len = q_len + pos;
+        std.debug.print("kv seq len : {any} \n", .{kv_seq_len});
+        const scores = try self.allocator.alloc(f32, q_len * kv_seq_len);
+        defer self.allocator.free(scores);
 
         for (0..self.config.n_layers) |l| {
-            if (self.config.head_dim * self.config.n_heads != self.config.dim) {
-                return error.UnexpectedHiddenSize;
+
+            // get the residual before performing layernorm
+            // this way the original input embeddings will act as a residual
+
+            // we then perform layernorm
+
+            for (0..q_len) |query| {
+                try layer_norm(
+                    ln_in[query * dim .. (query + 1) * dim],
+                    self.weights.t_ln_w[l * dim .. (l + 1) * dim],
+                    self.weights.t_ln_b[l * dim .. (l + 1) * dim],
+                    eps,
+                );
             }
 
-            // First layernorm
-            @memcpy(self.state.xb, self.state.x);
+            // next we will perform sdpa
 
-            try layer_norm(
-                self.state.xb,
-                self.weights.t_ln_w[l * self.config.dim .. (l + 1) * self.config.dim],
-                self.weights.t_ln_b[l * self.config.dim .. (l + 1) * self.config.dim],
-                1e-5,
-            );
-
-            // multiply the embedding (self.state.x) by Wkqv and get combined kqv
-            // split that into k,q,v
-            //  x (1, 2048)  @ W (2048 * 6144) = out (1 * 6144)
-            // offset for the weights will be : config.n_layers * config.dim * config.n_heads * config.head_dim * 3,
-
-            // matmuls for combined kqv
-            // xb (1, 2048) @ Wqkv (2048, 6144) -> qkv_combined(1, 6144)
+            // we will first extract the q, k, v states as a combined vector:
             try matmul(
                 self.allocator,
-                self.state.xb, // (1, dim)
-                self.weights.t_Wqkv_w[l * self.config.dim * 3 * self.config.n_heads * self.config.head_dim .. (l + 1) * self.config.dim * 3 * self.config.n_heads * self.config.head_dim],
-                self.state.qkv_combined,
-                1,
-                self.config.dim * 3,
-                self.config.dim,
+                ln_in,
+                self.weights.t_Wqkv_w[l * dim * 3 * dim .. (l + 1) * dim * 3 * dim],
+                qkv,
+                q_len,
+                dim * 3,
+                dim,
             );
 
-            // add bias
-            // qkv_combined (1, 2048) + bias (1, 2048)
-            accumulate(self.state.qkv_combined, self.weights.t_Wqkv_b[l * self.config.n_heads * self.config.head_dim * 3 .. (l + 1) * self.config.n_heads * self.config.head_dim * 3]);
+            // printMatrix(q_len, dim * 3, qkv, 2, 5);
 
-            // split into q, k, v
-            @memcpy(self.state.q, self.state.qkv_combined[0 .. self.config.n_heads * self.config.head_dim]); // (1, 2048)
-            @memcpy(self.state.k, self.state.qkv_combined[self.config.n_heads * self.config.head_dim .. self.config.n_heads * self.config.head_dim * 2]); // (1, 2048)
-            @memcpy(self.state.v, self.state.qkv_combined[self.config.n_heads * self.config.head_dim * 2 .. self.config.n_heads * self.config.head_dim * 3]); // (1, 2048)
+            // we split qkv into three state vectors for q, k, v
 
-            // Apply RoPE to Q and K
-            // TODO: Check implementation, could be a breakage point
-            try self.apply_rope(self.state.q, pos);
-            try self.apply_rope(self.state.k, pos);
+            // Manual strided copy
+            for (0..q_len * dim) |i| {
+                q[i] = qkv[i * 3];
+                k[i] = qkv[i * 3 + 1];
+                v[i] = qkv[i * 3 + 2];
+            }
 
-            // define kv cache
-            // the offset for each layer for the key and value vectors will be:
-            const l_off = l * self.config.seq_len * self.config.dim; // using dim instead of kv dim
+            // we then convert the q, k, v vectors into a different view of dims (n_heads, q_len, head_dim)
+            // TODO : Check if they actually are (n_heads, q_len, head_dim)
+            for (0..n_heads) |h| {
+                for (0..q_len) |i| {
+                    for (0..head_dim) |j| {
+                        const old_index = i * dim + h * head_dim + j;
+                        const new_index = h * q_len * head_dim + i * head_dim + j;
+                        q_r[new_index] = q[old_index];
+                        k_r[new_index] = k[old_index];
+                        v_r[new_index] = v[old_index];
+                    }
+                }
+            }
 
-            // we define a pointer to a row of k and v cache
-            const k_cache_row = self.state.k_cache[l_off + pos * self.config.dim .. l_off + (pos + 1) * self.config.dim]; // using dim instead of kv dim, size 2048
-            const v_cache_row = self.state.v_cache[l_off + pos * self.config.dim .. l_off + (pos + 1) * self.config.dim]; // size 2048
+            // first we need to calculate the inverse frequencies.
+            // the length of the sin and cos cache is equal to the max sequence length = 2048
+            // we the obtain the position frequencies from the cos sin cache for the current position + the number of tokens we are processing, which would be from 0 till the position of the current token
 
-            // we then update the kv cache for that specific row using the pointer
-            @memcpy(k_cache_row, self.state.k);
-            @memcpy(v_cache_row, self.state.v);
+            // we will then apply RoPE
+            // after that, we update the kv cache, and hence the pos counter for the kv cache will also update
+            // we update this in the generate function
+            // after we finish generation, we reset pos to 0
+
+            const freqs = self.get_rot_emb(kv_seq_len);
+            const cos = freqs.@"0";
+            const sin = freqs.@"1";
+
+            // add query rot and query pass here:
+
+            // Split the query states into rotary and pass-through parts
+            for (0..n_heads) |h| {
+                for (0..q_len) |i| {
+                    const base_old = h * q_len * head_dim + i * head_dim;
+                    const base_new = h * q_len * rotary_dim + i * rotary_dim;
+
+                    // Copy first half to rotary (0 to rotary_dim)
+                    @memcpy(query_rot[base_new .. base_new + rotary_dim], q_r[base_old .. base_old + rotary_dim]);
+                    @memcpy(key_rot[base_new .. base_new + rotary_dim], k_r[base_old .. base_old + rotary_dim]);
+
+                    // Copy second half to pass (rotary_dim to head_dim)
+                    @memcpy(query_pass[base_new .. base_new + rotary_dim], q_r[base_old + rotary_dim .. base_old + head_dim]);
+                    @memcpy(key_pass[base_new .. base_new + rotary_dim], k_r[base_old + rotary_dim .. base_old + head_dim]);
+                }
+            }
+
+            try self.apply_rope(query_rot, key_rot, cos, sin, pos, q_len);
+
+            // Merge rotary and pass parts back into q_r and k_r
+            for (0..n_heads) |h| {
+                for (0..q_len) |i| {
+                    const base_old = h * q_len * rotary_dim + i * rotary_dim;
+                    const base_new = h * q_len * head_dim + i * head_dim;
+
+                    // Copy rotary part back (first half)
+                    @memcpy(q_r[base_new .. base_new + rotary_dim], query_rot[base_old .. base_old + rotary_dim]);
+                    @memcpy(k_r[base_new .. base_new + rotary_dim], key_rot[base_old .. base_old + rotary_dim]);
+
+                    // Copy pass part back (second half)
+                    @memcpy(q_r[base_new + rotary_dim .. base_new + head_dim], query_pass[base_old .. base_old + rotary_dim]);
+                    @memcpy(k_r[base_new + rotary_dim .. base_new + head_dim], key_pass[base_old .. base_old + rotary_dim]);
+                }
+            }
+
+            // Update KV cache
+            const l_off = self.config.seq_len * dim;
+            @memcpy(self.state.k_cache[l * l_off ..], k_r);
+            @memcpy(self.state.v_cache[l * l_off ..], v_r);
 
             // attention
 
-            for (0..self.config.n_heads) |head| {
-                // extract query vector for the head
-                const q = self.state.q[head * self.config.head_dim .. (head + 1) * self.config.head_dim];
-                // define slice of attn weights for this head
-                const attn = self.state.attn[head * self.config.seq_len .. (head + 1) * self.config.seq_len];
+            try self.attention(q_r, k_r, v_r, embeddings, pos, q_len, l);
 
-                for (0..pos + 1) |t| {
-                    const k = self.state.k_cache[l_off + t * self.config.dim + head * self.config.head_dim .. l_off + t * self.config.dim + (head + 1) * self.config.head_dim];
-                    var score: f32 = vector_dot_product(q, k);
+            // mlp
 
-                    score /= std.math.sqrt(sqrt);
-                    attn[t] = score;
-                }
-
-                try softmax(attn[0 .. pos + 1]);
-
-                // attn for V
-                const xb = self.state.xb[head * self.config.head_dim .. (head + 1) * self.config.head_dim];
-
-                @memset(xb, 0.0);
-                for (0..pos + 1) |t| {
-                    const v = self.state.v_cache[l_off + t * self.config.head_dim + head * self.config.head_dim .. l_off + t * self.config.head_dim + (head + 1) * self.config.head_dim];
-                    const a = attn[t];
-
-                    vector_weighted_sum(xb, v, a);
-                }
-            }
-
-            try matmul(
-                self.allocator,
-                self.state.xb, // (1, 2048)
-                self.weights.t_out_proj_w[l * self.config.dim * self.config.dim .. (l + 1) * self.config.dim * self.config.dim], // (2048, 2048)
-                self.state.xb2, // (1, 2048)
-                1,
-                self.config.dim,
-                self.config.dim,
-            );
-
-            accumulate(self.state.xb2, self.weights.t_out_proj_bias[l * self.config.dim .. (l + 1) * self.config.dim]);
-
-            // TODO: Add residual connections
-
-            // residual connection back to x
-            accumulate(self.state.x, self.state.xb2);
-
-            // TODO: Add FFN
-
-            // upcasting
-            // X (1, 2048) @ fc1 (2048,8192) -> hb (1, 8192)
-
-            try matmul(
-                self.allocator,
-                self.state.x,
-                self.weights.t_fc1_w[l * self.config.dim * self.config.hidden_dim .. (l + 1) * self.config.dim * self.config.hidden_dim],
-                self.state.hb,
-                1,
-                self.config.hidden_dim,
-                self.config.dim,
-            );
-
-            accumulate(self.state.hb, self.weights.t_fc1_b[l * self.config.hidden_dim .. (l + 1) * self.config.hidden_dim]);
-            // hb (1, 8192) + fc1b (1, 8192)
-
-            gelu(self.state.hb);
-
-            // hb (1,8192) @ t_fc2_w(8192, 2048) -> hb2(1, 2048)
-
-            try matmul(
-                self.allocator,
-                self.state.hb,
-                self.weights.t_fc2_w[l * self.config.hidden_dim * self.config.dim .. (l + 1) * self.config.hidden_dim * self.config.dim],
-                self.state.hb2,
-                1,
-                self.config.dim,
-                self.config.hidden_dim,
-            );
-            // hb2 (1, 2048) + self.weights (1, 2048)
-
-            accumulate(self.state.hb2, self.weights.t_fc2_b[l * self.config.dim .. (l + 1) * self.config.dim]);
-
-            // residual connection from mlp back to x
-
-            // x (1, 2048) + hb2(1, 2048)
-            accumulate(self.state.x, self.state.hb2);
-
-            // final LN and then linear
-
-            try layer_norm(
-                self.state.x,
-                self.weights.t_ln_out_w,
-                self.weights.t_ln_out_b,
-                1e-5,
-            );
-
-            try matmul(
-                self.allocator,
-                self.state.x,
-                self.weights.t_linear_w,
-                self.state.logits,
-                1,
-                self.config.vocab,
-                self.config.dim,
-            );
-            accumulate(self.state.logits, self.weights.t_linear_b);
-            // std.debug.print("logits : {any} \n", .{self.state.logits[0..10]});
-            // std.debug.print("================= \n", .{});
+            try self.mlp(embeddings, embeddings, q_len, l);
         }
     }
+
+    fn lm_head(self: Self, hidden_states: []f32, q_len: usize) ![]f32 {
+        const dim = self.config.dim;
+        const vocab_size = self.config.vocab;
+
+        // If q_len > 1, we need to process each token to get their logits
+        // Allocate memory for all logits (vocab_size for each token in q_len)
+        const logits = try self.allocator.alloc(f32, q_len * vocab_size);
+
+        // Process each token in the sequence
+        for (0..q_len) |i| {
+            // Get the hidden state for the current token
+            const token_hidden = hidden_states[i * dim .. (i + 1) * dim];
+
+            // Allocate memory for normalized hidden state
+            const normalized = try self.allocator.alloc(f32, dim);
+            defer self.allocator.free(normalized);
+
+            // Copy current token's hidden state to normalize it
+            @memcpy(normalized, token_hidden);
+
+            // Apply layer normalization
+            try layer_norm(
+                normalized,
+                self.weights.t_ln_out_w,
+                self.weights.t_ln_out_b,
+                1e-5, // epsilon
+            );
+
+            // Project to vocabulary size using lm_head weights
+            try matmul(
+                self.allocator,
+                normalized,
+                self.weights.t_linear_w,
+                logits[i * vocab_size .. (i + 1) * vocab_size],
+                1, // batch size is 1 for each token
+                vocab_size,
+                dim,
+            );
+
+            // Add bias if it exists
+
+            accumulate(logits, self.weights.t_linear_b);
+        }
+
+        return logits;
+    }
+
+    fn attention_mask(allocator: std.mem.Allocator, pos: usize, seq_len: usize) ![]f32 {
+        // Total sequence length includes both past (pos) and current (seq_len) tokens
+        const total_seq_len = pos + seq_len;
+
+        // Allocate 2D mask of shape [seq_len, total_seq_len]
+        const mask = try allocator.alloc(f32, seq_len * total_seq_len);
+
+        // Fill everything with 1s first - this allows attention to all past tokens
+        @memset(mask, 1.0);
+
+        // For the current sequence part, implement causal masking
+        for (0..seq_len) |i| {
+            for (0..seq_len) |j| {
+                // Calculate position in the full sequence
+                const col = pos + j;
+                const mask_idx = i * total_seq_len + col;
+
+                // Ensure we don't write out of bounds
+                if (mask_idx >= mask.len) {
+                    return error.IndexOutOfBounds;
+                }
+
+                // Create causal mask: token i can only attend to tokens 0..=i
+                mask[mask_idx] = if (j <= i) 1.0 else 0.0;
+            }
+        }
+
+        return mask;
+    }
+
+    fn attention(self: Self, q: []f32, k: []f32, v: []f32, embeddings: []f32, pos: usize, q_len: usize, l: usize) !void {
+        const n_heads = self.config.n_heads;
+        const head_dim = self.config.head_dim;
+        const kv_seq_len = q_len + pos;
+        const dim = self.config.dim;
+
+        // separate scores are allocated for each head:
+        const scores = try self.allocator.alloc(f32, n_heads * q_len * kv_seq_len);
+        self.allocator.free(scores);
+
+        // attention output will be the same size as the input embedding
+        const attn_output = try self.allocator.alloc(f32, q_len * dim);
+        defer self.allocator.free(attn_output);
+
+        @memset(attn_output, 0);
+
+        const mask = try attention_mask(self.allocator, pos, q_len);
+        defer self.allocator.free(mask);
+
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+        // Compute attention scores for each head
+        for (0..n_heads) |h| {
+            // Calculate scaled dot product attention
+            // Q * K^T / sqrt(head_dim)
+
+            for (0..q_len) |i| {
+                for (0..kv_seq_len) |j| {
+                    var score: f32 = 0.0;
+                    const q_offset = h * q_len * head_dim + i * head_dim;
+                    const k_offset = h * kv_seq_len * head_dim + j * head_dim;
+
+                    // Compute dot product
+                    for (0..head_dim) |d| {
+                        score += q[q_offset + d] * k[k_offset + d];
+                    }
+
+                    // Scale and apply mask
+                    score *= scale;
+                    score *= mask[i * kv_seq_len + j];
+
+                    scores[h * q_len * kv_seq_len + i * kv_seq_len + j] = score;
+                }
+            }
+        }
+
+        // Apply softmax to scores
+        for (0..n_heads) |h| {
+            for (0..q_len) |i| {
+                const start_idx = h * q_len * kv_seq_len + i * kv_seq_len;
+                const end_idx = start_idx + kv_seq_len;
+                try softmax(scores[start_idx..end_idx]);
+            }
+        }
+
+        // Compute attention output
+        for (0..n_heads) |h| {
+            for (0..q_len) |i| {
+                for (0..head_dim) |d| {
+                    var sum: f32 = 0.0;
+                    for (0..kv_seq_len) |j| {
+                        const score = scores[h * q_len * kv_seq_len + i * kv_seq_len + j];
+                        const v_val = v[h * kv_seq_len * head_dim + j * head_dim + d];
+                        sum += score * v_val;
+                    }
+                    const out_idx = i * dim + h * head_dim + d;
+                    attn_output[out_idx] = sum;
+                }
+            }
+        }
+
+        // Allocate temporary buffer for projection output
+        const proj_output = try self.allocator.alloc(f32, q_len * dim);
+        defer self.allocator.free(proj_output);
+
+        try matmul(
+            self.allocator,
+            attn_output,
+            self.weights.t_out_proj_w[l * self.config.dim * self.config.dim .. (l + 1) * self.config.dim * self.config.dim],
+            proj_output,
+            q_len,
+            dim,
+            dim,
+        );
+
+        accumulate(proj_output, self.weights.t_out_proj_bias[l * self.config.dim .. (l + 1) * self.config.dim]);
+        accumulate(embeddings, proj_output);
+    }
+
+    fn mlp(self: Self, input: []f32, embeddings: []f32, q_len: usize, l: usize) !void {
+        const dim = self.config.dim;
+        const hidden_dim = self.config.hidden_dim;
+
+        const fc1_out = try self.allocator.alloc(f32, q_len * hidden_dim);
+        defer self.allocator.free(fc1_out);
+
+        const fc2_out = try self.allocator.alloc(f32, q_len * dim);
+        defer self.allocator.free(fc2_out);
+
+        // first we will perform the first linear layer
+
+        try matmul(
+            self.allocator,
+            input,
+            self.weights.t_fc1_w[l * dim * hidden_dim .. (l + 1) * dim * hidden_dim],
+            fc1_out,
+            q_len,
+            hidden_dim,
+            dim,
+        );
+
+        accumulate(fc1_out, self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim]);
+
+        // we will then apply the gelu activation function
+
+        gelu(fc1_out);
+
+        // we will then perform the second linear layer
+        // downcasting the activated vector from hidden_dim to dim
+
+        try matmul(
+            self.allocator,
+            fc1_out,
+            self.weights.t_fc2_w[l * hidden_dim * dim .. (l + 1) * hidden_dim * dim],
+            fc2_out,
+            q_len,
+            dim,
+            hidden_dim,
+        );
+
+        accumulate(fc2_out, self.weights.t_fc2_b[l * dim .. (l + 1) * dim]);
+
+        // we will then add the residual connection
+
+        accumulate(embeddings, fc2_out);
+    }
+
+    fn getvector(self: Self, vector: []f32, head_index: usize, seq_index: usize, head_dim_index: usize) f32 {
+        // Calculate the flat index for `q` assuming it's shaped as (num_heads, q_len, head_dim)
+        const flat_index = seq_index * self.config.dim + head_index * self.config.head_dim + head_dim_index;
+        return vector[flat_index];
+    }
+
+    // we will then transform each of q, k, v vectors
+    // they will go from (q_len, dim) to (n_heads, qlen, head_dim)
+    // dim = n_heads * head_dim
 
     pub fn layer_norm(
         inputs: []f32,
@@ -1242,86 +1679,186 @@ const Model = struct {
         variance /= n;
 
         // Compute standard deviation
-        const std_ = @sqrt(variance + eps);
+        const std_dev = @sqrt(variance + eps);
 
         // Normalize the inputs
         for (inputs, 0..inputs.len) |*x, i| {
-            if (std_ > 1e-5) {
-                x.* = (x.* - mean) / std_ * weight[i] + bias[i];
-            } else {
-                // If std_ is very small, apply a small scaling factor
-                x.* = (x.* - mean) * 0.01 * weight[i] + bias[i];
-            }
-
-            // Clip extreme values
-            x.* = std.math.clamp(x.*, eps, 1e5);
+            const normalized = (x.* - mean) / std_dev;
+            x.* = normalized * weight[i] + bias[i];
 
             // Check for numerical stability
             if (std.math.isNan(x.*) or std.math.isInf(x.*)) {
-                std.debug.print("Warning: Output contains NaN or Inf at index {d}. Input: {d}, Weight: {d}, Bias: {d}, Mean: {d}, Std: {d}\n", .{ i, x.*, weight[i], bias[i], mean, std_ });
+                std.debug.print("Warning: Output contains NaN or Inf at index {d}. Input: {d}, Normalized: {d}, Weight: {d}, Bias: {d}, Mean: {d}, Std: {d}\n", .{ i, x.*, normalized, weight[i], bias[i], mean, std_dev });
                 return error.NumericalInstability;
             }
         }
     }
-    fn set_cos_sin_cache(self: Self, tokens: std.ArrayList(u32)) !void {
-        const half_dim = self.config.dim / 2;
 
-        // Compute inverse frequency
-        var i: usize = 0;
-        while (i < half_dim) : (i += 1) {
-            const x = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(half_dim));
-            self.state.inv_freq[i] = 1.0 / std.math.pow(f32, self.config.rope_theta, x);
+    fn set_cos_sin_cache(self: Self) !void {
+        const max_cached_seq_len = self.config.max_pos_embeddings;
+        const head_dim = self.config.head_dim;
+        const half_dim = head_dim / 2; // This should be 32 for head_dim=64
+        const base = self.config.rope_theta;
+
+        std.debug.print("Cache initialization:\n", .{});
+        std.debug.print("max_seq_len: {d}\n", .{max_cached_seq_len});
+        std.debug.print("head_dim: {d}, half_dim: {d}\n", .{ head_dim, half_dim });
+        std.debug.print("cache size should be: {d}\n", .{max_cached_seq_len * half_dim});
+
+        // Calculate inverse frequencies
+        const inv_freq = try self.allocator.alloc(f32, half_dim);
+        defer self.allocator.free(inv_freq);
+
+        // Fill inverse frequencies
+        for (0..half_dim) |i| {
+            const x = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(head_dim));
+            inv_freq[i] = 1.0 / std.math.pow(f32, base, x);
         }
 
-        // Allocate position frequencies
-        var position_freqs = try self.allocator.alloc(f32, self.config.seq_len * half_dim);
-        defer self.allocator.free(position_freqs);
+        // Generate position indices
+        const t = try self.allocator.alloc(f32, max_cached_seq_len);
+        defer self.allocator.free(t);
 
-        // Calculate position frequencies
-        for (0..tokens.items.len) |pos| {
+        for (0..max_cached_seq_len) |i| {
+            t[i] = @floatFromInt(i);
+        }
+
+        // Compute frequencies - this should output max_cached_seq_len * half_dim
+        const freqs = try self.allocator.alloc(f32, max_cached_seq_len * half_dim);
+        defer self.allocator.free(freqs);
+
+        // Compute outer product
+        for (0..max_cached_seq_len) |i| {
             for (0..half_dim) |j| {
-                position_freqs[pos * half_dim + j] = @as(f32, @floatFromInt(pos)) * self.state.inv_freq[j];
+                freqs[i * half_dim + j] = t[i] * inv_freq[j];
             }
         }
 
-        // Cache cosine and sine values
-        const cache_len = self.config.seq_len * half_dim;
-        for (0..cache_len) |itr| {
-            const cos_val = @cos(position_freqs[itr]);
-            const sin_val = @sin(position_freqs[itr]);
+        // At this point freqs is of size max_cached_seq_len * half_dim
+        // We directly apply cos and sin to freqs
+        try cos_2d(freqs, self.state.cos_cache);
+        try sin_2d(freqs, self.state.sin_cache);
 
-            // Store values twice to create the full dim-dimensional embedding
-            self.state.cos_cache[itr] = cos_val;
-            self.state.cos_cache[itr + cache_len] = cos_val;
-            self.state.sin_cache[itr] = sin_val;
-            self.state.sin_cache[itr + cache_len] = sin_val;
+        // Add verification
+        std.debug.print("freqs.len: {d}, cos_cache.len: {d}\n", .{ freqs.len, self.state.cos_cache.len });
+        if (self.state.cos_cache.len != max_cached_seq_len * half_dim or
+            self.state.sin_cache.len != max_cached_seq_len * half_dim)
+        {
+            return error.CacheSizeMismatch;
         }
     }
 
-    fn apply_rope(self: Self, vec: []f32, pos: usize) !void {
-        assert(vec.len == self.config.dim);
-        const half_dim = self.config.dim / 2;
-        const cos = self.state.cos_cache[pos * half_dim .. (pos + 1) * half_dim];
-        const sin = self.state.sin_cache[pos * half_dim .. (pos + 1) * half_dim];
+    fn get_rot_emb(self: Self, seq_len: usize) struct { []f32, []f32 } {
+        const half_dim = self.config.head_dim / 2;
+        // Should create arrays of size seq_len * half_dim
+        return .{
+            .@"0" = self.state.cos_cache[0 .. seq_len * half_dim],
+            .@"1" = self.state.sin_cache[0 .. seq_len * half_dim],
+        };
+    }
 
-        var i: usize = 0;
-        while (i < half_dim) : (i += 1) {
-            const temp1 = vec[2 * i];
-            const temp2 = vec[2 * i + 1];
-            vec[2 * i] = temp1 * cos[i] - temp2 * sin[i];
-            vec[2 * i + 1] = temp1 * sin[i] + temp2 * cos[i];
+    fn apply_rope(self: Self, q: []f32, k: []f32, cos: []f32, sin: []f32, pos: usize, qlen: usize) !void {
+        const n_heads = self.config.n_heads;
+        const head_dim = self.config.head_dim;
+        const half_dim = head_dim / 2;
+
+        std.debug.print("RoPE debug:\n", .{});
+        std.debug.print("cos len: {d}\n", .{cos.len});
+        std.debug.print("head_dim: {d}\n", .{head_dim});
+        std.debug.print("half_dim: {d}\n", .{half_dim});
+        std.debug.print("pos: {d}\n", .{pos});
+        std.debug.print("qlen: {d}\n", .{qlen});
+        std.debug.print("max position access will be: {d}\n", .{(pos + qlen - 1) * half_dim + (half_dim - 1)});
+
+        // Verify dimensions
+        if (q.len != n_heads * qlen * head_dim) {
+            std.debug.print("Expected q length: {d}, got: {d}\n", .{ n_heads * qlen * head_dim, q.len });
+            return error.DimensionMismatch;
+        }
+
+        const q_rotated = try self.allocator.alloc(f32, q.len);
+        defer self.allocator.free(q_rotated);
+        const k_rotated = try self.allocator.alloc(f32, k.len);
+        defer self.allocator.free(k_rotated);
+
+        for (0..n_heads) |h| {
+            for (0..qlen) |seq_idx| {
+                const base_idx = h * qlen * head_dim + seq_idx * head_dim;
+
+                // Debug the indexing
+                if (base_idx >= q.len or base_idx + head_dim > q.len) {
+                    std.debug.print("Invalid base_idx: {d}, q.len: {d}\n", .{ base_idx, q.len });
+                    return error.IndexOutOfBounds;
+                }
+                const position = pos + seq_idx;
+
+                // First do the rotation
+                // For first half: copy negated values from second half
+                for (0..half_dim) |dim| {
+                    q_rotated[base_idx + dim] = -q[base_idx + dim + half_dim];
+                    k_rotated[base_idx + dim] = -k[base_idx + dim + half_dim];
+                }
+                // For second half: copy values from first half
+                for (0..half_dim) |dim| {
+                    q_rotated[base_idx + half_dim + dim] = q[base_idx + dim];
+                    k_rotated[base_idx + half_dim + dim] = k[base_idx + dim];
+                }
+
+                // Then apply the rotation using cos/sin
+                for (0..half_dim) |dim| {
+                    const cos_val = cos[position * half_dim + dim];
+                    const sin_val = sin[position * half_dim + dim];
+
+                    // Apply to first half
+                    const idx1 = base_idx + dim;
+                    const idx2 = base_idx + dim + half_dim;
+
+                    if (idx2 >= q.len) {
+                        std.debug.print("Index out of bounds: {d} >= {d}\n", .{ idx2, q.len });
+                        return error.IndexOutOfBounds;
+                    }
+
+                    const q1 = q[idx1];
+                    const q2 = q[idx2];
+                    q[idx1] = q1 * cos_val - q2 * sin_val;
+                    q[idx2] = q1 * sin_val + q2 * cos_val;
+
+                    const k1 = k[idx1];
+                    const k2 = k[idx2];
+                    k[idx1] = k1 * cos_val - k2 * sin_val;
+                    k[idx2] = k1 * sin_val + k2 * cos_val;
+                }
+            }
         }
     }
-    fn embed(self: Self, token: usize) []f32 {
-        return self.weights.word_token_embedding[token * self.config.dim ..][0..self.config.dim];
+
+    fn embed_tokens(self: Self, tokens: std.ArrayList(u32)) ![]f32 {
+        var text_embed = try self.allocator.alloc(f32, tokens.items.len * self.config.dim);
+        errdefer self.allocator.free(text_embed);
+
+        for (tokens.items, 0..) |token, i| {
+            if (token >= self.weights.word_token_embedding.len / self.config.dim) {
+                return error.TokenOutOfBounds;
+            }
+            const src_start = token * self.config.dim;
+            const src_end = src_start + self.config.dim;
+            const dst_start = i * self.config.dim;
+            const dst_end = dst_start + self.config.dim;
+            @memcpy(text_embed[dst_start..dst_end], self.weights.word_token_embedding[src_start..src_end]);
+        }
+
+        return text_embed;
     }
 
+    fn merge_embed(self: Self, text_embed: []f32, image_embed: []f32) ![]f32 {
+        const embedding = try self.allocator.alloc(f32, text_embed.len + image_embed.len);
+        std.debug.print("Merging text embed of size {any} and image embed of size {any} \n", .{ text_embed.len / self.config.dim, image_embed.len / self.config.dim });
+        @memcpy(embedding[0..image_embed.len], image_embed);
+        @memcpy(embedding[0..text_embed.len], text_embed);
+        return embedding;
+    }
     /// This function will load the images and then preprocess them into the required format
-    pub fn preprocess(
-        self: Self,
-        image_path: []const u8,
-        allocator: Allocator,
-    ) ![]f32 {
+    pub fn preprocess(self: Self, image_path: []const u8, allocator: Allocator) ![]f32 {
         // Load the image
         const target_height = self.config.img_dim;
         const target_width = self.config.img_dim;
@@ -1672,96 +2209,123 @@ const Model = struct {
         for (0..num_patches) |patch| {
             accumulate(self.state.projection[patch * self.config.dim .. (patch + 1) * self.config.dim], self.weights.v_proj_fc2_b);
         }
-        std.debug.print("Pass! \n", .{});
     }
 };
 // std.debug.print("Pass! \n", .{});
 // inference
-fn generate(model: *Model, image_path: []const u8, prompt: []const u8, max_new_tokens: usize, temperature: f32, top_p: f32, allocator: std.mem.Allocator) ![]const u8 {
+fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     const preprocessed = try model.preprocess(image_path, allocator);
     defer allocator.free(preprocessed);
 
-    // Now you can safely use float_image with SIMD operations
     @memcpy(model.state.img, preprocessed);
     try model.vision_encoder();
 
-    var tokens = try model.tokenizer.encode(prompt);
+    // Format prompt and encode tokens
+    const formatted_prompt = try std.fmt.allocPrint(allocator, "\n\nQuestion: {s}\n\nAnswer:", .{prompt});
+    defer allocator.free(formatted_prompt);
+
+    var tokens = try model.tokenizer.encode(formatted_prompt);
     defer tokens.deinit();
 
-    try model.set_cos_sin_cache(tokens);
+    var tokens_with_eos = std.ArrayList(u32).init(allocator);
+    defer tokens_with_eos.deinit();
+    try tokens_with_eos.append(model.tokenizer.eos_token);
+    try tokens_with_eos.appendSlice(tokens.items);
 
-    var generated_tokens = std.ArrayList(u32).init(allocator);
-    defer generated_tokens.deinit();
+    // Get initial embeddings
+    var initial_tokens = std.ArrayList(u32).init(model.allocator);
+    defer initial_tokens.deinit();
+    try initial_tokens.appendSlice(tokens_with_eos.items);
+    const text_embed = try model.embed_tokens(initial_tokens);
+    defer model.allocator.free(text_embed);
 
-    try generated_tokens.appendSlice(tokens.items);
+    std.debug.print("Text embeddings len : {any} \n", .{text_embed.len});
+    std.debug.print("Image embeddings len : {any} \n", .{model.state.projection.len});
 
-    var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+    const init_embedding = try model.merge_embed(text_embed, model.state.projection);
+    defer allocator.free(init_embedding);
 
-    while (generated_tokens.items.len < tokens.items.len + max_new_tokens) {
-        try model.text_model(generated_tokens, generated_tokens.items.len - 1);
+    // we precompute the cos and sin cache for the positional encoding
+    try model.set_cos_sin_cache();
 
-        const next_token = try sampleNextToken(model.state.logits, temperature, top_p, &rng, allocator);
-        try generated_tokens.append(next_token);
+    // // first we will perform multiquery attention on the vision and text embeddings from the image + prompt
 
-        if (next_token == model.tokenizer.eos_token) break;
+    var pos: usize = 0; // this defines the current position in the kv cache, or the number of tokens already processed. This starts at 0.
+
+    // // first we will process the prompt and the image embeddings altogether
+
+    try model.text_model(init_embedding, pos);
+
+    // // we will add the incoming q_len to the current pos which indicates the sequence length of the key and value vectors
+
+    pos += init_embedding.len / model.config.dim;
+    std.debug.print("pos : {any} \n", .{pos});
+
+    // Initialize output buffer
+    var output = std.ArrayList(u8).init(allocator);
+    defer output.deinit();
+
+    var current_embeddings = std.ArrayList(f32).init(allocator);
+    defer current_embeddings.deinit();
+
+    // Create ArrayList for tokens to decode
+    var token_list = std.ArrayList(u32).init(model.allocator);
+    defer token_list.deinit();
+
+    // Single token list for embedding
+    var single_token_list = std.ArrayList(u32).init(model.allocator);
+    defer single_token_list.deinit();
+
+    const max_tokens: usize = 100;
+    generation: for (0..max_tokens) |_| {
+        const logits = try model.lm_head(
+            current_embeddings.items,
+            current_embeddings.items.len / model.config.dim,
+        );
+
+        defer model.allocator.free(logits);
+
+        const next_token = try sampleNextToken(logits);
+
+        std.debug.print("Done!\n", .{});
+
+        // Check for EOS
+        if (next_token == model.tokenizer.eos_token) {
+            std.debug.print("EOS token found!\n", .{});
+            break :generation;
+        }
+
+        // Clear token lists and add next token
+        token_list.clearRetainingCapacity();
+        try token_list.append(next_token);
+
+        single_token_list.clearRetainingCapacity();
+        try single_token_list.append(next_token);
+
+        // Decode and append to output
+        const token_str = try model.tokenizer.decode(token_list);
+        defer model.allocator.free(token_str);
+        try output.appendSlice(token_str);
+
+        const next_embed = try model.embed_tokens(single_token_list);
+        defer model.allocator.free(next_embed);
+
+        // Clear current embeddings and set to next token's embeddings
+        try current_embeddings.resize(next_embed.len);
+        @memcpy(current_embeddings.items, next_embed);
+
+        // Process next token
+        try model.text_model(current_embeddings.items, pos);
+        pos += 1;
     }
-    const decoding = try model.tokenizer.decode(generated_tokens);
 
-    return decoding;
+    return output.toOwnedSlice();
 }
 
-fn sampleNextToken(logits: []f32, temperature: f32, top_p: f32, rng: *std.rand.DefaultPrng, allocator: Allocator) !u32 {
-    var adjusted_logits = try allocator.alloc(f32, logits.len);
-    defer allocator.free(adjusted_logits);
-
-    // Apply temperature
-    for (logits, 0..) |logit, i| {
-        adjusted_logits[i] = logit / temperature;
-    }
-
-    // Convert to probabilities
-    try softmax(adjusted_logits);
-    std.debug.print("Softmax logits : {any}", .{adjusted_logits[0..10]});
-    std.debug.print("\n===========================\n\n", .{});
-
-    // Implement top-p sampling
-    const cumulative_probs = try allocator.alloc(f32, logits.len);
-    defer allocator.free(cumulative_probs);
-
-    @memcpy(cumulative_probs, adjusted_logits);
-    std.sort.pdq(f32, cumulative_probs, {}, std.sort.desc(f32));
-
-    var cumsum: f32 = 0;
-    var cutoff_index: usize = 0;
-    for (cumulative_probs, 0..) |prob, i| {
-        cumsum += prob;
-        if (cumsum > top_p) {
-            cutoff_index = i;
-            break;
-        }
-    }
-
-    // Zero out probabilities below the cutoff
-    for (adjusted_logits) |*prob| {
-        if (prob.* < cumulative_probs[cutoff_index]) {
-            prob.* = 0;
-        }
-    }
-
-    // Renormalize
-    try softmax(adjusted_logits);
-
-    // Sample from the distribution
-    const random_value = rng.random().float(f32);
-    var sum: f32 = 0;
-    for (adjusted_logits, 0..) |prob, i| {
-        sum += prob;
-        if (sum > random_value) {
-            return @intCast(i);
-        }
-    }
-
-    return error.SamplingFailed;
+fn sampleNextToken(logits: []f32) !u32 {
+    // Use argmax to find the index of the maximum logit
+    const max_index = argmax(logits);
+    return @intCast(max_index);
 }
 
 // main
@@ -1808,17 +2372,15 @@ pub fn main() !void {
     var state = try RunState.init(allocator, config);
     defer state.deinit(allocator);
 
-    // initializing text model //
+    // initializing model struct //
     var model = try Model.init(config, weights, tokenizer, state, allocator);
 
-    const prompt = "this is a whiteboard <image> Hello, World!";
-    const max_new_tokens = 5;
-    const temperature = 0.1;
-    const top_p = 0.9;
+    const prompt = "Hello";
+    // const max_new_tokens = 5;
 
     var timer = try std.time.Timer.start();
 
-    const generated_text = try generate(&model, image_path, prompt, max_new_tokens, temperature, top_p, allocator);
+    const generated_text = try generate(&model, image_path, prompt, allocator);
     defer allocator.free(generated_text);
 
     const elapsed_ns = timer.read();
@@ -1833,7 +2395,7 @@ pub fn main() !void {
 test "softmax" {
     var x = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
 
-    softmax(&x);
+    try softmax(&x);
 
     var sum: f32 = 0.0;
     for (0..x.len) |value| {
@@ -1884,6 +2446,91 @@ test "matrix_multiplies" {
     try std.testing.expect(xout[1] == 4.0 + 10.0 + 18.0);
     try std.testing.expect(xout[2] == 7.0 + 16.0 + 27.0);
 }
+
+// test "test outer product correctness and performance" {
+//     const A = [_]f32{ 1, 2, 3 };
+//     const B = [_]f32{ 4, 5, 6 };
+//     const M: usize = 3;
+//     const N: usize = 3;
+
+//     // Allocate memory for the result matrices
+//     const C_simd = try std.heap.page_allocator.alloc(f32, M * N);
+//     defer std.heap.page_allocator.free(C_simd);
+
+//     const C_conventional = try std.heap.page_allocator.alloc(f32, M * N);
+//     defer std.heap.page_allocator.free(C_conventional);
+
+//     // Compute the outer product using SIMD
+//     const start_simd = std.time.nanoTimestamp();
+//     try outer(&A, &B, C_simd, M, N);
+//     const end_simd = std.time.nanoTimestamp();
+
+//     // Compute the outer product using conventional method
+//     const start_conventional = std.time.nanoTimestamp();
+//     try outerConventional(&A, &B, C_conventional, M, N);
+//     const end_conventional = std.time.nanoTimestamp();
+
+//     // Print the results
+//     std.debug.print("SIMD Time: {d} ns\n", .{end_simd - start_simd});
+//     std.debug.print("Conventional Time: {d} ns\n", .{end_conventional - start_conventional});
+
+//     // Check correctness
+//     for (C_simd, 0..C_simd.len) |elem, idx| {
+//         try std.testing.expectEqual(elem, C_conventional[idx]);
+//     }
+// }
+
+// test "matmul - outer product verification" {
+//     const testing = std.testing;
+//     const allocator = testing.allocator;
+
+//     // Define input vectors
+//     const M: usize = 3; // Size of first vector
+//     const K: usize = 1; // Middle dimension (always 1 for outer product)
+//     const N: usize = 2; // Size of second vector
+
+//     // Create input vectors
+//     const a = [_]f32{ 1, 2, 3 }; // 3x1 vector
+//     const b = [_]f32{ 4, 5 }; // 1x2 vector
+
+//     // Create output matrix
+//     const C = try allocator.alloc(f32, M * N);
+//     defer allocator.free(C);
+
+//     // Zero initialize the output matrix
+//     @memset(C, 0);
+
+//     // Perform outer product using matmul
+//     try matmul(allocator, &a, &b, C, M, N, K);
+
+//     // Expected result matrix (3x2)
+//     const expected = [_]f32{
+//         4.0, 5.0, // 1 * [4, 5]
+//         8.0, 10.0, // 2 * [4, 5]
+//         12.0, 15.0, // 3 * [4, 5]
+//     };
+
+//     // Verify results
+//     for (C, 0..) |val, i| {
+//         try testing.expectApproxEqAbs(expected[i], val, 0.0001);
+//     }
+
+//     // Optional: Print the result matrix for visualization
+//     std.debug.print("\nOuter product result:\n", .{});
+//     for (0..M) |i| {
+//         for (0..N) |j| {
+//             std.debug.print("{d:.1} ", .{C[i * N + j]});
+//         }
+//         std.debug.print("\n", .{});
+//     }
+
+//     for (0..M) |i| {
+//         for (0..N) |j| {
+//             std.debug.print("{d:.1} ", .{expected[i * N + j]});
+//         }
+//         std.debug.print("\n", .{});
+//     }
+// }
 
 // test "matmul dimension checks" {
 //     const allocator = std.testing.allocator;
