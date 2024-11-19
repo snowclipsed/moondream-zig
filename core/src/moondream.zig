@@ -1243,47 +1243,61 @@ const Model = struct {
     tokenizer: Tokenizer,
     state: RunState,
     allocator: Allocator,
+    freqs_cis: []Complex,
 
     fn init(config: Config, weights: Weights, tokenizer: Tokenizer, state: RunState, allocator: Allocator) !Model {
-        return Model{
+        var model = Model{
             .config = config,
             .weights = weights,
             .tokenizer = tokenizer,
             .state = state,
             .allocator = allocator,
+            .freqs_cis = undefined,
         };
+
+        // Initialize rotary embeddings
+        const theta = 10000.0;
+        model.freqs_cis = try model.precompute_freqs_cis(
+            model.config.head_dim,
+            model.config.max_pos_embeddings,
+            theta,
+        );
+
+        return model;
     }
 
     fn text_model(self: Self, embeddings: []f32, pos: usize) !void {
-        // each token embedding is of size dim, so we divide by it to see
-        // how many tokens are present
-        // so we perform this assert before making any further calculations
         assert(embeddings.len % self.config.dim == 0);
 
-        // we define our layernorm epsilon constant:
         const eps = 1e-5;
         const dim = self.config.dim;
         const n_heads = self.config.n_heads;
         const head_dim = self.config.head_dim;
-
-        //now we find the number of tokens, or the query length
-
         const q_len = embeddings.len / dim;
+        // const kv_seq_len = q_len + pos;
+        const half_dim = head_dim / 2;
 
-        // we will add the incoming q_len to the current pos which indicates the sequence length of the key and value vectors
-        // this also allows us to keep track of the current position in the kv cache
+        // Allocate all buffers upfront
+        // Allocate buffers for residual connections
+        const hidden_states = try self.allocator.alloc(f32, embeddings.len);
+        defer self.allocator.free(hidden_states);
 
-        std.debug.print("q_len: {any} \n", .{q_len});
-
-        // other constants
-        //layernorm input
+        // Layer norm input
         const ln_in = try self.allocator.alloc(f32, embeddings.len);
         defer self.allocator.free(ln_in);
 
-        // qkv states tensor
+        // Attention output
+        const attn_output = try self.allocator.alloc(f32, embeddings.len);
+        defer self.allocator.free(attn_output);
+
+        // MLP output
+        const mlp_output = try self.allocator.alloc(f32, embeddings.len);
+        defer self.allocator.free(mlp_output);
+
         const qkv = try self.allocator.alloc(f32, q_len * dim * 3);
         defer self.allocator.free(qkv);
 
+        // QKV split buffers
         const q = try self.allocator.alloc(f32, q_len * dim);
         const k = try self.allocator.alloc(f32, q_len * dim);
         const v = try self.allocator.alloc(f32, q_len * dim);
@@ -1291,32 +1305,48 @@ const Model = struct {
         defer self.allocator.free(k);
         defer self.allocator.free(v);
 
-        const q_r = try self.allocator.alloc(f32, q_len * dim);
-        const k_r = try self.allocator.alloc(f32, q_len * dim);
-        const v_r = try self.allocator.alloc(f32, q_len * dim);
-        // Allocate memory for query_rot and query_pass
-        // Allocate rotary and pass-through parts with proper sizes
-        const rotary_dim = head_dim / 2; // Half for rotation
-        const query_rot = try self.allocator.alloc(f32, n_heads * q_len * rotary_dim);
-        defer self.allocator.free(query_rot);
-        const query_pass = try self.allocator.alloc(f32, n_heads * q_len * rotary_dim);
-        defer self.allocator.free(query_pass);
-        const key_rot = try self.allocator.alloc(f32, n_heads * q_len * rotary_dim);
-        defer self.allocator.free(key_rot);
-        const key_pass = try self.allocator.alloc(f32, n_heads * q_len * rotary_dim);
-        defer self.allocator.free(key_pass);
-        const kv_seq_len = q_len + pos;
-        std.debug.print("kv seq len : {any} \n", .{kv_seq_len});
-        const scores = try self.allocator.alloc(f32, q_len * kv_seq_len);
-        defer self.allocator.free(scores);
+        // Head format buffers
+        const q_h = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        const k_h = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        const v_h = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        defer self.allocator.free(q_h);
+        defer self.allocator.free(k_h);
+        defer self.allocator.free(v_h);
 
+        // Additional buffers for cache format
+        const k_cache_fmt = try self.allocator.alloc(f32, q_len * dim);
+        const v_cache_fmt = try self.allocator.alloc(f32, q_len * dim);
+        defer self.allocator.free(k_cache_fmt);
+        defer self.allocator.free(v_cache_fmt);
+
+        // Rotary buffers
+        const q_rot = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
+        const k_rot = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
+        const q_pass = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
+        const k_pass = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
+        defer self.allocator.free(q_rot);
+        defer self.allocator.free(k_rot);
+        defer self.allocator.free(q_pass);
+        defer self.allocator.free(k_pass);
+
+        // Rotary output buffers
+        const q_rot_out = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
+        const k_rot_out = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
+        defer self.allocator.free(q_rot_out);
+        defer self.allocator.free(k_rot_out);
+
+        // Position IDs
+        var position_ids = try self.allocator.alloc(usize, q_len);
+        defer self.allocator.free(position_ids);
+        for (0..q_len) |i| {
+            position_ids[i] = pos + i;
+        }
+
+        @memcpy(hidden_states, embeddings);
+        // Main loop over layers
         for (0..self.config.n_layers) |l| {
-
-            // get the residual before performing layernorm
-            // this way the original input embeddings will act as a residual
-
-            // we then perform layernorm
-
+            // 1. Layer Norm
+            @memcpy(ln_in, hidden_states);
             for (0..q_len) |query| {
                 try layer_norm(
                     ln_in[query * dim .. (query + 1) * dim],
@@ -1326,9 +1356,7 @@ const Model = struct {
                 );
             }
 
-            // next we will perform sdpa
-
-            // we will first extract the q, k, v states as a combined vector:
+            // 2. QKV Projection
             try matmul(
                 self.allocator,
                 ln_in,
@@ -1339,92 +1367,203 @@ const Model = struct {
                 dim,
             );
 
-            // printMatrix(q_len, dim * 3, qkv, 2, 5);
-
-            // we split qkv into three state vectors for q, k, v
-
-            // Manual strided copy
+            // 3. Split QKV
             for (0..q_len * dim) |i| {
                 q[i] = qkv[i * 3];
                 k[i] = qkv[i * 3 + 1];
                 v[i] = qkv[i * 3 + 2];
             }
 
-            // we then convert the q, k, v vectors into a different view of dims (n_heads, q_len, head_dim)
-            // TODO : Check if they actually are (n_heads, q_len, head_dim)
+            // 4. Reshape to (n_heads, q_len, head_dim)
             for (0..n_heads) |h| {
                 for (0..q_len) |i| {
                     for (0..head_dim) |j| {
                         const old_index = i * dim + h * head_dim + j;
                         const new_index = h * q_len * head_dim + i * head_dim + j;
-                        q_r[new_index] = q[old_index];
-                        k_r[new_index] = k[old_index];
-                        v_r[new_index] = v[old_index];
+                        q_h[new_index] = q[old_index];
+                        k_h[new_index] = k[old_index];
+                        v_h[new_index] = v[old_index];
                     }
                 }
             }
 
-            // first we need to calculate the inverse frequencies.
-            // the length of the sin and cos cache is equal to the max sequence length = 2048
-            // we the obtain the position frequencies from the cos sin cache for the current position + the number of tokens we are processing, which would be from 0 till the position of the current token
-
-            // we will then apply RoPE
-            // after that, we update the kv cache, and hence the pos counter for the kv cache will also update
-            // we update this in the generate function
-            // after we finish generation, we reset pos to 0
-
-            const freqs = self.get_rot_emb(kv_seq_len);
-            const cos = freqs.@"0";
-            const sin = freqs.@"1";
-
-            // add query rot and query pass here:
-
-            // Split the query states into rotary and pass-through parts
-            for (0..n_heads) |h| {
-                for (0..q_len) |i| {
-                    const base_old = h * q_len * head_dim + i * head_dim;
-                    const base_new = h * q_len * rotary_dim + i * rotary_dim;
-
-                    // Copy first half to rotary (0 to rotary_dim)
-                    @memcpy(query_rot[base_new .. base_new + rotary_dim], q_r[base_old .. base_old + rotary_dim]);
-                    @memcpy(key_rot[base_new .. base_new + rotary_dim], k_r[base_old .. base_old + rotary_dim]);
-
-                    // Copy second half to pass (rotary_dim to head_dim)
-                    @memcpy(query_pass[base_new .. base_new + rotary_dim], q_r[base_old + rotary_dim .. base_old + head_dim]);
-                    @memcpy(key_pass[base_new .. base_new + rotary_dim], k_r[base_old + rotary_dim .. base_old + head_dim]);
-                }
+            // 5. Split into rotary and pass parts
+            for (0..n_heads * q_len) |i| {
+                @memcpy(q_rot[i * half_dim .. (i + 1) * half_dim], q_h[i * head_dim .. i * head_dim + half_dim]);
+                @memcpy(k_rot[i * half_dim .. (i + 1) * half_dim], k_h[i * head_dim .. i * head_dim + half_dim]);
+                @memcpy(q_pass[i * half_dim .. (i + 1) * half_dim], q_h[i * head_dim + half_dim .. (i + 1) * head_dim]);
+                @memcpy(k_pass[i * half_dim .. (i + 1) * half_dim], k_h[i * head_dim + half_dim .. (i + 1) * head_dim]);
             }
 
-            try self.apply_rope(query_rot, key_rot, cos, sin, pos, q_len);
+            // 6. Apply rotary embeddings
+            try self.apply_rotary_emb_inplace(q_rot, self.freqs_cis, position_ids, half_dim, q_rot_out);
+            try self.apply_rotary_emb_inplace(k_rot, self.freqs_cis, position_ids, half_dim, k_rot_out);
 
-            // Merge rotary and pass parts back into q_r and k_r
-            for (0..n_heads) |h| {
-                for (0..q_len) |i| {
-                    const base_old = h * q_len * rotary_dim + i * rotary_dim;
-                    const base_new = h * q_len * head_dim + i * head_dim;
-
-                    // Copy rotary part back (first half)
-                    @memcpy(q_r[base_new .. base_new + rotary_dim], query_rot[base_old .. base_old + rotary_dim]);
-                    @memcpy(k_r[base_new .. base_new + rotary_dim], key_rot[base_old .. base_old + rotary_dim]);
-
-                    // Copy pass part back (second half)
-                    @memcpy(q_r[base_new + rotary_dim .. base_new + head_dim], query_pass[base_old .. base_old + rotary_dim]);
-                    @memcpy(k_r[base_new + rotary_dim .. base_new + head_dim], key_pass[base_old .. base_old + rotary_dim]);
-                }
+            // 7. Merge back
+            for (0..n_heads * q_len) |i| {
+                @memcpy(q_h[i * head_dim .. i * head_dim + half_dim], q_rot_out[i * half_dim .. (i + 1) * half_dim]);
+                @memcpy(k_h[i * head_dim .. i * head_dim + half_dim], k_rot_out[i * half_dim .. (i + 1) * half_dim]);
+                @memcpy(q_h[i * head_dim + half_dim .. (i + 1) * head_dim], q_pass[i * half_dim .. (i + 1) * half_dim]);
+                @memcpy(k_h[i * head_dim + half_dim .. (i + 1) * head_dim], k_pass[i * half_dim .. (i + 1) * half_dim]);
             }
 
-            // Update KV cache
+            // 8. Before updating cache, convert back from head format to cache format
+            for (0..q_len) |i| {
+                for (0..n_heads) |h| {
+                    for (0..head_dim) |j| {
+                        const head_idx = h * q_len * head_dim + i * head_dim + j;
+                        const cache_idx = i * dim + h * head_dim + j;
+                        k_cache_fmt[cache_idx] = k_h[head_idx];
+                        v_cache_fmt[cache_idx] = v_h[head_idx];
+                    }
+                }
+            }
+            // 9. Update KV Cache with properly formatted tensors
             const l_off = self.config.seq_len * dim;
-            @memcpy(self.state.k_cache[l * l_off ..], k_r);
-            @memcpy(self.state.v_cache[l * l_off ..], v_r);
+            const cache_start = l * l_off + pos * dim;
+            const cache_len = q_len * dim;
 
-            // attention
+            if (cache_start + cache_len > self.state.k_cache.len) {
+                std.debug.print("Cache update out of bounds: start={d}, len={d}, cache_len={d}\n", .{ cache_start, cache_len, self.state.k_cache.len });
+                return error.CacheUpdateOutOfBounds;
+            }
 
-            try self.attention(q_r, k_r, v_r, embeddings, pos, q_len, l);
+            @memcpy(self.state.k_cache[cache_start .. cache_start + cache_len], k_cache_fmt);
+            @memcpy(self.state.v_cache[cache_start .. cache_start + cache_len], v_cache_fmt);
 
-            // mlp
+            // 10. Attention
+            try self.attention(q_h, k_h, v_h, pos, q_len, l, attn_output);
 
-            try self.mlp(embeddings, embeddings, q_len, l);
+            // 11. MLP
+            try self.mlp(embeddings, q_len, l, mlp_output);
+
+            // 12. Residual connections
+            accumulate(hidden_states, attn_output);
+            accumulate(hidden_states, mlp_output);
+        }
+        @memcpy(embeddings, hidden_states);
+    }
+
+    fn handle_kv_cache(
+        self: Self,
+        k: []f32,
+        v: []f32,
+        l: usize,
+        pos: usize,
+        q_len: usize,
+    ) !struct { k_out: []f32, v_out: []f32 } {
+        const dim = self.config.dim;
+        const kv_seq_len = pos + q_len;
+
+        // Allocate buffers for concatenated KV
+        const k_out = try self.allocator.alloc(f32, kv_seq_len * dim);
+        errdefer self.allocator.free(k_out);
+        const v_out = try self.allocator.alloc(f32, kv_seq_len * dim);
+        errdefer self.allocator.free(v_out);
+
+        // First copy existing cache if pos > 0
+        if (pos > 0) {
+            const l_off = self.config.seq_len * dim;
+            const cache_start = l * l_off;
+            const cache_len = pos * dim;
+
+            @memcpy(k_out[0..cache_len], self.state.k_cache[cache_start .. cache_start + cache_len]);
+            @memcpy(v_out[0..cache_len], self.state.v_cache[cache_start .. cache_start + cache_len]);
+        }
+
+        // Then append new KV
+        @memcpy(k_out[pos * dim ..], k);
+        @memcpy(v_out[pos * dim ..], v);
+
+        // Update cache
+        const l_off = self.config.seq_len * dim;
+        const cache_start = l * l_off;
+        @memcpy(self.state.k_cache[cache_start .. cache_start + kv_seq_len * dim], k_out);
+        @memcpy(self.state.v_cache[cache_start .. cache_start + kv_seq_len * dim], v_out);
+
+        return .{ .k_out = k_out, .v_out = v_out };
+    }
+
+    const Complex = struct {
+        real: f32,
+        imag: f32,
+    };
+
+    fn precompute_freqs_cis(self: Self, dim: usize, end: usize, theta: f32) ![]Complex {
+        const half_dim = dim / 2;
+
+        // Calculate inverse frequencies
+        const inv_freq = try self.allocator.alloc(f32, half_dim);
+        defer self.allocator.free(inv_freq);
+
+        for (0..half_dim) |i| {
+            const x = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(dim));
+            inv_freq[i] = 1.0 / std.math.pow(f32, theta, x);
+        }
+
+        // Pre-compute complex rotations for all positions
+        const freqs_cis = try self.allocator.alloc(Complex, end * half_dim);
+
+        for (0..end) |pos| {
+            for (0..half_dim) |i| {
+                const freq = @as(f32, @floatFromInt(pos)) * inv_freq[i];
+                freqs_cis[pos * half_dim + i] = Complex{
+                    .real = std.math.cos(freq),
+                    .imag = std.math.sin(freq),
+                };
+            }
+        }
+
+        return freqs_cis;
+    }
+
+    fn apply_rotary_emb_inplace(
+        self: Self,
+        x: []const f32, // Input tensor (read-only)
+        freqs_cis: []Complex, // Precomputed frequencies
+        position_ids: []const usize, // Position indices (read-only)
+        half_dim: usize, // half of head_dim
+        out: []f32, // Pre-allocated output buffer
+    ) !void {
+        const num_heads_tokens = x.len / half_dim; // n_heads * q_len
+
+        assert(half_dim == self.config.head_dim / 2);
+        // Verify buffer sizes
+        if (x.len != out.len) {
+            std.debug.print("Buffer size mismatch: x.len={}, out.len={}\n", .{ x.len, out.len });
+            return error.BufferSizeMismatch;
+        }
+
+        // Process each head and position
+        for (0..num_heads_tokens) |h_t| {
+            const pos = position_ids[h_t % position_ids.len];
+            const x_base = h_t * half_dim;
+
+            // Apply rotation for this position
+            for (0..half_dim) |d| {
+                const freq = freqs_cis[pos * half_dim + d];
+                const x_pos = x_base + d;
+
+                // Apply complex rotation using the pre-computed values
+                out[x_pos] = x[x_pos] * freq.real - x[x_pos] * freq.imag;
+            }
+        }
+    }
+
+    // Helper function to verify rotary embedding application
+    fn verify_rotary(x: []const f32, out: []const f32, half_dim: usize) void {
+        std.debug.print("\nRotary Verification:\n", .{});
+        for (0..std.math.min(2, x.len / half_dim)) |h_t| {
+            std.debug.print("Position {}:\n", .{h_t});
+            std.debug.print("  Input:  ", .{});
+            for (0..std.math.min(4, half_dim)) |d| {
+                std.debug.print("{d:.4} ", .{x[h_t * half_dim + d]});
+            }
+            std.debug.print("\n  Output: ", .{});
+            for (0..std.math.min(4, half_dim)) |d| {
+                std.debug.print("{d:.4} ", .{out[h_t * half_dim + d]});
+            }
+            std.debug.print("\n", .{});
         }
     }
 
@@ -1432,126 +1571,166 @@ const Model = struct {
         const dim = self.config.dim;
         const vocab_size = self.config.vocab;
 
-        // If q_len > 1, we need to process each token to get their logits
-        // Allocate memory for all logits (vocab_size for each token in q_len)
-        const logits = try self.allocator.alloc(f32, q_len * vocab_size);
+        // Only process the last token for generation
+        const last_token_offset = (q_len - 1) * dim;
+        const last_hidden = hidden_states[last_token_offset .. last_token_offset + dim];
 
-        // Process each token in the sequence
-        for (0..q_len) |i| {
-            // Get the hidden state for the current token
-            const token_hidden = hidden_states[i * dim .. (i + 1) * dim];
+        // Allocate memory for the last token's logits
+        const logits = try self.allocator.alloc(f32, vocab_size);
+        errdefer self.allocator.free(logits);
 
-            // Allocate memory for normalized hidden state
-            const normalized = try self.allocator.alloc(f32, dim);
-            defer self.allocator.free(normalized);
+        // Normalize the last hidden state
+        const normalized = try self.allocator.alloc(f32, dim);
+        defer self.allocator.free(normalized);
 
-            // Copy current token's hidden state to normalize it
-            @memcpy(normalized, token_hidden);
+        @memcpy(normalized, last_hidden);
 
-            // Apply layer normalization
-            try layer_norm(
-                normalized,
-                self.weights.t_ln_out_w,
-                self.weights.t_ln_out_b,
-                1e-5, // epsilon
-            );
+        try layer_norm(
+            normalized,
+            self.weights.t_ln_out_w,
+            self.weights.t_ln_out_b,
+            1e-5, // epsilon
+        );
 
-            // Project to vocabulary size using lm_head weights
-            try matmul(
-                self.allocator,
-                normalized,
-                self.weights.t_linear_w,
-                logits[i * vocab_size .. (i + 1) * vocab_size],
-                1, // batch size is 1 for each token
-                vocab_size,
-                dim,
-            );
+        // Project to vocabulary size
+        try matmul(
+            self.allocator,
+            normalized,
+            self.weights.t_linear_w,
+            logits,
+            1, // single token
+            vocab_size,
+            dim,
+        );
 
-            // Add bias if it exists
-
-            accumulate(logits, self.weights.t_linear_b);
-        }
+        // Add bias
+        accumulate(logits, self.weights.t_linear_b);
 
         return logits;
     }
 
-    fn attention_mask(allocator: std.mem.Allocator, pos: usize, seq_len: usize) ![]f32 {
-        // Total sequence length includes both past (pos) and current (seq_len) tokens
+    fn attention_mask(allocator: std.mem.Allocator, pos: usize, seq_len: usize, n_heads: usize) ![]f32 {
         const total_seq_len = pos + seq_len;
 
-        // Allocate 2D mask of shape [seq_len, total_seq_len]
-        const mask = try allocator.alloc(f32, seq_len * total_seq_len);
+        // Allocate 4D mask [1, n_heads, seq_len, total_seq_len]
+        const mask_size = 1 * n_heads * seq_len * total_seq_len;
+        const mask = try allocator.alloc(f32, mask_size);
 
-        // Fill everything with 1s first - this allows attention to all past tokens
+        // Initialize with ones for past attention
         @memset(mask, 1.0);
 
-        // For the current sequence part, implement causal masking
-        for (0..seq_len) |i| {
-            for (0..seq_len) |j| {
-                // Calculate position in the full sequence
-                const col = pos + j;
-                const mask_idx = i * total_seq_len + col;
-
-                // Ensure we don't write out of bounds
-                if (mask_idx >= mask.len) {
-                    return error.IndexOutOfBounds;
+        // Apply causal masking for the current sequence part
+        for (0..n_heads) |h| {
+            for (0..seq_len) |i| {
+                for (pos..total_seq_len) |j| {
+                    const mask_idx = h * seq_len * total_seq_len + i * total_seq_len + j;
+                    mask[mask_idx] = if (j - pos <= i) 1.0 else 0.0;
                 }
-
-                // Create causal mask: token i can only attend to tokens 0..=i
-                mask[mask_idx] = if (j <= i) 1.0 else 0.0;
             }
         }
 
         return mask;
     }
 
-    fn attention(self: Self, q: []f32, k: []f32, v: []f32, embeddings: []f32, pos: usize, q_len: usize, l: usize) !void {
+    fn attention(
+        self: Self,
+        q: []f32,
+        k: []f32,
+        v: []f32,
+        pos: usize,
+        q_len: usize,
+        l: usize,
+        output: []f32,
+    ) !void {
         const n_heads = self.config.n_heads;
         const head_dim = self.config.head_dim;
-        const kv_seq_len = q_len + pos;
         const dim = self.config.dim;
+        const kv_seq_len = pos + q_len;
 
-        // separate scores are allocated for each head:
+        // Allocate concatenated k/v buffers
+        const k_concat = try self.allocator.alloc(f32, n_heads * kv_seq_len * head_dim);
+        defer self.allocator.free(k_concat);
+        const v_concat = try self.allocator.alloc(f32, n_heads * kv_seq_len * head_dim);
+        defer self.allocator.free(v_concat);
+
+        // Copy cached KV states if they exist
+        if (pos > 0) {
+            const l_off = self.config.seq_len * dim;
+            const cache_start = l * l_off;
+
+            // Convert cache format to head format for previous tokens
+            for (0..n_heads) |h| {
+                for (0..pos) |i| {
+                    for (0..head_dim) |j| {
+                        const cache_idx = cache_start + i * dim + h * head_dim + j;
+                        const head_idx = h * kv_seq_len * head_dim + i * head_dim + j;
+                        k_concat[head_idx] = self.state.k_cache[cache_idx];
+                        v_concat[head_idx] = self.state.v_cache[cache_idx];
+                    }
+                }
+            }
+        }
+
+        // Add new k/v states
+        for (0..n_heads) |h| {
+            for (0..q_len) |i| {
+                const src_offset = h * q_len * head_dim + i * head_dim;
+                const dst_offset = h * kv_seq_len * head_dim + (pos + i) * head_dim;
+                @memcpy(k_concat[dst_offset .. dst_offset + head_dim], k[src_offset .. src_offset + head_dim]);
+                @memcpy(v_concat[dst_offset .. dst_offset + head_dim], v[src_offset .. src_offset + head_dim]);
+            }
+        }
+
+        // Update KV cache
+        const l_off = self.config.seq_len * dim;
+        const cache_start = l * l_off;
+
+        // Convert head format back to cache format for new tokens
+        for (0..q_len) |i| {
+            for (0..n_heads) |h| {
+                for (0..head_dim) |j| {
+                    const head_idx = h * kv_seq_len * head_dim + (pos + i) * head_dim + j;
+                    const cache_idx = cache_start + (pos + i) * dim + h * head_dim + j;
+                    self.state.k_cache[cache_idx] = k_concat[head_idx];
+                    self.state.v_cache[cache_idx] = v_concat[head_idx];
+                }
+            }
+        }
+
         const scores = try self.allocator.alloc(f32, n_heads * q_len * kv_seq_len);
-        self.allocator.free(scores);
+        defer self.allocator.free(scores);
 
-        // attention output will be the same size as the input embedding
         const attn_output = try self.allocator.alloc(f32, q_len * dim);
         defer self.allocator.free(attn_output);
-
         @memset(attn_output, 0);
 
-        const mask = try attention_mask(self.allocator, pos, q_len);
+        const mask = try attention_mask(self.allocator, pos, q_len, n_heads);
         defer self.allocator.free(mask);
 
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-        // Compute attention scores for each head
+        // Compute attention scores using concatenated KV
         for (0..n_heads) |h| {
-            // Calculate scaled dot product attention
-            // Q * K^T / sqrt(head_dim)
-
             for (0..q_len) |i| {
                 for (0..kv_seq_len) |j| {
                     var score: f32 = 0.0;
                     const q_offset = h * q_len * head_dim + i * head_dim;
                     const k_offset = h * kv_seq_len * head_dim + j * head_dim;
 
-                    // Compute dot product
                     for (0..head_dim) |d| {
-                        score += q[q_offset + d] * k[k_offset + d];
+                        score += q[q_offset + d] * k_concat[k_offset + d];
                     }
 
-                    // Scale and apply mask
                     score *= scale;
-                    score *= mask[i * kv_seq_len + j];
+                    const mask_idx = h * q_len * kv_seq_len + i * kv_seq_len + j;
+                    score *= mask[mask_idx];
 
                     scores[h * q_len * kv_seq_len + i * kv_seq_len + j] = score;
                 }
             }
         }
 
-        // Apply softmax to scores
+        // Apply softmax
         for (0..n_heads) |h| {
             for (0..q_len) |i| {
                 const start_idx = h * q_len * kv_seq_len + i * kv_seq_len;
@@ -1560,14 +1739,14 @@ const Model = struct {
             }
         }
 
-        // Compute attention output
+        // Compute attention output using concatenated V
         for (0..n_heads) |h| {
             for (0..q_len) |i| {
                 for (0..head_dim) |d| {
                     var sum: f32 = 0.0;
                     for (0..kv_seq_len) |j| {
                         const score = scores[h * q_len * kv_seq_len + i * kv_seq_len + j];
-                        const v_val = v[h * kv_seq_len * head_dim + j * head_dim + d];
+                        const v_val = v_concat[h * kv_seq_len * head_dim + j * head_dim + d];
                         sum += score * v_val;
                     }
                     const out_idx = i * dim + h * head_dim + d;
@@ -1576,25 +1755,28 @@ const Model = struct {
             }
         }
 
-        // Allocate temporary buffer for projection output
+        // Project output
         const proj_output = try self.allocator.alloc(f32, q_len * dim);
         defer self.allocator.free(proj_output);
 
         try matmul(
             self.allocator,
             attn_output,
-            self.weights.t_out_proj_w[l * self.config.dim * self.config.dim .. (l + 1) * self.config.dim * self.config.dim],
+            self.weights.t_out_proj_w[l * dim * dim .. (l + 1) * dim * dim],
             proj_output,
             q_len,
             dim,
             dim,
         );
 
-        accumulate(proj_output, self.weights.t_out_proj_bias[l * self.config.dim .. (l + 1) * self.config.dim]);
-        accumulate(embeddings, proj_output);
+        for (0..q_len) |i| {
+            accumulate(proj_output[i * dim .. (i + 1) * dim], self.weights.t_out_proj_bias[l * dim .. (l + 1) * dim]);
+        }
+
+        @memcpy(output, proj_output);
     }
 
-    fn mlp(self: Self, input: []f32, embeddings: []f32, q_len: usize, l: usize) !void {
+    fn mlp(self: Self, input: []f32, q_len: usize, l: usize, output: []f32) !void {
         const dim = self.config.dim;
         const hidden_dim = self.config.hidden_dim;
 
@@ -1616,7 +1798,9 @@ const Model = struct {
             dim,
         );
 
-        accumulate(fc1_out, self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim]);
+        for (0..q_len) |i| {
+            accumulate(fc1_out[i * hidden_dim .. (i + 1) * hidden_dim], self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim]);
+        }
 
         // we will then apply the gelu activation function
 
@@ -1635,11 +1819,13 @@ const Model = struct {
             hidden_dim,
         );
 
-        accumulate(fc2_out, self.weights.t_fc2_b[l * dim .. (l + 1) * dim]);
+        for (0..q_len) |i| {
+            accumulate(fc2_out[i * dim .. (i + 1) * dim], self.weights.t_fc2_b[l * dim .. (l + 1) * dim]);
+        }
 
         // we will then add the residual connection
 
-        accumulate(embeddings, fc2_out);
+        @memcpy(output, fc2_out);
     }
 
     fn getvector(self: Self, vector: []f32, head_index: usize, seq_index: usize, head_dim_index: usize) f32 {
@@ -1690,144 +1876,6 @@ const Model = struct {
             if (std.math.isNan(x.*) or std.math.isInf(x.*)) {
                 std.debug.print("Warning: Output contains NaN or Inf at index {d}. Input: {d}, Normalized: {d}, Weight: {d}, Bias: {d}, Mean: {d}, Std: {d}\n", .{ i, x.*, normalized, weight[i], bias[i], mean, std_dev });
                 return error.NumericalInstability;
-            }
-        }
-    }
-
-    fn set_cos_sin_cache(self: Self) !void {
-        const max_cached_seq_len = self.config.max_pos_embeddings;
-        const head_dim = self.config.head_dim;
-        const half_dim = head_dim / 2; // This should be 32 for head_dim=64
-        const base = self.config.rope_theta;
-
-        std.debug.print("Cache initialization:\n", .{});
-        std.debug.print("max_seq_len: {d}\n", .{max_cached_seq_len});
-        std.debug.print("head_dim: {d}, half_dim: {d}\n", .{ head_dim, half_dim });
-        std.debug.print("cache size should be: {d}\n", .{max_cached_seq_len * half_dim});
-
-        // Calculate inverse frequencies
-        const inv_freq = try self.allocator.alloc(f32, half_dim);
-        defer self.allocator.free(inv_freq);
-
-        // Fill inverse frequencies
-        for (0..half_dim) |i| {
-            const x = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(head_dim));
-            inv_freq[i] = 1.0 / std.math.pow(f32, base, x);
-        }
-
-        // Generate position indices
-        const t = try self.allocator.alloc(f32, max_cached_seq_len);
-        defer self.allocator.free(t);
-
-        for (0..max_cached_seq_len) |i| {
-            t[i] = @floatFromInt(i);
-        }
-
-        // Compute frequencies - this should output max_cached_seq_len * half_dim
-        const freqs = try self.allocator.alloc(f32, max_cached_seq_len * half_dim);
-        defer self.allocator.free(freqs);
-
-        // Compute outer product
-        for (0..max_cached_seq_len) |i| {
-            for (0..half_dim) |j| {
-                freqs[i * half_dim + j] = t[i] * inv_freq[j];
-            }
-        }
-
-        // At this point freqs is of size max_cached_seq_len * half_dim
-        // We directly apply cos and sin to freqs
-        try cos_2d(freqs, self.state.cos_cache);
-        try sin_2d(freqs, self.state.sin_cache);
-
-        // Add verification
-        std.debug.print("freqs.len: {d}, cos_cache.len: {d}\n", .{ freqs.len, self.state.cos_cache.len });
-        if (self.state.cos_cache.len != max_cached_seq_len * half_dim or
-            self.state.sin_cache.len != max_cached_seq_len * half_dim)
-        {
-            return error.CacheSizeMismatch;
-        }
-    }
-
-    fn get_rot_emb(self: Self, seq_len: usize) struct { []f32, []f32 } {
-        const half_dim = self.config.head_dim / 2;
-        // Should create arrays of size seq_len * half_dim
-        return .{
-            .@"0" = self.state.cos_cache[0 .. seq_len * half_dim],
-            .@"1" = self.state.sin_cache[0 .. seq_len * half_dim],
-        };
-    }
-
-    fn apply_rope(self: Self, q: []f32, k: []f32, cos: []f32, sin: []f32, pos: usize, qlen: usize) !void {
-        const n_heads = self.config.n_heads;
-        const head_dim = self.config.head_dim;
-        const half_dim = head_dim / 2;
-
-        std.debug.print("RoPE debug:\n", .{});
-        std.debug.print("cos len: {d}\n", .{cos.len});
-        std.debug.print("head_dim: {d}\n", .{head_dim});
-        std.debug.print("half_dim: {d}\n", .{half_dim});
-        std.debug.print("pos: {d}\n", .{pos});
-        std.debug.print("qlen: {d}\n", .{qlen});
-        std.debug.print("max position access will be: {d}\n", .{(pos + qlen - 1) * half_dim + (half_dim - 1)});
-
-        // Verify dimensions
-        if (q.len != n_heads * qlen * head_dim) {
-            std.debug.print("Expected q length: {d}, got: {d}\n", .{ n_heads * qlen * head_dim, q.len });
-            return error.DimensionMismatch;
-        }
-
-        const q_rotated = try self.allocator.alloc(f32, q.len);
-        defer self.allocator.free(q_rotated);
-        const k_rotated = try self.allocator.alloc(f32, k.len);
-        defer self.allocator.free(k_rotated);
-
-        for (0..n_heads) |h| {
-            for (0..qlen) |seq_idx| {
-                const base_idx = h * qlen * head_dim + seq_idx * head_dim;
-
-                // Debug the indexing
-                if (base_idx >= q.len or base_idx + head_dim > q.len) {
-                    std.debug.print("Invalid base_idx: {d}, q.len: {d}\n", .{ base_idx, q.len });
-                    return error.IndexOutOfBounds;
-                }
-                const position = pos + seq_idx;
-
-                // First do the rotation
-                // For first half: copy negated values from second half
-                for (0..half_dim) |dim| {
-                    q_rotated[base_idx + dim] = -q[base_idx + dim + half_dim];
-                    k_rotated[base_idx + dim] = -k[base_idx + dim + half_dim];
-                }
-                // For second half: copy values from first half
-                for (0..half_dim) |dim| {
-                    q_rotated[base_idx + half_dim + dim] = q[base_idx + dim];
-                    k_rotated[base_idx + half_dim + dim] = k[base_idx + dim];
-                }
-
-                // Then apply the rotation using cos/sin
-                for (0..half_dim) |dim| {
-                    const cos_val = cos[position * half_dim + dim];
-                    const sin_val = sin[position * half_dim + dim];
-
-                    // Apply to first half
-                    const idx1 = base_idx + dim;
-                    const idx2 = base_idx + dim + half_dim;
-
-                    if (idx2 >= q.len) {
-                        std.debug.print("Index out of bounds: {d} >= {d}\n", .{ idx2, q.len });
-                        return error.IndexOutOfBounds;
-                    }
-
-                    const q1 = q[idx1];
-                    const q2 = q[idx2];
-                    q[idx1] = q1 * cos_val - q2 * sin_val;
-                    q[idx2] = q1 * sin_val + q2 * cos_val;
-
-                    const k1 = k[idx1];
-                    const k2 = k[idx2];
-                    k[idx1] = k1 * cos_val - k2 * sin_val;
-                    k[idx2] = k1 * sin_val + k2 * cos_val;
-                }
             }
         }
     }
@@ -2211,6 +2259,7 @@ const Model = struct {
         }
     }
 };
+
 // std.debug.print("Pass! \n", .{});
 // inference
 fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator: std.mem.Allocator) ![]const u8 {
@@ -2218,6 +2267,7 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
     defer allocator.free(preprocessed);
 
     @memcpy(model.state.img, preprocessed);
+
     try model.vision_encoder();
 
     // Format prompt and encode tokens
@@ -2244,9 +2294,6 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
 
     const init_embedding = try model.merge_embed(text_embed, model.state.projection);
     defer allocator.free(init_embedding);
-
-    // we precompute the cos and sin cache for the positional encoding
-    try model.set_cos_sin_cache();
 
     // // first we will perform multiquery attention on the vision and text embeddings from the image + prompt
 
@@ -2278,6 +2325,8 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
 
     const max_tokens: usize = 100;
     generation: for (0..max_tokens) |_| {
+        try model.text_model(current_embeddings.items, pos);
+
         const logits = try model.lm_head(
             current_embeddings.items,
             current_embeddings.items.len / model.config.dim,
@@ -2286,8 +2335,6 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
         defer model.allocator.free(logits);
 
         const next_token = try sampleNextToken(logits);
-
-        std.debug.print("Done!\n", .{});
 
         // Check for EOS
         if (next_token == model.tokenizer.eos_token) {
@@ -2338,7 +2385,7 @@ pub fn main() !void {
     // Constants //
     const bin_path: []const u8 = "../moondream_f32.bin";
     const config_path: ?[]const u8 = "../model_config.json";
-    const image_path: []const u8 = "images/frierenburger.png";
+    const image_path: []const u8 = "images/demo-1.jpg";
 
     // Start of loading config file //
     const config_file = try std.fs.cwd().openFile(config_path.?, .{}); // TODO: Add filereader inside the init function for config itself.
