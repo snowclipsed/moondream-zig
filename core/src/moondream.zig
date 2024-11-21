@@ -21,23 +21,69 @@ const c = @cImport({
 
 // REDO this function with vectors
 fn softmax(x: []f32) !void {
-    assert(x.len > 0);
-    // max of x for numerical stability
-    var max: f32 = x[0];
-    for (x[1..]) |val| {
-        if (val > max) {
-            max = val;
-        }
+    // Find max for numerical stability
+    var max: f32 = -std.math.inf(f32);
+    for (x) |val| {
+        max = @max(max, val);
     }
-    // exp and sum
+
+    // Compute exp(x - max) and sum
     var sum: f32 = 0.0;
     for (x) |*val| {
-        val.* = std.math.exp(val.* - max); // https://stackoverflow.com/questions/42599498/numerically-stable-softmax
+        val.* = @exp(val.* - max);
         sum += val.*;
     }
-    // normalize
-    for (x) |*val| {
-        val.* /= sum;
+
+    // Normalize
+    if (sum != 0) {
+        for (x) |*val| {
+            val.* /= sum;
+        }
+    } else {
+        // Handle the case where sum is zero - uniform distribution
+        const uniform_val = 1.0 / @as(f32, @floatFromInt(x.len));
+        for (x) |*val| {
+            val.* = uniform_val;
+        }
+    }
+
+    // std.debug.print("Softmax max value: {}\n", .{max});
+    // std.debug.print("After exp, before normalization - first 3: {any}\n", .{x[0..3]});
+    // std.debug.print("Sum for normalization: {}\n", .{sum});
+}
+
+fn softmax_rows(x: []f32, num_rows: usize, row_size: usize) !void {
+    var row: usize = 0;
+    while (row < num_rows) : (row += 1) {
+        const start = row * row_size;
+        const end = start + row_size;
+        const row_slice = x[start..end];
+
+        // Find max for this row only
+        var max: f32 = -std.math.inf(f32);
+        for (row_slice) |val| {
+            max = @max(max, val);
+        }
+
+        // Compute exp(x - max) and sum for this row
+        var sum: f32 = 0.0;
+        for (row_slice) |*val| {
+            val.* = @exp(val.* - max);
+            sum += val.*;
+        }
+
+        // Normalize this row
+        if (sum != 0) {
+            for (row_slice) |*val| {
+                val.* /= sum;
+            }
+        } else {
+            // Handle zero sum case
+            const uniform_val = 1.0 / @as(f32, @floatFromInt(row_size));
+            for (row_slice) |*val| {
+                val.* = uniform_val;
+            }
+        }
     }
 }
 
@@ -173,7 +219,9 @@ pub fn accumulate(accum: []f32, x: []const f32) void {
 }
 
 fn transposeSimd(allocator: std.mem.Allocator, matrix: []const f32, rows: usize, cols: usize) ![]f32 {
-    const transposed = try allocator.alloc(f32, rows * cols);
+    // Ensure aligned allocation
+    const alignment = 16; // For Vector(4, f32)
+    const transposed = try allocator.alignedAlloc(f32, alignment, rows * cols);
     errdefer allocator.free(transposed);
 
     const VectorType = @Vector(4, f32);
@@ -190,7 +238,12 @@ fn transposeSimd(allocator: std.mem.Allocator, matrix: []const f32, rows: usize,
                 const v3 = matrix[(i + 3) * cols + j];
                 const vec = VectorType{ v0, v1, v2, v3 };
 
-                @as(*VectorType, @alignCast(@ptrCast(transposed.ptr + j * rows + i))).* = vec;
+                // Store values individually if alignment can't be guaranteed
+                const base_idx = j * rows + i;
+                transposed[base_idx + 0] = vec[0];
+                transposed[base_idx + 1] = vec[1];
+                transposed[base_idx + 2] = vec[2];
+                transposed[base_idx + 3] = vec[3];
             } else {
                 var k: usize = 0;
                 while (k < rows - i) : (k += 1) {
@@ -361,6 +414,164 @@ fn tiledMultiplyKernel(A: []const f32, B: []const f32, local_C: *[T][T]f32, N: u
 
             // Accumulate results to local_C
             for (0..V) |idx| {
+                local_C[i][j + idx] += vec_sum[idx];
+            }
+        }
+    }
+}
+
+const BatchWorkItem = struct {
+    batch: usize,
+    i: usize,
+    j: usize,
+};
+
+const BatchThreadContext = struct {
+    A: []const f32,
+    B: []const f32,
+    C: []f32,
+    batch_size: usize,
+    M: usize,
+    N: usize,
+    K: usize,
+    work_queue: *std.ArrayList(BatchWorkItem),
+    mutex: std.Thread.Mutex,
+};
+
+pub fn batchedTiledMatMul(allocator: std.mem.Allocator, A: []const f32, B: []const f32, C: []f32, batch_size: usize, M: usize, N: usize, K: usize) !void {
+    const num_threads = try std.Thread.getCpuCount();
+
+    // Calculate tiles
+    const tiles_M = (M + T - 1) / T;
+    const tiles_N = (N + T - 1) / T;
+
+    var work_queue = std.ArrayList(BatchWorkItem).init(allocator);
+    defer work_queue.deinit();
+
+    // Create work items for all batches and tiles
+    for (0..batch_size) |b| {
+        for (0..tiles_M) |i| {
+            for (0..tiles_N) |j| {
+                try work_queue.append(.{ .batch = b, .i = i, .j = j });
+            }
+        }
+    }
+
+    // Shuffle work queue
+    var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+    rng.random().shuffle(BatchWorkItem, work_queue.items);
+
+    var thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, num_threads);
+    defer thread_pool.deinit();
+
+    var context = BatchThreadContext{
+        .A = A,
+        .B = B,
+        .C = C,
+        .batch_size = batch_size,
+        .M = M,
+        .N = N,
+        .K = K,
+        .work_queue = &work_queue,
+        .mutex = std.Thread.Mutex{},
+    };
+
+    for (0..num_threads) |_| {
+        try thread_pool.append(try std.Thread.spawn(.{}, batchedWorkerThread, .{&context}));
+    }
+
+    for (thread_pool.items) |thread| {
+        thread.join();
+    }
+}
+
+fn batchedWorkerThread(context: *BatchThreadContext) void {
+    const batch_stride_A = context.M * context.K; // Stride for A
+    const batch_stride_C = context.M * context.N; // Stride for C
+    // No batch stride for B since it's broadcasted
+
+    while (true) {
+        context.mutex.lock();
+        const work_item = if (context.work_queue.popOrNull()) |item| item else {
+            context.mutex.unlock();
+            break;
+        };
+        context.mutex.unlock();
+
+        const batch_offset_A = work_item.batch * batch_stride_A;
+        const batch_offset_C = work_item.batch * batch_stride_C;
+
+        const i_start = work_item.i * T;
+        const j_start = work_item.j * T;
+        const i_end = @min(i_start + T, context.M);
+        const j_end = @min(j_start + T, context.N);
+
+        var local_C: [T][T]f32 = [_][T]f32{[_]f32{0} ** T} ** T;
+
+        var k: usize = 0;
+        while (k < context.K) : (k += T) {
+            const k_end = @min(k + T, context.K);
+            batchedTiledMultiplyKernel(context.A[batch_offset_A..], context.B, &local_C, context.N, context.K, i_start, j_start, k, i_end, j_end, k_end);
+        }
+
+        // Accumulate results
+        for (i_start..i_end) |i| {
+            for (j_start..j_end) |j| {
+                context.C[batch_offset_C + i * context.N + j] += local_C[i - i_start][j - j_start];
+            }
+        }
+    }
+}
+
+fn batchedTiledMultiplyKernel(A: []const f32, B: []const f32, local_C: *[T][T]f32, N: usize, K: usize, i_start: usize, j_start: usize, k_start: usize, i_end: usize, j_end: usize, k_end: usize) void {
+    var A_local: [T][T]f32 = undefined;
+    var B_local: [T][T]f32 = undefined;
+
+    // Load A tile
+    for (0..T) |i| {
+        for (0..T) |k| {
+            if (i_start + i < i_end and k_start + k < k_end) {
+                A_local[i][k] = A[(i_start + i) * K + (k_start + k)];
+            } else {
+                A_local[i][k] = 0;
+            }
+        }
+    }
+
+    // Load B tile (now using original B without batch offset)
+    for (0..T) |k| {
+        for (0..T) |j| {
+            if (k_start + k < k_end and j_start + j < j_end) {
+                B_local[k][j] = B[(k_start + k) * N + (j_start + j)];
+            } else {
+                B_local[k][j] = 0;
+            }
+        }
+    }
+
+    // Compute tile
+    var i: usize = 0;
+    while (i < T and i_start + i < i_end) : (i += 1) {
+        var j: usize = 0;
+        while (j < T and j_start + j < j_end) : (j += V) {
+            const vec_size = @min(V, j_end - j_start - j);
+            var vec_sum: @Vector(V, f32) = @splat(0);
+
+            var k: usize = 0;
+            while (k < T and k_start + k < k_end) : (k += 1) {
+                const a_val = A_local[i][k];
+                const a_vec = @as(@Vector(V, f32), @splat(a_val));
+                const b_vec = blk: {
+                    var temp: @Vector(V, f32) = @splat(0);
+                    for (0..vec_size) |idx| {
+                        temp[idx] = B_local[k][j + idx];
+                    }
+                    break :blk temp;
+                };
+                vec_sum += a_vec * b_vec;
+            }
+
+            for (0..vec_size) |idx| {
                 local_C[i][j + idx] += vec_sum[idx];
             }
         }
@@ -643,218 +854,249 @@ const Config = struct {
 /// "_b" suffix : biases
 const Weights = struct {
     const Self = @This();
-    // Slices for specific weights
 
-    ///Text model start///
-    word_token_embedding: []f32, // (dim, vocab)
+    // Add magic number for format validation
+    const WEIGHTS_MAGIC = 0x4D4F4F4E; // "MOON" in ASCII
+    const WEIGHTS_VERSION = 1;
 
-    // Transformer layer start
+    /// Buffer holding all weight data
+    buffer: []f32,
+    allocator: Allocator,
 
-    // attn layer norm
-    t_ln_w: []f32, // (layer, dim)
-    t_ln_b: []f32, // (layer, dim)
-    // attn qkv
-    t_Wqkv_w: []f32, // (layer, dim, n_heads*head_dim*3)
-    t_Wqkv_b: []f32, // (layer, n_heads*head_dim*3)
-    // output
-    t_out_proj_w: []f32, // (layer, seqlen, dim)
-    t_out_proj_bias: []f32, // (layer, dim)
-    // fully connected
-    t_fc1_w: []f32, // (layer, hidden_dim, dim)
-    t_fc1_b: []f32, // (layer, hidden_dim)
-    t_fc2_w: []f32, // (layer, dim, hidden_dim)
-    t_fc2_b: []f32, // (layer, dim)
+    // All the weight slices that point into buffer
+    word_token_embedding: []f32,
+    t_ln_w: []f32,
+    t_ln_b: []f32,
+    t_Wqkv_w: []f32,
+    t_Wqkv_b: []f32,
+    t_out_proj_w: []f32,
+    t_out_proj_bias: []f32,
+    t_fc1_w: []f32,
+    t_fc1_b: []f32,
+    t_fc2_w: []f32,
+    t_fc2_b: []f32,
+    t_linear_w: []f32,
+    t_linear_b: []f32,
+    t_ln_out_w: []f32,
+    t_ln_out_b: []f32,
+    v_patch_embedding_linear_w: []f32,
+    v_patch_embedding_linear_b: []f32,
+    v_pos_embedding: []f32,
+    v_Wqkv_w: []f32,
+    v_Wqkv_b: []f32,
+    v_out_proj_w: []f32,
+    v_out_proj_b: []f32,
+    v_fc1_w: []f32,
+    v_fc1_b: []f32,
+    v_fc2_w: []f32,
+    v_fc2_b: []f32,
+    v_norm1_w: []f32,
+    v_norm1_b: []f32,
+    v_norm2_w: []f32,
+    v_norm2_b: []f32,
+    v_norm_out_w: []f32,
+    v_norm_out_b: []f32,
+    v_proj_fc1_w: []f32,
+    v_proj_fc1_b: []f32,
+    v_proj_fc2_w: []f32,
+    v_proj_fc2_b: []f32,
 
-    //Transformer layer end //
-
-    // lm head
-    t_linear_w: []f32, //(vocab, dim)
-    t_linear_b: []f32, //(vocab)
-    t_ln_out_w: []f32, //(dim)
-    t_ln_out_b: []f32, //(dim)
-    //Text model end///
-
-    // Vision model start //
-
-    // combining patch embeddngs and pos
-    v_patch_embedding_linear_w: []f32, // (vit_dim, patch * patch * channels)
-    v_patch_embedding_linear_b: []f32, // (vit_dim)
-    v_pos_embedding: []f32, // (1, (img_dim/patch_dim)^2, vit_dim)
-
-    /// Vision Transformer Start
-    // attention qkv
-    v_Wqkv_w: []f32, // (vit_dim, vit_dim*3)
-    v_Wqkv_b: []f32, // (vit_dim * 3)
-
-    //attn out
-    v_out_proj_w: []f32, // (vit_dim, vit_dim)
-    v_out_proj_b: []f32, // (vit_dim)
-
-    //ViT fc
-    v_fc1_w: []f32, // (hidden_features, vit_dim)
-    v_fc1_b: []f32, // (hidden_features)
-    v_fc2_w: []f32, // (vit_dim, hidden_features)
-    v_fc2_b: []f32, // (vit_dim)
-
-    //ViT norm
-    v_norm1_w: []f32, // (layer, hidden_features)
-    v_norm1_b: []f32, // (layer, hidden_features)
-    v_norm2_w: []f32, // (layer, hidden_features)
-    v_norm2_b: []f32, // (layer, hidden_features)
-
-    // Vision Transformer End
-
-    //norm
-    v_norm_out_w: []f32, // (hidden_features)
-    v_norm_out_b: []f32, // (hidden_features)
-
-    // projection
-    v_proj_fc1_w: []f32, // (hidden_dim, hidden_features * 2)
-    v_proj_fc1_b: []f32, // (hidden_dim)
-
-    v_proj_fc2_w: []f32, // (hidden_features*2, hidden_dim)
-    v_proj_fc2_b: []f32, // (hidden_features)
-
-    fn init(config: Config, filename: []const u8, allocator: Allocator) !Weights {
-
-        // Set up slices for each weight
-
+    fn init(config: Config, filename: []const u8, allocator: Allocator) !Self {
         const sizes = calculateSizes(config);
         const num_weights = calculateTotalSize(sizes);
+
+        // Open and validate the file
         const file = try std.fs.cwd().openFile(filename, .{});
         defer file.close();
 
         const file_size = try file.getEndPos();
-        if (file_size != num_weights * @sizeOf(f32)) {
-            std.debug.print("Actual file size = {} \n", .{file_size});
-            std.debug.print("Estimated file size = {} \n", .{num_weights * @sizeOf(f32)});
+        const expected_size = num_weights * @sizeOf(f32);
+
+        if (file_size != expected_size) {
+            std.debug.print("Error: Unexpected file size\n", .{});
+            std.debug.print("Expected: {}, Got: {}\n", .{ expected_size, file_size });
             return error.UnexpectedFileSize;
         }
-        std.debug.print("{s} read successfully with {} parameters. \n", .{ filename, num_weights });
-        var data = try allocator.alloc(f32, num_weights);
-        defer allocator.free(data);
 
-        const bytes_read = try file.readAll(std.mem.sliceAsBytes(data));
+        // Allocate buffer for all weights
+        const buffer = try allocator.alloc(f32, num_weights);
+        errdefer allocator.free(buffer);
+
+        // Read all weight data
+        const bytes_read = try file.readAll(std.mem.sliceAsBytes(buffer));
         if (bytes_read != file_size) {
             return error.IncompleteRead;
         }
 
-        // Memory mapping of slices
-        // Set slices for each weight
-        var self: Weights = undefined;
+        // Initialize the struct with our owned buffer
+        var self = Self{
+            .buffer = buffer,
+            .allocator = allocator,
+            // Initialize all weight slices as undefined first
+            .word_token_embedding = undefined,
+            .t_ln_w = undefined,
+            .t_ln_b = undefined,
+            .t_Wqkv_w = undefined,
+            .t_Wqkv_b = undefined,
+            .t_out_proj_w = undefined,
+            .t_out_proj_bias = undefined,
+            .t_fc1_w = undefined,
+            .t_fc1_b = undefined,
+            .t_fc2_w = undefined,
+            .t_fc2_b = undefined,
+            .t_linear_w = undefined,
+            .t_linear_b = undefined,
+            .t_ln_out_w = undefined,
+            .t_ln_out_b = undefined,
+            .v_patch_embedding_linear_w = undefined,
+            .v_patch_embedding_linear_b = undefined,
+            .v_pos_embedding = undefined,
+            .v_Wqkv_w = undefined,
+            .v_Wqkv_b = undefined,
+            .v_out_proj_w = undefined,
+            .v_out_proj_b = undefined,
+            .v_fc1_w = undefined,
+            .v_fc1_b = undefined,
+            .v_fc2_w = undefined,
+            .v_fc2_b = undefined,
+            .v_norm1_w = undefined,
+            .v_norm1_b = undefined,
+            .v_norm2_w = undefined,
+            .v_norm2_b = undefined,
+            .v_norm_out_w = undefined,
+            .v_norm_out_b = undefined,
+            .v_proj_fc1_w = undefined,
+            .v_proj_fc1_b = undefined,
+            .v_proj_fc2_w = undefined,
+            .v_proj_fc2_b = undefined,
+        };
+
+        // Set up all the slices into our buffer
         var offset: usize = 0;
-        // text model
-        self.word_token_embedding = data[offset .. offset + sizes.word_token_embedding];
+
+        // Text model start
+        self.word_token_embedding = self.buffer[offset .. offset + sizes.word_token_embedding];
         offset += sizes.word_token_embedding;
 
-        self.t_ln_w = data[offset .. offset + sizes.t_ln_w];
+        // Text model transformer blocks
+        self.t_ln_w = self.buffer[offset .. offset + sizes.t_ln_w];
         offset += sizes.t_ln_w;
 
-        self.t_ln_b = data[offset .. offset + sizes.t_ln_b];
+        self.t_ln_b = self.buffer[offset .. offset + sizes.t_ln_b];
         offset += sizes.t_ln_b;
 
-        self.t_Wqkv_w = data[offset .. offset + sizes.t_Wqkv_w];
+        self.t_Wqkv_w = self.buffer[offset .. offset + sizes.t_Wqkv_w];
         offset += sizes.t_Wqkv_w;
 
-        self.t_Wqkv_b = data[offset .. offset + sizes.t_Wqkv_b];
+        self.t_Wqkv_b = self.buffer[offset .. offset + sizes.t_Wqkv_b];
         offset += sizes.t_Wqkv_b;
 
-        self.t_out_proj_w = data[offset .. offset + sizes.t_out_proj_w];
+        self.t_out_proj_w = self.buffer[offset .. offset + sizes.t_out_proj_w];
         offset += sizes.t_out_proj_w;
 
-        self.t_out_proj_bias = data[offset .. offset + sizes.t_out_proj_bias];
+        self.t_out_proj_bias = self.buffer[offset .. offset + sizes.t_out_proj_bias];
         offset += sizes.t_out_proj_bias;
 
-        self.t_fc1_w = data[offset .. offset + sizes.t_fc1_w];
+        self.t_fc1_w = self.buffer[offset .. offset + sizes.t_fc1_w];
         offset += sizes.t_fc1_w;
 
-        self.t_fc1_b = data[offset .. offset + sizes.t_fc1_b];
+        self.t_fc1_b = self.buffer[offset .. offset + sizes.t_fc1_b];
         offset += sizes.t_fc1_b;
 
-        self.t_fc2_w = data[offset .. offset + sizes.t_fc2_w];
+        self.t_fc2_w = self.buffer[offset .. offset + sizes.t_fc2_w];
         offset += sizes.t_fc2_w;
 
-        self.t_fc2_b = data[offset .. offset + sizes.t_fc2_b];
+        self.t_fc2_b = self.buffer[offset .. offset + sizes.t_fc2_b];
         offset += sizes.t_fc2_b;
 
-        self.t_linear_w = data[offset .. offset + sizes.t_linear_w];
+        // Text model end
+        self.t_linear_w = self.buffer[offset .. offset + sizes.t_linear_w];
         offset += sizes.t_linear_w;
 
-        self.t_linear_b = data[offset .. offset + sizes.t_linear_b];
+        self.t_linear_b = self.buffer[offset .. offset + sizes.t_linear_b];
         offset += sizes.t_linear_b;
 
-        self.t_ln_out_w = data[offset .. offset + sizes.t_ln_out_w];
+        self.t_ln_out_w = self.buffer[offset .. offset + sizes.t_ln_out_w];
         offset += sizes.t_ln_out_w;
 
-        self.t_ln_out_b = data[offset .. offset + sizes.t_ln_out_b];
+        self.t_ln_out_b = self.buffer[offset .. offset + sizes.t_ln_out_b];
         offset += sizes.t_ln_out_b;
 
-        // vision model
-
-        self.v_patch_embedding_linear_w = data[offset .. offset + sizes.v_patch_embedding_linear_w];
+        // Vision model start
+        self.v_patch_embedding_linear_w = self.buffer[offset .. offset + sizes.v_patch_embedding_linear_w];
         offset += sizes.v_patch_embedding_linear_w;
 
-        self.v_patch_embedding_linear_b = data[offset .. offset + sizes.v_patch_embedding_linear_b];
+        self.v_patch_embedding_linear_b = self.buffer[offset .. offset + sizes.v_patch_embedding_linear_b];
         offset += sizes.v_patch_embedding_linear_b;
 
-        self.v_pos_embedding = data[offset .. offset + sizes.v_pos_embedding];
+        self.v_pos_embedding = self.buffer[offset .. offset + sizes.v_pos_embedding];
         offset += sizes.v_pos_embedding;
 
-        self.v_Wqkv_w = data[offset .. offset + sizes.v_Wqkv_w];
+        // Vision transformer blocks
+        self.v_Wqkv_w = self.buffer[offset .. offset + sizes.v_Wqkv_w];
         offset += sizes.v_Wqkv_w;
 
-        self.v_Wqkv_b = data[offset .. offset + sizes.v_Wqkv_b];
+        self.v_Wqkv_b = self.buffer[offset .. offset + sizes.v_Wqkv_b];
         offset += sizes.v_Wqkv_b;
 
-        self.v_out_proj_w = data[offset .. offset + sizes.v_out_proj_w];
+        self.v_out_proj_w = self.buffer[offset .. offset + sizes.v_out_proj_w];
         offset += sizes.v_out_proj_w;
 
-        self.v_out_proj_b = data[offset .. offset + sizes.v_out_proj_b];
+        self.v_out_proj_b = self.buffer[offset .. offset + sizes.v_out_proj_b];
         offset += sizes.v_out_proj_b;
 
-        self.v_fc1_w = data[offset .. offset + sizes.v_fc1_w];
+        self.v_fc1_w = self.buffer[offset .. offset + sizes.v_fc1_w];
         offset += sizes.v_fc1_w;
 
-        self.v_fc1_b = data[offset .. offset + sizes.v_fc1_b];
+        self.v_fc1_b = self.buffer[offset .. offset + sizes.v_fc1_b];
         offset += sizes.v_fc1_b;
 
-        self.v_fc2_w = data[offset .. offset + sizes.v_fc2_w];
+        self.v_fc2_w = self.buffer[offset .. offset + sizes.v_fc2_w];
         offset += sizes.v_fc2_w;
 
-        self.v_fc2_b = data[offset .. offset + sizes.v_fc2_b];
+        self.v_fc2_b = self.buffer[offset .. offset + sizes.v_fc2_b];
         offset += sizes.v_fc2_b;
 
-        self.v_norm1_w = data[offset .. offset + sizes.v_norm1_w];
+        self.v_norm1_w = self.buffer[offset .. offset + sizes.v_norm1_w];
         offset += sizes.v_norm1_w;
 
-        self.v_norm1_b = data[offset .. offset + sizes.v_norm1_b];
+        self.v_norm1_b = self.buffer[offset .. offset + sizes.v_norm1_b];
         offset += sizes.v_norm1_b;
 
-        self.v_norm2_w = data[offset .. offset + sizes.v_norm2_w];
+        self.v_norm2_w = self.buffer[offset .. offset + sizes.v_norm2_w];
         offset += sizes.v_norm2_w;
 
-        self.v_norm2_b = data[offset .. offset + sizes.v_norm2_b];
+        self.v_norm2_b = self.buffer[offset .. offset + sizes.v_norm2_b];
         offset += sizes.v_norm2_b;
 
-        self.v_norm_out_w = data[offset .. offset + sizes.v_norm_out_w];
+        // Vision model end
+        self.v_norm_out_w = self.buffer[offset .. offset + sizes.v_norm_out_w];
         offset += sizes.v_norm_out_w;
 
-        self.v_norm_out_b = data[offset .. offset + sizes.v_norm_out_b];
+        self.v_norm_out_b = self.buffer[offset .. offset + sizes.v_norm_out_b];
         offset += sizes.v_norm_out_b;
 
-        self.v_proj_fc1_w = data[offset .. offset + sizes.v_proj_fc1_w];
+        // Projection layers
+        self.v_proj_fc1_w = self.buffer[offset .. offset + sizes.v_proj_fc1_w];
         offset += sizes.v_proj_fc1_w;
 
-        self.v_proj_fc1_b = data[offset .. offset + sizes.v_proj_fc1_b];
+        self.v_proj_fc1_b = self.buffer[offset .. offset + sizes.v_proj_fc1_b];
         offset += sizes.v_proj_fc1_b;
 
-        self.v_proj_fc2_w = data[offset .. offset + sizes.v_proj_fc2_w];
+        self.v_proj_fc2_w = self.buffer[offset .. offset + sizes.v_proj_fc2_w];
         offset += sizes.v_proj_fc2_w;
 
-        self.v_proj_fc2_b = data[offset .. offset + sizes.v_proj_fc2_b];
+        self.v_proj_fc2_b = self.buffer[offset .. offset + sizes.v_proj_fc2_b];
         offset += sizes.v_proj_fc2_b;
 
-        std.debug.print("Mapped weights and biases successfully. \n", .{});
+        // Verify we used exactly all the bytes
+        if (offset != num_weights) {
+            std.debug.print("Error: Buffer not fully utilized\n", .{});
+            std.debug.print("Used: {}, Total: {}\n", .{ offset, num_weights });
+            return error.BufferSizeMismatch;
+        }
+
+        std.debug.print("Loaded weights successfully. Total parameters: {}\n", .{num_weights});
         return self;
     }
 
@@ -956,10 +1198,8 @@ const Weights = struct {
         return total;
     }
 
-    fn deinit(self: *Self, allocator: Allocator) void {
-        inline for (std.meta.fields(Self)) |f| {
-            allocator.free(@field(self, f.name));
-        }
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.buffer);
         self.* = undefined;
     }
 };
@@ -1005,23 +1245,31 @@ const RunState = struct {
     // logits: []align(simd_align) f32,
 
     fn init(allocator: Allocator, config: Config) !Self {
+        const batch_size = 2; // Two identical patches
+        const total_patches = batch_size * config.num_patches;
         return Self{
-            .img = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
-            .patches = try allocator.alignedAlloc(f32, simd_align, config.img_dim * config.img_dim * config.img_channels),
-            .patch_emb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
-            .final_emb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * 2 * config.vit_dim),
-            .projection = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.dim),
-            .v_x = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
-            .v_xb = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.hidden_features),
-            .v_xb2 = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
-            .v_xb3 = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.hidden_dim),
-            .v_qkv = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim * 3),
-            .v_q = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
-            .v_k = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
-            .v_v = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
-            .v_attn = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.num_patches * config.vit_dim),
-            .v_output = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
-            .v_proj = try allocator.alignedAlloc(f32, simd_align, config.num_patches * config.vit_dim),
+            .img = try allocator.alignedAlloc(f32, simd_align, batch_size * config.img_dim * config.img_dim * config.img_channels),
+
+            // Patches buffer needs to handle both patches
+            .patches = try allocator.alignedAlloc(f32, simd_align, batch_size * config.img_dim * config.img_dim * config.img_channels),
+
+            // All patch-related buffers need to account for total_patches
+            .patch_emb = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
+            .final_emb = try allocator.alignedAlloc(f32, simd_align, total_patches * 2 * config.vit_dim),
+            .projection = try allocator.alignedAlloc(f32, simd_align, total_patches * config.dim),
+            .v_x = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
+            .v_xb = try allocator.alignedAlloc(f32, simd_align, total_patches * config.hidden_features),
+            .v_xb2 = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
+            .v_xb3 = try allocator.alignedAlloc(f32, simd_align, total_patches * config.hidden_dim),
+            .v_qkv = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim * 3),
+            .v_q = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
+            .v_k = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
+            .v_v = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
+
+            // Attention buffers need to be updated for total_patches
+            .v_attn = try allocator.alignedAlloc(f32, simd_align, total_patches * total_patches * config.n_vit_heads),
+            .v_output = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
+            .v_proj = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
             .k_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
             .v_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
             .cos_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.head_dim / 2),
@@ -1266,7 +1514,7 @@ const Model = struct {
         return model;
     }
 
-    fn text_model(self: Self, embeddings: []f32, pos: usize) !void {
+    fn text_model(self: Self, embeddings: []f32, pos: usize) ![]f32 {
         assert(embeddings.len % self.config.dim == 0);
 
         const eps = 1e-5;
@@ -1275,7 +1523,7 @@ const Model = struct {
         const head_dim = self.config.head_dim;
         const q_len = embeddings.len / dim;
         // const kv_seq_len = q_len + pos;
-        const half_dim = head_dim / 2;
+        // const half_dim = head_dim / 2;
 
         // Allocate all buffers upfront
         // Allocate buffers for residual connections
@@ -1313,28 +1561,6 @@ const Model = struct {
         defer self.allocator.free(k_h);
         defer self.allocator.free(v_h);
 
-        // Additional buffers for cache format
-        const k_cache_fmt = try self.allocator.alloc(f32, q_len * dim);
-        const v_cache_fmt = try self.allocator.alloc(f32, q_len * dim);
-        defer self.allocator.free(k_cache_fmt);
-        defer self.allocator.free(v_cache_fmt);
-
-        // Rotary buffers
-        const q_rot = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
-        const k_rot = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
-        const q_pass = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
-        const k_pass = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
-        defer self.allocator.free(q_rot);
-        defer self.allocator.free(k_rot);
-        defer self.allocator.free(q_pass);
-        defer self.allocator.free(k_pass);
-
-        // Rotary output buffers
-        const q_rot_out = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
-        const k_rot_out = try self.allocator.alloc(f32, n_heads * q_len * half_dim);
-        defer self.allocator.free(q_rot_out);
-        defer self.allocator.free(k_rot_out);
-
         // Position IDs
         var position_ids = try self.allocator.alloc(usize, q_len);
         defer self.allocator.free(position_ids);
@@ -1343,18 +1569,23 @@ const Model = struct {
         }
 
         @memcpy(hidden_states, embeddings);
+        const shape = [_]usize{dim};
         // Main loop over layers
         for (0..self.config.n_layers) |l| {
             // 1. Layer Norm
             @memcpy(ln_in, hidden_states);
-            for (0..q_len) |query| {
-                try layer_norm(
-                    ln_in[query * dim .. (query + 1) * dim],
-                    self.weights.t_ln_w[l * dim .. (l + 1) * dim],
-                    self.weights.t_ln_b[l * dim .. (l + 1) * dim],
-                    eps,
-                );
-            }
+
+            debug_tensor("Layer input", hidden_states, l);
+
+            try layer_norm(
+                ln_in,
+                &shape,
+                self.weights.t_ln_w[l * dim .. (l + 1) * dim],
+                self.weights.t_ln_b[l * dim .. (l + 1) * dim],
+                eps,
+            );
+
+            debug_tensor("After LayerNorm", ln_in, l);
 
             // 2. QKV Projection
             try matmul(
@@ -1368,11 +1599,20 @@ const Model = struct {
             );
 
             // 3. Split QKV
-            for (0..q_len * dim) |i| {
-                q[i] = qkv[i * 3];
-                k[i] = qkv[i * 3 + 1];
-                v[i] = qkv[i * 3 + 2];
+            for (0..q_len) |seq_idx| {
+                const row_start = seq_idx * (dim * 3);
+                const q_start = row_start;
+                const k_start = row_start + dim;
+                const v_start = row_start + (dim * 2);
+
+                @memcpy(q[seq_idx * dim .. (seq_idx + 1) * dim], qkv[q_start .. q_start + dim]);
+                @memcpy(k[seq_idx * dim .. (seq_idx + 1) * dim], qkv[k_start .. k_start + dim]);
+                @memcpy(v[seq_idx * dim .. (seq_idx + 1) * dim], qkv[v_start .. v_start + dim]);
             }
+
+            debug_tensor("Q tensor", q, l);
+            debug_tensor("K tensor", k, l);
+            debug_tensor("V tensor", v, l);
 
             // 4. Reshape to (n_heads, q_len, head_dim)
             for (0..n_heads) |h| {
@@ -1387,25 +1627,8 @@ const Model = struct {
                 }
             }
 
-            // 5. Split into rotary and pass parts
-            for (0..n_heads * q_len) |i| {
-                @memcpy(q_rot[i * half_dim .. (i + 1) * half_dim], q_h[i * head_dim .. i * head_dim + half_dim]);
-                @memcpy(k_rot[i * half_dim .. (i + 1) * half_dim], k_h[i * head_dim .. i * head_dim + half_dim]);
-                @memcpy(q_pass[i * half_dim .. (i + 1) * half_dim], q_h[i * head_dim + half_dim .. (i + 1) * head_dim]);
-                @memcpy(k_pass[i * half_dim .. (i + 1) * half_dim], k_h[i * head_dim + half_dim .. (i + 1) * head_dim]);
-            }
-
-            // 6. Apply rotary embeddings
-            try self.apply_rotary_emb_inplace(q_rot, self.freqs_cis, position_ids, half_dim, q_rot_out);
-            try self.apply_rotary_emb_inplace(k_rot, self.freqs_cis, position_ids, half_dim, k_rot_out);
-
-            // 7. Merge back
-            for (0..n_heads * q_len) |i| {
-                @memcpy(q_h[i * head_dim .. i * head_dim + half_dim], q_rot_out[i * half_dim .. (i + 1) * half_dim]);
-                @memcpy(k_h[i * head_dim .. i * head_dim + half_dim], k_rot_out[i * half_dim .. (i + 1) * half_dim]);
-                @memcpy(q_h[i * head_dim + half_dim .. (i + 1) * head_dim], q_pass[i * half_dim .. (i + 1) * half_dim]);
-                @memcpy(k_h[i * head_dim + half_dim .. (i + 1) * head_dim], k_pass[i * half_dim .. (i + 1) * half_dim]);
-            }
+            try self.apply_rotary_emb(q_h, self.freqs_cis, position_ids, q_h);
+            try self.apply_rotary_emb(k_h, self.freqs_cis, position_ids, k_h);
 
             // 8. Before updating cache, convert back from head format to cache format
             for (0..q_len) |i| {
@@ -1413,8 +1636,8 @@ const Model = struct {
                     for (0..head_dim) |j| {
                         const head_idx = h * q_len * head_dim + i * head_dim + j;
                         const cache_idx = i * dim + h * head_dim + j;
-                        k_cache_fmt[cache_idx] = k_h[head_idx];
-                        v_cache_fmt[cache_idx] = v_h[head_idx];
+                        k[cache_idx] = k_h[head_idx];
+                        v[cache_idx] = v_h[head_idx];
                     }
                 }
             }
@@ -1428,20 +1651,24 @@ const Model = struct {
                 return error.CacheUpdateOutOfBounds;
             }
 
-            @memcpy(self.state.k_cache[cache_start .. cache_start + cache_len], k_cache_fmt);
-            @memcpy(self.state.v_cache[cache_start .. cache_start + cache_len], v_cache_fmt);
+            @memcpy(self.state.k_cache[cache_start .. cache_start + cache_len], k);
+            @memcpy(self.state.v_cache[cache_start .. cache_start + cache_len], v);
 
             // 10. Attention
             try self.attention(q_h, k_h, v_h, pos, q_len, l, attn_output);
+            debug_tensor("Attention output", attn_output, l);
 
             // 11. MLP
             try self.mlp(embeddings, q_len, l, mlp_output);
+            debug_tensor("MLP output", mlp_output, l);
 
             // 12. Residual connections
             accumulate(hidden_states, attn_output);
             accumulate(hidden_states, mlp_output);
+            debug_tensor("Final hidden states", hidden_states, l);
+            check_gradients(hidden_states, "hidden_states");
         }
-        @memcpy(embeddings, hidden_states);
+        return hidden_states;
     }
 
     fn handle_kv_cache(
@@ -1496,14 +1723,15 @@ const Model = struct {
         const inv_freq = try self.allocator.alloc(f32, half_dim);
         defer self.allocator.free(inv_freq);
 
+        // Match PyTorch exactly: arange(0, dim, 2)[:(dim//2)] / dim
         for (0..half_dim) |i| {
-            const x = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(dim));
-            inv_freq[i] = 1.0 / std.math.pow(f32, theta, x);
+            inv_freq[i] = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(dim)));
         }
 
-        // Pre-compute complex rotations for all positions
+        // Pre-compute complex rotations
         const freqs_cis = try self.allocator.alloc(Complex, end * half_dim);
 
+        // Match PyTorch: t * freqs -> exp(1j * freqs)
         for (0..end) |pos| {
             for (0..half_dim) |i| {
                 const freq = @as(f32, @floatFromInt(pos)) * inv_freq[i];
@@ -1517,56 +1745,55 @@ const Model = struct {
         return freqs_cis;
     }
 
-    fn apply_rotary_emb_inplace(
+    fn apply_rotary_emb(
         self: Self,
-        x: []const f32, // Input tensor (read-only)
-        freqs_cis: []Complex, // Precomputed frequencies
-        position_ids: []const usize, // Position indices (read-only)
-        half_dim: usize, // half of head_dim
-        out: []f32, // Pre-allocated output buffer
+        x: []const f32,
+        freqs_cis: []const Complex,
+        position_ids: []const usize,
+        out: []f32,
     ) !void {
-        const num_heads_tokens = x.len / half_dim; // n_heads * q_len
+        const head_dim = self.config.head_dim;
+        const half_dim = head_dim / 2;
+        const seq_len = position_ids.len;
+        const n_heads = x.len / (seq_len * head_dim);
+        const rot_dim = half_dim * 2;
 
-        assert(half_dim == self.config.head_dim / 2);
-        // Verify buffer sizes
-        if (x.len != out.len) {
-            std.debug.print("Buffer size mismatch: x.len={}, out.len={}\n", .{ x.len, out.len });
-            return error.BufferSizeMismatch;
-        }
+        assert(x.len == out.len);
+        assert(x.len == n_heads * seq_len * head_dim);
+        assert(freqs_cis.len >= (position_ids[position_ids.len - 1] + 1) * half_dim);
 
-        // Process each head and position
-        for (0..num_heads_tokens) |h_t| {
-            const pos = position_ids[h_t % position_ids.len];
-            const x_base = h_t * half_dim;
+        // Process each head
+        for (0..n_heads) |h| {
+            for (0..seq_len) |s| {
+                const pos = position_ids[s];
+                const head_offset = h * seq_len * head_dim + s * head_dim;
 
-            // Apply rotation for this position
-            for (0..half_dim) |d| {
-                const freq = freqs_cis[pos * half_dim + d];
-                const x_pos = x_base + d;
+                // Split into rotational and pass-through parts
+                const x_rot = x[head_offset .. head_offset + rot_dim];
+                const x_pass = if (head_dim > rot_dim)
+                    x[head_offset + rot_dim .. head_offset + head_dim]
+                else
+                    &[_]f32{};
 
-                // Apply complex rotation using the pre-computed values
-                out[x_pos] = x[x_pos] * freq.real - x[x_pos] * freq.imag;
+                // Split rotational part into real and imaginary
+                for (0..half_dim) |d| {
+                    const freq = freqs_cis[pos * half_dim + d];
+                    const x_r = x_rot[d];
+                    const x_i = x_rot[d + half_dim];
+
+                    // Complex multiplication
+                    out[head_offset + d] = x_r * freq.real - x_i * freq.imag;
+                    out[head_offset + d + half_dim] = x_r * freq.imag + x_i * freq.real;
+                }
+
+                // Copy pass-through values
+                if (x_pass.len > 0) {
+                    const pass_start = head_offset + rot_dim;
+                    @memcpy(out[pass_start .. pass_start + x_pass.len], x_pass);
+                }
             }
         }
     }
-
-    // Helper function to verify rotary embedding application
-    fn verify_rotary(x: []const f32, out: []const f32, half_dim: usize) void {
-        std.debug.print("\nRotary Verification:\n", .{});
-        for (0..std.math.min(2, x.len / half_dim)) |h_t| {
-            std.debug.print("Position {}:\n", .{h_t});
-            std.debug.print("  Input:  ", .{});
-            for (0..std.math.min(4, half_dim)) |d| {
-                std.debug.print("{d:.4} ", .{x[h_t * half_dim + d]});
-            }
-            std.debug.print("\n  Output: ", .{});
-            for (0..std.math.min(4, half_dim)) |d| {
-                std.debug.print("{d:.4} ", .{out[h_t * half_dim + d]});
-            }
-            std.debug.print("\n", .{});
-        }
-    }
-
     fn lm_head(self: Self, hidden_states: []f32, q_len: usize) ![]f32 {
         const dim = self.config.dim;
         const vocab_size = self.config.vocab;
@@ -1585,8 +1812,10 @@ const Model = struct {
 
         @memcpy(normalized, last_hidden);
 
+        const shape = [_]usize{dim};
         try layer_norm(
             normalized,
+            &shape,
             self.weights.t_ln_out_w,
             self.weights.t_ln_out_b,
             1e-5, // epsilon
@@ -1609,22 +1838,33 @@ const Model = struct {
         return logits;
     }
 
-    fn attention_mask(allocator: std.mem.Allocator, pos: usize, seq_len: usize, n_heads: usize) ![]f32 {
+    fn attention_mask(
+        allocator: std.mem.Allocator,
+        pos: usize,
+        seq_len: usize,
+    ) ![]f32 {
         const total_seq_len = pos + seq_len;
+        const mask = try allocator.alloc(f32, seq_len * total_seq_len);
+        errdefer allocator.free(mask);
 
-        // Allocate 4D mask [1, n_heads, seq_len, total_seq_len]
-        const mask_size = 1 * n_heads * seq_len * total_seq_len;
-        const mask = try allocator.alloc(f32, mask_size);
+        // Fill everything with negative infinity first
+        for (mask) |*m| {
+            m.* = -std.math.inf(f32);
+        }
 
-        // Initialize with ones for past attention
-        @memset(mask, 1.0);
+        // Set valid attention positions to 0.0 (will allow values through in softmax)
+        // First all positions up to pos
+        for (0..seq_len) |i| {
+            for (0..pos) |j| {
+                mask[i * total_seq_len + j] = 0.0;
+            }
+        }
 
-        // Apply causal masking for the current sequence part
-        for (0..n_heads) |h| {
-            for (0..seq_len) |i| {
-                for (pos..total_seq_len) |j| {
-                    const mask_idx = h * seq_len * total_seq_len + i * total_seq_len + j;
-                    mask[mask_idx] = if (j - pos <= i) 1.0 else 0.0;
+        // Then handle the causal part
+        for (0..seq_len) |i| {
+            for (pos..total_seq_len) |j| {
+                if (j - pos <= i) {
+                    mask[i * total_seq_len + j] = 0.0;
                 }
             }
         }
@@ -1634,9 +1874,9 @@ const Model = struct {
 
     fn attention(
         self: Self,
-        q: []f32,
-        k: []f32,
-        v: []f32,
+        q: []f32, // Already in head format [n_heads * q_len * head_dim]
+        k: []f32, // Already in head format
+        v: []f32, // Already in head format
         pos: usize,
         q_len: usize,
         l: usize,
@@ -1646,139 +1886,107 @@ const Model = struct {
         const head_dim = self.config.head_dim;
         const dim = self.config.dim;
         const kv_seq_len = pos + q_len;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-        // Allocate concatenated k/v buffers
-        const k_concat = try self.allocator.alloc(f32, n_heads * kv_seq_len * head_dim);
-        defer self.allocator.free(k_concat);
-        const v_concat = try self.allocator.alloc(f32, n_heads * kv_seq_len * head_dim);
-        defer self.allocator.free(v_concat);
+        // Get attention mask
+        const mask = try attention_mask(self.allocator, pos, q_len);
+        defer self.allocator.free(mask);
 
-        // Copy cached KV states if they exist
-        if (pos > 0) {
+        // Temporary buffers
+        const scores = try self.allocator.alloc(f32, q_len * kv_seq_len);
+        defer self.allocator.free(scores);
+        const head_output = try self.allocator.alloc(f32, q_len * head_dim);
+        defer self.allocator.free(head_output);
+
+        @memset(output, 0);
+
+        // Process each head
+        for (0..n_heads) |h| {
+            const h_offset = h * q_len * head_dim;
             const l_off = self.config.seq_len * dim;
             const cache_start = l * l_off;
 
-            // Convert cache format to head format for previous tokens
-            for (0..n_heads) |h| {
-                for (0..pos) |i| {
-                    for (0..head_dim) |j| {
-                        const cache_idx = cache_start + i * dim + h * head_dim + j;
-                        const head_idx = h * kv_seq_len * head_dim + i * head_dim + j;
-                        k_concat[head_idx] = self.state.k_cache[cache_idx];
-                        v_concat[head_idx] = self.state.v_cache[cache_idx];
-                    }
-                }
-            }
-        }
-
-        // Add new k/v states
-        for (0..n_heads) |h| {
-            for (0..q_len) |i| {
-                const src_offset = h * q_len * head_dim + i * head_dim;
-                const dst_offset = h * kv_seq_len * head_dim + (pos + i) * head_dim;
-                @memcpy(k_concat[dst_offset .. dst_offset + head_dim], k[src_offset .. src_offset + head_dim]);
-                @memcpy(v_concat[dst_offset .. dst_offset + head_dim], v[src_offset .. src_offset + head_dim]);
-            }
-        }
-
-        // Update KV cache
-        const l_off = self.config.seq_len * dim;
-        const cache_start = l * l_off;
-
-        // Convert head format back to cache format for new tokens
-        for (0..q_len) |i| {
-            for (0..n_heads) |h| {
-                for (0..head_dim) |j| {
-                    const head_idx = h * kv_seq_len * head_dim + (pos + i) * head_dim + j;
-                    const cache_idx = cache_start + (pos + i) * dim + h * head_dim + j;
-                    self.state.k_cache[cache_idx] = k_concat[head_idx];
-                    self.state.v_cache[cache_idx] = v_concat[head_idx];
-                }
-            }
-        }
-
-        const scores = try self.allocator.alloc(f32, n_heads * q_len * kv_seq_len);
-        defer self.allocator.free(scores);
-
-        const attn_output = try self.allocator.alloc(f32, q_len * dim);
-        defer self.allocator.free(attn_output);
-        @memset(attn_output, 0);
-
-        const mask = try attention_mask(self.allocator, pos, q_len, n_heads);
-        defer self.allocator.free(mask);
-
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-
-        // Compute attention scores using concatenated KV
-        for (0..n_heads) |h| {
+            // 1. Scaled dot product attention
             for (0..q_len) |i| {
                 for (0..kv_seq_len) |j| {
-                    var score: f32 = 0.0;
-                    const q_offset = h * q_len * head_dim + i * head_dim;
-                    const k_offset = h * kv_seq_len * head_dim + j * head_dim;
+                    // Get query and key
+                    var score: f32 = 0;
+                    const k_ptr = if (j < pos)
+                        self.state.k_cache[cache_start + j * dim + h * head_dim ..]
+                    else
+                        k[h_offset + (j - pos) * head_dim ..];
+
+                    // Q * K^T
+                    for (0..head_dim) |d| {
+                        score += q[h_offset + i * head_dim + d] * k_ptr[d];
+                    }
+                    score *= scale;
+
+                    // Apply mask
+                    score *= scale;
+                    const mask_idx = i * kv_seq_len + j;
+                    scores[i * kv_seq_len + j] = score + mask[mask_idx];
+                }
+
+                // Softmax per row
+                try softmax(scores[i * kv_seq_len .. (i + 1) * kv_seq_len]);
+            }
+
+            // 2. Multiply with values
+            @memset(head_output, 0);
+            for (0..q_len) |i| {
+                for (0..kv_seq_len) |j| {
+                    const score = scores[i * kv_seq_len + j];
+                    const v_ptr = if (j < pos)
+                        self.state.v_cache[cache_start + j * dim + h * head_dim ..]
+                    else
+                        v[h_offset + (j - pos) * head_dim ..];
 
                     for (0..head_dim) |d| {
-                        score += q[q_offset + d] * k_concat[k_offset + d];
+                        head_output[i * head_dim + d] += score * v_ptr[d];
                     }
-
-                    score *= scale;
-                    const mask_idx = h * q_len * kv_seq_len + i * kv_seq_len + j;
-                    score *= mask[mask_idx];
-
-                    scores[h * q_len * kv_seq_len + i * kv_seq_len + j] = score;
                 }
             }
-        }
 
-        // Apply softmax
-        for (0..n_heads) |h| {
+            // 3. Store head output
             for (0..q_len) |i| {
-                const start_idx = h * q_len * kv_seq_len + i * kv_seq_len;
-                const end_idx = start_idx + kv_seq_len;
-                try softmax(scores[start_idx..end_idx]);
+                const out_offset = i * dim + h * head_dim;
+                @memcpy(output[out_offset .. out_offset + head_dim], head_output[i * head_dim ..][0..head_dim]);
             }
         }
 
-        // Compute attention output using concatenated V
-        for (0..n_heads) |h| {
-            for (0..q_len) |i| {
-                for (0..head_dim) |d| {
-                    var sum: f32 = 0.0;
-                    for (0..kv_seq_len) |j| {
-                        const score = scores[h * q_len * kv_seq_len + i * kv_seq_len + j];
-                        const v_val = v_concat[h * kv_seq_len * head_dim + j * head_dim + d];
-                        sum += score * v_val;
-                    }
-                    const out_idx = i * dim + h * head_dim + d;
-                    attn_output[out_idx] = sum;
-                }
-            }
-        }
-
-        // Project output
-        const proj_output = try self.allocator.alloc(f32, q_len * dim);
-        defer self.allocator.free(proj_output);
+        // 4. Final linear projection
+        const proj_out = try self.allocator.alloc(f32, q_len * dim);
+        defer self.allocator.free(proj_out);
 
         try matmul(
             self.allocator,
-            attn_output,
+            output,
             self.weights.t_out_proj_w[l * dim * dim .. (l + 1) * dim * dim],
-            proj_output,
+            proj_out,
             q_len,
             dim,
             dim,
         );
 
+        // Add bias
         for (0..q_len) |i| {
-            accumulate(proj_output[i * dim .. (i + 1) * dim], self.weights.t_out_proj_bias[l * dim .. (l + 1) * dim]);
+            const row = i * dim;
+            for (0..dim) |j| {
+                output[row + j] = proj_out[row + j] + self.weights.t_out_proj_bias[l * dim + j];
+            }
         }
-
-        @memcpy(output, proj_output);
     }
-
     fn mlp(self: Self, input: []f32, q_len: usize, l: usize, output: []f32) !void {
         const dim = self.config.dim;
         const hidden_dim = self.config.hidden_dim;
+
+        // Debug input state
+        debug_tensor("MLP Input", input, l);
+
+        // Debug weight matrices
+        debug_tensor("FC1 Weights", self.weights.t_fc1_w[l * dim * hidden_dim .. (l + 1) * dim * hidden_dim], l);
+        debug_tensor("FC1 Bias", self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim], l);
 
         const fc1_out = try self.allocator.alloc(f32, q_len * hidden_dim);
         defer self.allocator.free(fc1_out);
@@ -1786,8 +1994,7 @@ const Model = struct {
         const fc2_out = try self.allocator.alloc(f32, q_len * dim);
         defer self.allocator.free(fc2_out);
 
-        // first we will perform the first linear layer
-
+        // First linear layer
         try matmul(
             self.allocator,
             input,
@@ -1798,17 +2005,27 @@ const Model = struct {
             dim,
         );
 
+        // Debug after first matmul
+        debug_tensor("After FC1 MatMul", fc1_out, l);
+
         for (0..q_len) |i| {
             accumulate(fc1_out[i * hidden_dim .. (i + 1) * hidden_dim], self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim]);
         }
 
-        // we will then apply the gelu activation function
+        // Debug after bias addition
+        debug_tensor("After FC1 Bias", fc1_out, l);
 
+        // GeLU activation
         gelu(fc1_out);
 
-        // we will then perform the second linear layer
-        // downcasting the activated vector from hidden_dim to dim
+        // Debug after activation
+        debug_tensor("After GeLU", fc1_out, l);
 
+        // Debug second layer weights
+        debug_tensor("FC2 Weights", self.weights.t_fc2_w[l * hidden_dim * dim .. (l + 1) * hidden_dim * dim], l);
+        debug_tensor("FC2 Bias", self.weights.t_fc2_b[l * dim .. (l + 1) * dim], l);
+
+        // Second linear layer
         try matmul(
             self.allocator,
             fc1_out,
@@ -1819,11 +2036,18 @@ const Model = struct {
             hidden_dim,
         );
 
+        // Debug after second matmul
+        debug_tensor("After FC2 MatMul", fc2_out, l);
+
         for (0..q_len) |i| {
             accumulate(fc2_out[i * dim .. (i + 1) * dim], self.weights.t_fc2_b[l * dim .. (l + 1) * dim]);
         }
 
-        // we will then add the residual connection
+        // Debug final output before copying
+        debug_tensor("Final MLP Output", fc2_out, l);
+
+        // Add gradient magnitude checking
+        check_gradients(fc2_out, "MLP Output Gradients");
 
         @memcpy(output, fc2_out);
     }
@@ -1838,44 +2062,198 @@ const Model = struct {
     // they will go from (q_len, dim) to (n_heads, qlen, head_dim)
     // dim = n_heads * head_dim
 
+    pub const LayerNormError = error{
+        EmptyInput,
+        DimensionMismatch,
+        InvalidEpsilon,
+        NaNInput,
+        InfInput,
+    };
+
+    /// Checks if a floating point value is finite and not NaN
+    fn isValid(x: f32) bool {
+        return !std.math.isNan(x) and !std.math.isInf(x);
+    }
+
+    /// Checks if all values in a slice are valid floating point numbers
+    fn validateInputs(values: []const f32) LayerNormError!void {
+        for (values) |x| {
+            if (std.math.isNan(x)) return LayerNormError.NaNInput;
+            if (std.math.isInf(x)) return LayerNormError.InfInput;
+        }
+    }
+
+    const NumericalStats = struct {
+        min: f32,
+        max: f32,
+        mean: f32,
+        std: f32,
+        has_nan: bool,
+        has_inf: bool,
+    };
+
+    fn compute_stats(data: []const f32) NumericalStats {
+        if (data.len == 0) {
+            return .{
+                .min = 0,
+                .max = 0,
+                .mean = 0,
+                .std = 0,
+                .has_nan = false,
+                .has_inf = false,
+            };
+        }
+
+        var stats = NumericalStats{
+            .min = data[0],
+            .max = data[0],
+            .mean = 0,
+            .std = 0,
+            .has_nan = false,
+            .has_inf = false,
+        };
+
+        // First pass - min, max, mean, and check for nan/inf
+        var sum: f64 = 0; // Use f64 for better accuracy in sum
+        for (data) |val| {
+            if (std.math.isNan(val)) {
+                stats.has_nan = true;
+            }
+            if (std.math.isInf(val)) {
+                stats.has_inf = true;
+            }
+            if (val < stats.min) stats.min = val;
+            if (val > stats.max) stats.max = val;
+            sum += val;
+        }
+        stats.mean = @floatCast(sum / @as(f64, @floatFromInt(data.len)));
+
+        // Second pass - standard deviation
+        var sum_squared_diff: f64 = 0;
+        for (data) |val| {
+            const diff = val - stats.mean;
+            sum_squared_diff += diff * diff;
+        }
+        stats.std = @sqrt(@as(f32, @floatCast(sum_squared_diff / @as(f64, @floatFromInt(data.len)))));
+
+        return stats;
+    }
+
+    fn debug_tensor(name: []const u8, data: []const f32, layer: ?usize) void {
+        const stats = compute_stats(data);
+
+        std.debug.print(
+            \\{s} (layer {?d}):
+            \\  Range: [{d:0.6}, {d:0.6}]
+            \\  Mean: {d:0.6}, Std: {d:0.6}
+            \\  Has NaN: {}, Has Inf: {}
+            \\
+        , .{
+            name,
+            layer,
+            stats.min,
+            stats.max,
+            stats.mean,
+            stats.std,
+            stats.has_nan,
+            stats.has_inf,
+        });
+    }
+
+    // Gradient checking utility
+    fn check_gradients(tensor: []const f32, name: []const u8) void {
+        var max_grad: f32 = 0;
+        var min_grad: f32 = 0;
+
+        if (tensor.len > 1) {
+            for (1..tensor.len) |i| {
+                const grad = @abs(tensor[i] - tensor[i - 1]);
+                if (grad > max_grad) max_grad = grad;
+                if (grad < min_grad) min_grad = grad;
+            }
+        }
+
+        std.debug.print(
+            \\Gradient check for {s}:
+            \\  Min gradient: {d:0.6}
+            \\  Max gradient: {d:0.6}
+            \\
+        , .{
+            name,
+            min_grad,
+            max_grad,
+        });
+    }
+
     pub fn layer_norm(
         inputs: []f32,
-        weight: []const f32,
-        bias: []const f32,
+        normalized_shape: []const usize,
+        weight: ?[]const f32,
+        bias: ?[]const f32,
         eps: f32,
-    ) !void {
-        const len = inputs.len;
-        if (len == 0) return error.EmptyInput;
-        if (len != weight.len or len != bias.len) return error.DimensionMismatch;
+    ) LayerNormError!void {
+        // Basic input validation
+        if (inputs.len == 0) return LayerNormError.EmptyInput;
+        if (eps <= 0) return LayerNormError.InvalidEpsilon;
+        try validateInputs(inputs);
+        if (weight) |w| try validateInputs(w);
+        if (bias) |b| try validateInputs(b);
 
-        // Compute the mean
-        var mean: f32 = 0.0;
-        for (inputs) |x| {
-            mean += x;
+        // Calculate the number of features being normalized over
+        var num_features: usize = 1;
+        for (normalized_shape) |dim| {
+            num_features *= dim;
         }
-        const n: f32 = @floatFromInt(len);
-        mean /= n;
 
-        // Compute the variance
-        var variance: f32 = 0.0;
-        for (inputs) |x| {
-            const diff = x - mean;
-            variance += diff * diff;
+        // Verify dimensions match
+        if (inputs.len % num_features != 0) {
+            return LayerNormError.DimensionMismatch;
         }
-        variance /= n;
 
-        // Compute standard deviation
-        const std_dev = @sqrt(variance + eps);
+        // Check weight and bias dimensions if provided
+        if (weight) |w| {
+            if (w.len != num_features) return LayerNormError.DimensionMismatch;
+        }
+        if (bias) |b| {
+            if (b.len != num_features) return LayerNormError.DimensionMismatch;
+        }
 
-        // Normalize the inputs
-        for (inputs, 0..inputs.len) |*x, i| {
-            const normalized = (x.* - mean) / std_dev;
-            x.* = normalized * weight[i] + bias[i];
+        const num_groups = inputs.len / num_features;
 
-            // Check for numerical stability
-            if (std.math.isNan(x.*) or std.math.isInf(x.*)) {
-                std.debug.print("Warning: Output contains NaN or Inf at index {d}. Input: {d}, Normalized: {d}, Weight: {d}, Bias: {d}, Mean: {d}, Std: {d}\n", .{ i, x.*, normalized, weight[i], bias[i], mean, std_dev });
-                return error.NumericalInstability;
+        // Process each normalization group
+        var group_idx: usize = 0;
+        while (group_idx < num_groups) : (group_idx += 1) {
+            const start = group_idx * num_features;
+            const end = start + num_features;
+            const group = inputs[start..end];
+
+            // Calculate mean (direct sum, matching PyTorch)
+            var mean: f32 = 0.0;
+            for (group) |x| {
+                mean += x;
+            }
+            mean /= @as(f32, @floatFromInt(num_features));
+
+            // Calculate variance (direct sum, matching PyTorch)
+            var variance: f32 = 0.0;
+            for (group) |x| {
+                const diff = x - mean;
+                variance += diff * diff;
+            }
+            variance /= @as(f32, @floatFromInt(num_features));
+
+            const inv_std = 1.0 / @sqrt(variance + eps);
+
+            // Normalize and apply affine transform
+            for (group, 0..num_features) |*x, i| {
+                const x_centered = x.* - mean;
+                var normalized = x_centered * inv_std;
+
+                const w = if (weight) |w_slice| w_slice[i] else 1.0;
+                const b = if (bias) |b_slice| b_slice[i] else 0.0;
+
+                normalized = normalized * w + b;
+                x.* = normalized;
             }
         }
     }
@@ -1910,6 +2288,7 @@ const Model = struct {
         // Load the image
         const target_height = self.config.img_dim;
         const target_width = self.config.img_dim;
+        const batch_size = 2;
 
         const c_image_path = @as([*c]const u8, @ptrCast(image_path.ptr));
         var width: c_int = 0;
@@ -1942,13 +2321,18 @@ const Model = struct {
             return error.FailedToResizeImage;
         }
 
-        var float_image = try allocator.alloc(f32, target_width * target_height * @as(usize, @intCast(channels)));
-        const mean = [3]f32{ 0.5, 0.5, 0.5 };
-        const stddev = [3]f32{ 0.5, 0.5, 0.5 };
+        var float16_image = try allocator.alloc(f16, batch_size * target_width * target_height * @as(usize, @intCast(channels)));
+        const mean = [3]f16{ 0.5, 0.5, 0.5 };
+        const stddev = [3]f16{ 0.5, 0.5, 0.5 };
 
         // reorganize the data from (H,W,C) to (C, H, W) format that torch uses
         // initially data is stored in [R,G,B,R,G,B,R,G,B...R,G,B] format
         // now we want to store it as [R,R,R,R,R,R,..G,G,G,G,G..B,B,B,B,B] format where the RGB values are contiguous
+        const single_image_size = target_height * target_width * @as(usize, @intCast(channels)); // single image size of 378 x 378 x 3
+
+        defer allocator.free(float16_image);
+
+        // Process in FP16
         for (0..@as(usize, @intCast(channels))) |ch| {
             for (0..target_height) |h| {
                 for (0..target_width) |w| {
@@ -1956,18 +2340,27 @@ const Model = struct {
                     const dst_idx = ch * target_height * target_width + h * target_width + w;
 
                     const pixel_value: u8 = resized_data[src_idx];
-                    // scale to 0-1 range
-                    const scaled_value = @as(f32, @floatFromInt(pixel_value)) / 255.0;
-                    // apply normalization
+                    const scaled_value = @as(f16, @floatFromInt(pixel_value)) / @as(f16, 255.0);
                     const normalized_value = (scaled_value - mean[ch]) / stddev[ch];
-                    float_image[dst_idx] = normalized_value;
+                    float16_image[dst_idx] = normalized_value;
+                    if (batch_size > 1) {
+                        float16_image[single_image_size + dst_idx] = normalized_value;
+                    }
                 }
             }
         }
-        return float_image;
+
+        // Convert to FP32 for export
+        var float32_image = try allocator.alloc(f32, float16_image.len);
+        for (float16_image, 0..) |value, i| {
+            float32_image[i] = @floatCast(value);
+        }
+
+        return float32_image;
     }
+
     fn vision_encoder(self: Self) !void {
-        std.debug.print("Image len : {any} \n", .{self.state.img.len});
+
         // now the vision encoder will take in the float image and divide it into
         // patches of self.patch_size x self.patch_size (14 x 14)
         // we have to rearrange the values of the patches
@@ -1982,29 +2375,33 @@ const Model = struct {
         const patch_h = self.config.patch_size;
         const patch_w = self.config.patch_size;
         const patch_elements = patch_h * patch_w * channels;
-        const num_patches_h = img_h / patch_h;
-        const num_patches_w = img_h / patch_w;
+        // const num_patches_h = img_h / patch_h;
+        // const num_patches_w = img_h / patch_w;
         const num_patches = self.config.num_patches;
+        const batch_size: usize = 2;
+        const total_patches = batch_size * num_patches;
 
-        // we are going to change the format of our image from (C, H, W) to (h * w, C * p1 * p2) or (729, 3 * 14 * 14)
-        for (0..num_patches_h) |h_patch| {
-            for (0..num_patches_w) |w_patch| {
-                for (0..channels) |ch| {
-                    for (0..patch_h) |h| {
-                        for (0..patch_w) |w| {
-                            const src_idx = ch * img_h * img_w + (h_patch * patch_h + h) * img_w + (w_patch * patch_w + w);
-                            const dest_idx = (h_patch * num_patches_w + w_patch) * channels * patch_h * patch_w + (ch * patch_h * patch_w + h * patch_w + w);
-                            self.state.patches[dest_idx] = self.state.img[src_idx];
-                        }
-                    }
-                }
-            }
-        }
+        // we are going to change the format of our image from (B, C, H, W) to (h * w, C * p1 * p2) or (729, 3 * 14 * 14)
+
+        @memcpy(self.state.patches, try rearrangeBCHWtoBTC(
+            self.allocator,
+            self.state.img,
+            batch_size,
+            channels,
+            img_h,
+            img_w,
+            patch_h,
+        ));
+
+        // NOTE: This transformation above is correct and verified with pytorch version
 
         // we get the patch embedding by doing matmul with the patch embedding linear layer and adding bias
         // each patch is individually multiplied and then stored into self.state.patches!
 
-        for (0..num_patches) |patch| {
+        // try batchedTiledMatMul(self.allocator, self.state.patches, self.weights.v_patch_embedding_linear_w, self.state.patch_emb, total_patches, 1, self.config.vit_dim, patch_elements);
+
+        for (0..total_patches) |patch| {
+
             // for each patch, we do matrix multiplication
             // (1, 3 * 14 * 14)  @ (3 * 14 * 14, 1152)
             // all this is stored in patch_emb which is (729, 1152)
@@ -2023,41 +2420,54 @@ const Model = struct {
             );
         }
 
-        // next up is positional embedding, which is directly just accumulated into the patch embedding!
-        // x = x + pos_embed
-        // pos embed dim (729, 1152) + v_pos_embed (1152, 729) ^ Transposed
-        accumulate(self.state.patch_emb, try transposeSimd(self.allocator, self.weights.v_pos_embedding, 1152, 729));
+        // next up is positional embedding, which is directly just accumulated into the patch embedding but actually broadcasted across the batch (each image gets its own pos emb)!
+        // so for each 729, 1152 batch : x = x + pos_embed
+        //essentially pos embed dim (b, 729, 1152) + v_pos_embed (b, (1152, 729) ^ T)
+        try self.broadcast_pos_embeddings(
+            self.state.patch_emb,
+            batch_size,
+            num_patches,
+            self.config.vit_dim,
+        );
 
         // we will now pass our positionally encoded patch embeddings through the ViT blocks.
-        // v_x (729, 1152)
+        // v_x (b, 729, 1152)
 
         for (0..self.config.n_vit_layers) |l| {
             @memcpy(self.state.v_x, self.state.patch_emb);
+            // std.debug.print("Pre-LN1: range [{d}, {d}], ", .{ min_value(self.state.v_x), max_value(self.state.v_x) });
+            // print_mean_std("mean/std", self.state.v_x);
 
             // we will normalize each patch by iterating over each patch, because our layernorm can only do a single patch vector of inputs
-            for (0..num_patches) |patch| {
-                try layer_norm(
-                    self.state.v_x[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
-                    self.weights.v_norm1_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
-                    self.weights.v_norm1_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
-                    1e-5,
-                );
-            }
+            const shape = [_]usize{self.config.vit_dim}; // Each patch normalized across vit_dim
+
+            // Instead of the loop, process all patches at once
+            try layer_norm(
+                self.state.v_x, // Pass entire tensor of all patches
+                &shape, // Normalize in groups of vit_dim
+                self.weights.v_norm1_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                self.weights.v_norm1_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                1e-5,
+            );
+            // std.debug.print("Post-LN1: range [{d}, {d}], ", .{ min_value(self.state.v_x), max_value(self.state.v_x) });
+            // print_mean_std("mean/std", self.state.v_x);
+
             // now our patch embedding is normalized, we are going to get the attention weights
             // we multiply our patch embedding to get the qkv for all the patches all at once for the specific layer
-            // patch_emb (729, 1152) @ v_Wqkv (1152, 3456) = v_qkv (729, 3456)
+            // patch_emb (b, 729, 1152) @ v_Wqkv (1152, 3456) = v_qkv (729, 3456)
             try matmul(
                 self.allocator,
                 self.state.v_x,
                 self.weights.v_Wqkv_w[l * self.config.vit_dim * 3 * self.config.vit_dim .. (l + 1) * self.config.vit_dim * 3 * self.config.vit_dim],
                 self.state.v_qkv,
-                num_patches,
+                total_patches,
                 self.config.vit_dim * 3,
                 self.config.vit_dim,
             );
+
             // next we accumulate the bias for that layer into v_qkv!
             // we need to iterate over all the patches again to do so!
-            for (0..num_patches) |patch| {
+            for (0..total_patches) |patch| {
                 // 1 patch from v_qkv (1, 3456) = 1 patch from v_qkv (1, 3456) + Wqkv_b(3456)
                 // over all patches it will be v_qkv(729, 3456)
                 accumulate(
@@ -2066,102 +2476,180 @@ const Model = struct {
                 );
             }
 
-            @memcpy(self.state.v_q, self.state.v_qkv[0 .. num_patches * self.config.vit_dim]);
-            @memcpy(self.state.v_k, self.state.v_qkv[num_patches * self.config.vit_dim .. num_patches * self.config.vit_dim * 2]);
-            @memcpy(self.state.v_v, self.state.v_qkv[num_patches * self.config.vit_dim * 2 .. num_patches * self.config.vit_dim * 3]);
+            //----------
+
+            for (0..total_patches) |patch_idx| {
+                const row_start = patch_idx * (self.config.vit_dim * 3);
+                const q_start = row_start;
+                const k_start = row_start + self.config.vit_dim;
+                const v_start = row_start + (self.config.vit_dim * 2);
+
+                // // Print values for first patch
+                // if (patch_idx == 0) {
+                //     std.debug.print("\nQKV split for first patch:\n", .{});
+                //     std.debug.print("Q first 3: {any}\n", .{self.state.v_qkv[q_start .. q_start + 3]});
+                //     std.debug.print("K first 3: {any}\n", .{self.state.v_qkv[k_start .. k_start + 3]});
+                //     std.debug.print("V first 3: {any}\n", .{self.state.v_qkv[v_start .. v_start + 3]});
+                // }
+
+                // Copy into separate buffers
+                @memcpy(self.state.v_q[patch_idx * self.config.vit_dim .. (patch_idx + 1) * self.config.vit_dim], self.state.v_qkv[q_start .. q_start + self.config.vit_dim]);
+                @memcpy(self.state.v_k[patch_idx * self.config.vit_dim .. (patch_idx + 1) * self.config.vit_dim], self.state.v_qkv[k_start .. k_start + self.config.vit_dim]);
+                @memcpy(self.state.v_v[patch_idx * self.config.vit_dim .. (patch_idx + 1) * self.config.vit_dim], self.state.v_qkv[v_start .. v_start + self.config.vit_dim]);
+            }
+
+            // After splitting, print ranges
+            // std.debug.print("\nAfter QKV split - value ranges:\n", .{});
+            // std.debug.print("Q range: [{d}, {d}]\n", .{ min_value(self.state.v_q), max_value(self.state.v_q) });
+            // std.debug.print("K range: [{d}, {d}]\n", .{ min_value(self.state.v_k), max_value(self.state.v_k) });
+            // std.debug.print("V range: [{d}, {d}]\n", .{ min_value(self.state.v_v), max_value(self.state.v_v) });
 
             const head_dim = self.config.vit_dim / self.config.n_vit_heads;
 
             for (0..self.config.n_vit_heads) |head| {
-                const v_q_head = self.state.v_q[head * head_dim * num_patches .. (head + 1) * head_dim * num_patches];
-                const v_k_head = self.state.v_k[head * head_dim * num_patches .. (head + 1) * head_dim * num_patches];
-                const v_v_head = self.state.v_v[head * head_dim * num_patches .. (head + 1) * head_dim * num_patches];
+                const v_q_head = self.state.v_q[head * head_dim * total_patches .. (head + 1) * head_dim * total_patches];
+                const v_k_head = self.state.v_k[head * head_dim * total_patches .. (head + 1) * head_dim * total_patches];
+                const v_v_head = self.state.v_v[head * head_dim * total_patches .. (head + 1) * head_dim * total_patches];
 
-                // Compute the attention score by taking the dot product of the query and key for this head
-                // v_q_head (num_patches, head_dim) @ v_k_head.T (head_dim, num_patches) = v_attn (num_patches, num_patches)
+                const attn_slice = self.state.v_attn[head * total_patches * total_patches .. (head + 1) * total_patches * total_patches];
+
+                // Scale Q and K before multiplication
+                const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.config.vit_head_dim)));
+                var scaled_q = try self.allocator.alloc(f32, v_q_head.len);
+                defer self.allocator.free(scaled_q);
+                var scaled_k = try self.allocator.alloc(f32, v_k_head.len);
+                defer self.allocator.free(scaled_k);
+
+                // Scale Q and K
+                for (v_q_head, 0..) |val, i| scaled_q[i] = val * scale;
+                for (v_k_head, 0..) |val, i| scaled_k[i] = val * scale;
+
+                const k_transposed = try transposeSimd(self.allocator, scaled_k, total_patches, head_dim);
+                defer self.allocator.free(k_transposed);
+
+                // std.debug.print("Head {}: Pre-matmul Q range: [{any}, {d}], K range: [{any}, {any}]\n", .{ head, min_value(scaled_q), max_value(scaled_q), min_value(k_transposed), max_value(k_transposed) });
+
+                // QK^T multiplication with pre-scaled values
                 try matmul(
                     self.allocator,
-                    v_q_head,
-                    v_k_head, // We would need to transpose v_k_head for this operation
-                    self.state.v_attn[head * num_patches * num_patches .. (head + 1) * num_patches * num_patches],
-                    num_patches,
-                    num_patches,
+                    scaled_q,
+                    k_transposed,
+                    attn_slice,
+                    total_patches,
+                    total_patches,
                     head_dim,
                 );
 
-                // Scale the attention scores by sqrt(head_dim) to stabilize gradients as per the scaled dot-product attention mechanism
-                const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-                for (0..num_patches * num_patches) |i| {
-                    self.state.v_attn[head * num_patches * num_patches + i] *= scale;
+                // std.debug.print("After QK^T - scores range: [{any}, {any}]\n", .{ min_value(attn_slice), max_value(attn_slice) });
+
+                // Apply row-wise softmax
+                // TODO: Replace with function
+                var row: usize = 0;
+                while (row < total_patches) : (row += 1) {
+                    const row_start = row * total_patches;
+                    const row_end = row_start + total_patches;
+                    const row_slice = attn_slice[row_start..row_end];
+
+                    // Find max for this row only
+                    var max: f32 = -std.math.inf(f32);
+                    for (row_slice) |val| {
+                        max = @max(max, val);
+                    }
+
+                    // Compute exp(x - max) and sum for this row
+                    var sum: f32 = 0.0;
+                    for (row_slice) |*val| {
+                        val.* = @exp(val.* - max);
+                        sum += val.*;
+                    }
+
+                    // Normalize this row
+                    if (sum != 0) {
+                        for (row_slice) |*val| {
+                            val.* /= sum;
+                        }
+                    } else {
+                        // Handle zero sum case - uniform attention
+                        const uniform_val = 1.0 / @as(f32, @floatFromInt(total_patches));
+                        for (row_slice) |*val| {
+                            val.* = uniform_val;
+                        }
+                    }
                 }
 
-                // Apply softmax to get the attention probabilities
-                // We will be applying softmax row-wise over the num_patches dimension
-                try softmax(self.state.v_attn[head * num_patches * num_patches .. (head + 1) * num_patches * num_patches]);
+                // std.debug.print("After softmax - weights range: [{any}, {any}]\n", .{ min_value(attn_slice), max_value(attn_slice) });
 
-                // Multiply attention probabilities with value matrix to get the final output for this head
-                // v_attn (num_patches, num_patches) @ v_v_head (num_patches, head_dim) = output (num_patches, head_dim)
+                // attn @ V multiplication
                 try matmul(
                     self.allocator,
-                    self.state.v_attn[head * num_patches * num_patches .. (head + 1) * num_patches * num_patches],
+                    attn_slice,
                     v_v_head,
-                    self.state.v_output[head * num_patches * head_dim .. (head + 1) * num_patches * head_dim],
-                    num_patches,
+                    self.state.v_output[head * total_patches * head_dim .. (head + 1) * total_patches * head_dim],
+                    total_patches,
                     head_dim,
-                    num_patches,
+                    total_patches,
                 );
+
+                // const output_slice = self.state.v_output[head * total_patches * head_dim .. (head + 1) * total_patches * head_dim];
+                // std.debug.print("After V multiplication - output range: [{any}, {any}]\n", .{ min_value(output_slice), max_value(output_slice) });
             }
 
+            // std.debug.print("Attention output: range [{d}, {d}], ", .{ min_value(self.state.v_output), max_value(self.state.v_output) });
+            // print_mean_std("mean/std", self.state.v_output);
+
             // Next, we will multiply the final output from all the heads with the attention projection layer for this vit block
-            // v_output (num_patches, vit_dim) @  v_out_proj_w (vit_dim, vit_dim) = v_proj (num_patches, vit_dim)
+            // v_output (total_patches, vit_dim) @  v_out_proj_w (vit_dim, vit_dim) = v_proj (total_patches, vit_dim)
 
             try matmul(
                 self.allocator,
                 self.state.v_output,
                 self.weights.v_out_proj_w[l * self.config.vit_dim * self.config.vit_dim .. (l + 1) * self.config.vit_dim * self.config.vit_dim],
                 self.state.v_proj,
-                num_patches,
+                total_patches,
                 self.config.vit_dim,
                 self.config.vit_dim,
             );
 
-            //TODO : investigate if the qkv weights and proj weights use ReLU???
-
-            for (0..num_patches) |patch| {
+            for (0..total_patches) |patch| {
                 accumulate(self.state.v_proj[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.weights.v_out_proj_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim]);
             }
-
+            // std.debug.print("Before residual: range [{d}, {d}]\n", .{ min_value(self.state.patch_emb), max_value(self.state.patch_emb) });
             accumulate(self.state.patch_emb, self.state.v_proj);
+
+            // std.debug.print("After residual1: range [{d}, {d}], ", .{ min_value(self.state.patch_emb), max_value(self.state.patch_emb) });
+            // print_mean_std("mean/std", self.state.patch_emb);
 
             // reusing v_x now and saving patch embed as a residual carry
             @memcpy(self.state.v_x, self.state.patch_emb);
 
             // second layernorm
-            for (0..num_patches) |patch| {
-                try layer_norm(
-                    self.state.v_x[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
-                    self.weights.v_norm2_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
-                    self.weights.v_norm2_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
-                    1e-5,
-                );
-            }
+
+            try layer_norm(
+                self.state.v_x,
+                &shape,
+                self.weights.v_norm2_w[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                self.weights.v_norm2_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                1e-5,
+            );
+
+            // std.debug.print("Pre-LN2: range [{d}, {d}], ", .{ min_value(self.state.v_x), max_value(self.state.v_x) });
+            // print_mean_std("mean/std", self.state.v_x);
 
             // pass the normalized v_x through the first MLP, upcasting it, and storing it in a buffer
-            // v_x(num_patches, vit_dim) @ fc1 (vit_dim, hidden_features) = v_xb(num_patches, hidden_features)
-
+            // v_x(total_patches, vit_dim) @ fc1 (vit_dim, hidden_features) = v_xb(total_patches, hidden_features)
             try matmul(
                 self.allocator,
                 self.state.v_x,
                 self.weights.v_fc1_w[l * self.config.vit_dim * self.config.hidden_features .. (l + 1) * self.config.vit_dim * self.config.hidden_features],
                 self.state.v_xb,
-                num_patches,
+                total_patches,
                 self.config.hidden_features,
                 self.config.vit_dim,
             );
 
             // then we accumulate the fc1 bias into v_xb by iterating over num patches
-            for (0..num_patches) |patch| {
-                // iterate over num_patches (xb (1, hidden_features) = xb (1, hidden_features) + fc1_b (hidden_features)
+            for (0..total_patches) |patch| {
+                // iterate over total_patches (xb (1, hidden_features) = xb (1, hidden_features) + fc1_b (hidden_features)
                 accumulate(
                     self.state.v_xb[patch * self.config.hidden_features .. (patch + 1) * self.config.hidden_features],
                     self.weights.v_fc1_b[l * self.config.hidden_features .. (l + 1) * self.config.hidden_features],
@@ -2175,87 +2663,204 @@ const Model = struct {
             // now we will downcast it through fc2.
 
             // for this we will multiply v_xb with the fc2 weights and store it in v_xb2
-            // v_xb(num_patches, hidden_features) @ fc2 (hidden_features, vit_dim) = v_xb2(num_patches, hidden_features)
+            // v_xb(total_patches, hidden_features) @ fc2 (hidden_features, vit_dim) = v_xb2(total_patches, hidden_features)
             try matmul(
                 self.allocator,
                 self.state.v_xb,
                 self.weights.v_fc2_w[l * self.config.hidden_features * self.config.vit_dim .. (l + 1) * self.config.hidden_features * self.config.vit_dim],
                 self.state.v_xb2,
-                num_patches,
+                total_patches,
                 self.config.vit_dim,
                 self.config.hidden_features,
             );
             // then we accumulate the fc2 bias into v_xb2 by iterating over num patches
 
-            for (0..num_patches) |patch| {
-                // iterate over num_patches (xb2 (1, vit_dim) = xb (1, vit_dim) + fc1_b (vit_dim)
+            for (0..total_patches) |patch| {
+                // iterate over total_patches (xb2 (1, vit_dim) = xb (1, vit_dim) + fc1_b (vit_dim)
                 accumulate(
                     self.state.v_xb2[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
-                    self.weights.v_fc1_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
+                    self.weights.v_fc2_b[l * self.config.vit_dim .. (l + 1) * self.config.vit_dim],
                 );
             }
+            // std.debug.print("MLP output: range [{d}, {d}], ", .{ min_value(self.state.v_xb2), max_value(self.state.v_xb2) });
+            // print_mean_std("mean/std", self.state.v_xb2);
 
             // now we finally can merge the mlp output into the residual we've been saving all this long
             accumulate(self.state.patch_emb, self.state.v_xb2);
+
+            // std.debug.print("After residual2: range [{d}, {d}], ", .{ min_value(self.state.patch_emb), max_value(self.state.patch_emb) });
+            // print_mean_std("mean/std", self.state.patch_emb);
         }
         // now for the final layernorm..
+        const shape = [_]usize{self.config.vit_dim};
+        try layer_norm(
+            self.state.patch_emb,
+            &shape,
+            self.weights.v_norm_out_w,
+            self.weights.v_norm_out_b,
+            1e-5,
+        );
 
-        for (0..num_patches) |patch| {
-            try layer_norm(
-                self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim],
-                self.weights.v_norm_out_w,
-                self.weights.v_norm_out_b,
-                1e-5,
-            );
-        }
+        // std.debug.print("After Final LN: range [{d}, {d}], ", .{ min_value(self.state.patch_emb), max_value(self.state.patch_emb) });
+        // print_mean_std("mean/std", self.state.patch_emb);
 
-        for (0..num_patches) |patch| {
-            // 0 to 1152
-            // 1152 to 2304
+        for (0..total_patches) |patch| {
             @memcpy(self.state.final_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim], self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim]);
-            @memcpy(self.state.final_emb[(patch + 1) * self.config.vit_dim .. (patch + 2) * self.config.vit_dim], self.state.patch_emb[patch * self.config.vit_dim .. (patch + 1) * self.config.vit_dim]);
         }
+
+        // std.debug.print("Final embeddings: range [{d}, {d}], ", .{ min_value(self.state.final_emb), max_value(self.state.final_emb) });
+        // print_mean_std("mean/std", self.state.final_emb);
 
         // now we will pass the final embed through the projection layers:
         // first we will upcast to (num patches, hidden_dim)
-        // final_emb (num_patches , vit_dim * 2) @ v_proj_fc1_w (vit_dim * 2, hidden_dim) = v_xb3(num_patches, hidden_dim)
+        // final_emb (total_patches , vit_dim * 2) @ v_proj_fc1_w (vit_dim * 2, hidden_dim) = v_xb3(total_patches, hidden_dim)
         try matmul(
             self.allocator,
             self.state.final_emb,
             self.weights.v_proj_fc1_w,
             self.state.v_xb3,
-            num_patches,
+            total_patches,
             self.config.hidden_dim,
             self.config.vit_dim * 2,
         );
 
         // next up, we apply the bias on v_xb3
-        for (0..num_patches) |patch| {
+        for (0..total_patches) |patch| {
             accumulate(
                 self.state.v_xb3[patch * self.config.hidden_dim .. (patch + 1) * self.config.hidden_dim],
                 self.weights.v_proj_fc1_b,
             );
         }
 
+        // std.debug.print("After proj1: range [{d}, {d}], ", .{ min_value(self.state.v_xb3), max_value(self.state.v_xb3) });
+        // print_mean_std("mean/std", self.state.v_xb3);
+
         // we will then apply GeLU on the logits from the first projection layer:
         gelu(self.state.v_xb3);
 
+        // std.debug.print("After GeLU Proj: range [{d}, {d}], ", .{ min_value(self.state.v_xb3), max_value(self.state.v_xb3) });
+        // print_mean_std("mean/std", self.state.v_xb3);
+
         // after this we will pass the activated v_xb3:
-        // v_xb3(num_patches, hidden_dim) @ v_proj_fc2_w (hidden_dim, dim) = v_xb3(num_patches, dim)
+        // v_xb3(total_patches, hidden_dim) @ v_proj_fc2_w (hidden_dim, dim) = v_xb3(total_patches, dim)
+
         try matmul(
             self.allocator,
             self.state.v_xb3,
             self.weights.v_proj_fc2_w,
             self.state.projection,
-            num_patches,
+            total_patches,
             self.config.dim,
             self.config.hidden_dim,
         );
 
         // then we add the final projection bias
 
-        for (0..num_patches) |patch| {
+        for (0..total_patches) |patch| {
             accumulate(self.state.projection[patch * self.config.dim .. (patch + 1) * self.config.dim], self.weights.v_proj_fc2_b);
+        }
+    }
+
+    fn min_value(slice: []const f32) f32 {
+        var min: f32 = std.math.inf(f32);
+        for (slice) |val| {
+            min = @min(min, val);
+        }
+        return min;
+    }
+
+    fn max_value(slice: []const f32) f32 {
+        var max: f32 = -std.math.inf(f32);
+        for (slice) |val| {
+            max = @max(max, val);
+        }
+        return max;
+    }
+
+    // Helper function to compute and print mean/std
+    fn print_mean_std(prefix: []const u8, values: []const f32) void {
+        var sum: f32 = 0;
+        var sum_sq: f32 = 0;
+        for (values) |v| {
+            sum += v;
+            sum_sq += v * v;
+        }
+        const mean = sum / @as(f32, @floatFromInt(values.len));
+        const variance = (sum_sq / @as(f32, @floatFromInt(values.len))) - (mean * mean);
+        const std_dev = @sqrt(@max(variance, 0));
+        std.debug.print("{s}: mean {d}, std {d}\n", .{ prefix, mean, std_dev });
+    }
+
+    fn clip_values(slice: []f32, min_val: f32, max_val: f32) void {
+        for (slice) |*val| {
+            val.* = @min(@max(val.*, min_val), max_val);
+        }
+    }
+
+    fn rearrangeBCHWtoBTC(allocator: std.mem.Allocator, input: []const f32, batch: usize, channels: usize, height: usize, width: usize, patch_size: usize) ![]f32 {
+        const h_patches = height / patch_size;
+        const w_patches = width / patch_size;
+        const out_size = batch * (h_patches * w_patches) * (channels * patch_size * patch_size);
+
+        var output = try allocator.alloc(f32, out_size);
+        errdefer allocator.free(output);
+
+        // Pre-calculate strides
+        const in_c_stride = height * width;
+        const in_h_stride = width;
+        const in_b_stride = channels * height * width;
+
+        const out_t_stride = channels * patch_size * patch_size;
+        const out_b_stride = h_patches * w_patches * out_t_stride;
+
+        // Single loop over all elements
+        var idx: usize = 0;
+        while (idx < out_size) : (idx += 1) {
+            // Decode output index into components
+            const b = idx / out_b_stride;
+            const hw = (idx % out_b_stride) / out_t_stride;
+            const cp = idx % out_t_stride;
+
+            const h = hw / w_patches;
+            const w = hw % w_patches;
+            const ch = cp / (patch_size * patch_size);
+            const p = cp % (patch_size * patch_size);
+            const ph = p / patch_size;
+            const pw = p % patch_size;
+
+            // Calculate input index
+            const in_idx = b * in_b_stride +
+                ch * in_c_stride +
+                (h * patch_size + ph) * in_h_stride +
+                (w * patch_size + pw);
+
+            output[idx] = input[in_idx];
+        }
+
+        return output;
+    }
+
+    fn broadcast_pos_embeddings(
+        self: Self,
+        patch_emb: []f32,
+        batch_size: usize,
+        num_patches: usize,
+        vit_dim: usize,
+    ) !void {
+        // First transpose pos embeddings
+        const pos_emb_transposed = try transposeSimd(
+            self.allocator,
+            self.weights.v_pos_embedding,
+            vit_dim, // 1152
+            num_patches, // 729
+        );
+        defer self.allocator.free(pos_emb_transposed);
+
+        // Now add to each batch's patches
+        for (0..batch_size) |batch| {
+            const start_idx = batch * num_patches * vit_dim;
+            const end_idx = start_idx + num_patches * vit_dim;
+            accumulate(patch_emb[start_idx..end_idx], pos_emb_transposed);
         }
     }
 };
@@ -2283,86 +2888,57 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
     try tokens_with_eos.appendSlice(tokens.items);
 
     // Get initial embeddings
-    var initial_tokens = std.ArrayList(u32).init(model.allocator);
-    defer initial_tokens.deinit();
-    try initial_tokens.appendSlice(tokens_with_eos.items);
-    const text_embed = try model.embed_tokens(initial_tokens);
+    const text_embed = try model.embed_tokens(tokens_with_eos);
     defer model.allocator.free(text_embed);
 
-    std.debug.print("Text embeddings len : {any} \n", .{text_embed.len});
-    std.debug.print("Image embeddings len : {any} \n", .{model.state.projection.len});
-
+    // Merge text and image embeddings
     const init_embedding = try model.merge_embed(text_embed, model.state.projection);
     defer allocator.free(init_embedding);
 
-    // // first we will perform multiquery attention on the vision and text embeddings from the image + prompt
+    var pos: usize = 0;
 
-    var pos: usize = 0; // this defines the current position in the kv cache, or the number of tokens already processed. This starts at 0.
-
-    // // first we will process the prompt and the image embeddings altogether
-
-    try model.text_model(init_embedding, pos);
-
-    // // we will add the incoming q_len to the current pos which indicates the sequence length of the key and value vectors
-
+    // Process initial embeddings and update cache
+    var current_state = try model.text_model(init_embedding, pos);
+    defer allocator.free(current_state);
     pos += init_embedding.len / model.config.dim;
-    std.debug.print("pos : {any} \n", .{pos});
 
     // Initialize output buffer
     var output = std.ArrayList(u8).init(allocator);
     defer output.deinit();
 
-    var current_embeddings = std.ArrayList(f32).init(allocator);
-    defer current_embeddings.deinit();
-
-    // Create ArrayList for tokens to decode
-    var token_list = std.ArrayList(u32).init(model.allocator);
-    defer token_list.deinit();
-
-    // Single token list for embedding
+    // Single token list for next token embedding
     var single_token_list = std.ArrayList(u32).init(model.allocator);
     defer single_token_list.deinit();
 
     const max_tokens: usize = 100;
     generation: for (0..max_tokens) |_| {
-        try model.text_model(current_embeddings.items, pos);
-
-        const logits = try model.lm_head(
-            current_embeddings.items,
-            current_embeddings.items.len / model.config.dim,
-        );
-
+        const logits = try model.lm_head(current_state, 1);
         defer model.allocator.free(logits);
 
         const next_token = try sampleNextToken(logits);
 
         // Check for EOS
         if (next_token == model.tokenizer.eos_token) {
-            std.debug.print("EOS token found!\n", .{});
             break :generation;
         }
 
-        // Clear token lists and add next token
-        token_list.clearRetainingCapacity();
-        try token_list.append(next_token);
-
+        // Decode and append to output
         single_token_list.clearRetainingCapacity();
         try single_token_list.append(next_token);
 
-        // Decode and append to output
-        const token_str = try model.tokenizer.decode(token_list);
+        const token_str = try model.tokenizer.decode(single_token_list);
         defer model.allocator.free(token_str);
         try output.appendSlice(token_str);
 
+        // Get embedding for next token
         const next_embed = try model.embed_tokens(single_token_list);
         defer model.allocator.free(next_embed);
 
-        // Clear current embeddings and set to next token's embeddings
-        try current_embeddings.resize(next_embed.len);
-        @memcpy(current_embeddings.items, next_embed);
+        // Process next token with cache
+        const new_state = try model.text_model(next_embed, pos);
+        allocator.free(current_state);
+        current_state = new_state;
 
-        // Process next token
-        try model.text_model(current_embeddings.items, pos);
         pos += 1;
     }
 
@@ -2409,7 +2985,7 @@ pub fn main() !void {
 
     // loading weights //
     var weights = try Weights.init(config, bin_path, allocator);
-    defer weights.deinit(allocator);
+    defer weights.deinit();
 
     // loading tokenizer //
     var tokenizer = try Tokenizer.fromFile("../tokenizer.bin", allocator);
@@ -2422,7 +2998,7 @@ pub fn main() !void {
     // initializing model struct //
     var model = try Model.init(config, weights, tokenizer, state, allocator);
 
-    const prompt = "Hello";
+    const prompt = "Describe the image.";
     // const max_new_tokens = 5;
 
     var timer = try std.time.Timer.start();
