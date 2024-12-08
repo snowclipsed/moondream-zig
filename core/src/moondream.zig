@@ -1096,7 +1096,7 @@ const Weights = struct {
             return error.BufferSizeMismatch;
         }
 
-        std.debug.print("Loaded weights successfully. Total parameters: {}\n", .{num_weights});
+        std.debug.print("Loaded weights successfully. \n Total parameters: {}\n", .{num_weights});
         return self;
     }
 
@@ -1303,20 +1303,37 @@ const RunState = struct {
 
 // Tokens, their scores, and the max token length. Supports initialization
 // from a file and encoding text into tokens via the `encode` method.
+
+const SpecialToken = struct {
+    id: u32,
+    content: []const u8,
+    is_special: bool,
+    single_word: bool,
+    lstrip: bool,
+    rstrip: bool,
+    normalized: bool,
+};
+
 const Tokenizer = struct {
     // TODO : Add handling external tokens to tokenizer
     const Self = @This();
     tokens: std.StringHashMap(u32),
+    special_tokens: std.ArrayList(SpecialToken),
     merges: std.ArrayList([]const u8),
     allocator: Allocator,
     eos_token: u32,
+    bos_token: u32,
+    pad_token: u32,
 
     fn init(allocator: Allocator) Tokenizer {
         return .{
             .tokens = std.StringHashMap(u32).init(allocator),
+            .special_tokens = std.ArrayList(SpecialToken).init(allocator),
             .merges = std.ArrayList([]const u8).init(allocator),
             .allocator = allocator,
-            .eos_token = 50256,
+            .eos_token = 50256, // These values should match your tokenizer.json
+            .bos_token = 50257,
+            .pad_token = 50258,
         };
     }
 
@@ -1329,40 +1346,108 @@ const Tokenizer = struct {
 
         var reader = file.reader();
 
-        // Read number of tokens
+        // Read regular tokens
         const num_tokens = try reader.readInt(u32, .little);
+        std.debug.print("Loading {} regular tokens\n", .{num_tokens});
 
-        // Read tokens
-        var i: u32 = 0;
-        while (i < num_tokens) : (i += 1) {
+        for (0..num_tokens) |i| {
             const token_id = try reader.readInt(u32, .little);
             const token_len = try reader.readInt(u32, .little);
             const token_content = try allocator.alloc(u8, token_len);
             errdefer allocator.free(token_content);
-            _ = try reader.readAll(token_content);
-
+            const bytes_read = try reader.readAll(token_content);
+            if (bytes_read != token_len) {
+                return error.UnexpectedEOF;
+            }
             try self.tokens.put(token_content, token_id);
+
+            if (i % 1000 == 0) {
+                std.debug.print("Loaded {} regular tokens...\n", .{i});
+            }
         }
 
-        // Read number of merges
-        const num_merges = try reader.readInt(u32, .little);
+        // Read special tokens
+        const num_special = try reader.readInt(u32, .little);
+        std.debug.print("Loading {} special tokens\n", .{num_special});
+
+        for (0..num_special) |i| {
+            // Read token metadata
+            const token_id = try reader.readInt(u32, .little);
+            const token_len = try reader.readInt(u32, .little);
+
+            // Read flags
+            const is_special = try reader.readInt(u8, .little) != 0;
+            const single_word = try reader.readInt(u8, .little) != 0;
+            const lstrip = try reader.readInt(u8, .little) != 0;
+            const rstrip = try reader.readInt(u8, .little) != 0;
+            const normalized = try reader.readInt(u8, .little) != 0;
+
+            // Read token content
+            const content = try allocator.alloc(u8, token_len);
+            errdefer allocator.free(content);
+            const bytes_read = try reader.readAll(content);
+            if (bytes_read != token_len) {
+                return error.UnexpectedEOF;
+            }
+
+            // Create and store special token
+            try self.special_tokens.append(.{
+                .id = token_id,
+                .content = content,
+                .is_special = is_special,
+                .single_word = single_word,
+                .lstrip = lstrip,
+                .rstrip = rstrip,
+                .normalized = normalized,
+            });
+
+            std.debug.print("Loaded special token {}: id={}, content='{s}'\n", .{ i, token_id, content });
+        }
 
         // Read merges
-        i = 0;
-        while (i < num_merges) : (i += 1) {
+        const num_merges = try reader.readInt(u32, .little);
+        std.debug.print("Loading {} merges\n", .{num_merges});
+
+        for (0..num_merges) |i| {
+            // Read first part
             const first_len = try reader.readInt(u16, .little);
             const first = try allocator.alloc(u8, first_len);
-            _ = try reader.readAll(first);
-            defer allocator.free(first);
+            errdefer allocator.free(first);
+            const first_bytes_read = try reader.readAll(first);
+            if (first_bytes_read != first_len) {
+                return error.UnexpectedEOF;
+            }
 
+            // Read second part
             const second_len = try reader.readInt(u16, .little);
             const second = try allocator.alloc(u8, second_len);
-            _ = try reader.readAll(second);
-            defer allocator.free(second);
+            errdefer allocator.free(second);
+            const second_bytes_read = try reader.readAll(second);
+            if (second_bytes_read != second_len) {
+                return error.UnexpectedEOF;
+            }
 
+            // Combine into merge rule
             const merge = try std.fmt.allocPrint(allocator, "{s} {s}", .{ first, second });
+            errdefer allocator.free(merge);
+
             try self.merges.append(merge);
+
+            // Clean up temporary allocations
+            allocator.free(first);
+            allocator.free(second);
+
+            if (i % 1000 == 0) {
+                std.debug.print("Loaded {} merges...\n", .{i});
+            }
         }
+
+        // Final load summary
+        std.debug.print("Tokenizer loaded: {} tokens, {} special tokens, {} merges\n", .{
+            self.tokens.count(),
+            self.special_tokens.items.len,
+            self.merges.items.len,
+        });
 
         return self;
     }
@@ -1383,33 +1468,63 @@ const Tokenizer = struct {
         var tokens = std.ArrayList(u32).init(self.allocator);
         errdefer tokens.deinit();
 
-        var words = std.mem.split(u8, text, " ");
-        while (words.next()) |word| {
-            var current_word = word;
-            while (current_word.len > 0) {
-                var longest_token: ?[]const u8 = null;
-                var longest_token_id: ?u32 = null;
+        // First check for special tokens
+        for (self.special_tokens.items) |special| {
+            if (std.mem.indexOf(u8, text, special.content)) |_| {
+                if (special.is_special) {
+                    // Handle special token differently
+                    try tokens.append(special.id);
+                    return tokens;
+                }
+            }
+        }
 
-                // Find the longest matching token
+        // Regular tokenization process
+        var current_pos: usize = 0;
+        while (current_pos < text.len) {
+            var longest_match: ?struct { token: []const u8, id: u32, len: usize } = null;
+
+            // Check special tokens first
+            for (self.special_tokens.items) |special| {
+                if (current_pos + special.content.len <= text.len and
+                    std.mem.startsWith(u8, text[current_pos..], special.content))
+                {
+                    if (longest_match == null or special.content.len > longest_match.?.len) {
+                        longest_match = .{
+                            .token = special.content,
+                            .id = special.id,
+                            .len = special.content.len,
+                        };
+                    }
+                }
+            }
+
+            // Then check regular tokens
+            if (longest_match == null) {
                 var token_it = self.tokens.iterator();
                 while (token_it.next()) |entry| {
                     const token = entry.key_ptr.*;
-                    if (std.mem.startsWith(u8, current_word, token)) {
-                        if (longest_token == null or token.len > longest_token.?.len) {
-                            longest_token = token;
-                            longest_token_id = entry.value_ptr.*;
+                    if (current_pos + token.len <= text.len and
+                        std.mem.startsWith(u8, text[current_pos..], token))
+                    {
+                        if (longest_match == null or token.len > longest_match.?.len) {
+                            longest_match = .{
+                                .token = token,
+                                .id = entry.value_ptr.*,
+                                .len = token.len,
+                            };
                         }
                     }
                 }
+            }
 
-                if (longest_token) |token| {
-                    try tokens.append(longest_token_id.?);
-                    current_word = current_word[token.len..];
-                } else {
-                    // If no token matches, treat the first byte as an unknown token
-                    try tokens.append(current_word[0]);
-                    current_word = current_word[1..];
-                }
+            if (longest_match) |match| {
+                try tokens.append(match.id);
+                current_pos += match.len;
+            } else {
+                // Handle unknown byte
+                try tokens.append(text[current_pos]);
+                current_pos += 1;
             }
         }
 
@@ -1426,7 +1541,7 @@ const Tokenizer = struct {
         var decoded_text = std.ArrayList(u8).init(self.allocator);
         errdefer decoded_text.deinit();
 
-        std.debug.print("Decoding tokens: {any}\n", .{tokens.items});
+        var need_space = false;
 
         for (tokens.items) |token_id| {
             var found = false;
@@ -1434,41 +1549,66 @@ const Tokenizer = struct {
             while (token_it.next()) |entry| {
                 if (entry.value_ptr.* == token_id) {
                     const token = entry.key_ptr.*;
-                    if (token.len > 1) {
-                        switch (token[1]) {
-                            0xA0 => {
-                                if (token[1] == 0xA0) {
-                                    // This is 'Ġ' (0xC4 0xA0 in UTF-8)
-                                    try decoded_text.append(' ');
-                                    try decoded_text.appendSlice(token[2..]);
-                                } else {
-                                    try decoded_text.appendSlice(token);
-                                }
-                            },
-                            0x82 => {
-                                if (token.len > 1 and token[1] == 0x82) {
-                                    // This is 'Ċ' (0xC4 0x82 in UTF-8)
-                                    try decoded_text.append('\n');
-                                    try decoded_text.appendSlice(token[2..]);
-                                } else {
-                                    try decoded_text.appendSlice(token);
-                                }
-                            },
-                            else => try decoded_text.appendSlice(token),
+
+                    if (token.len >= 2) {
+                        if (std.mem.startsWith(u8, token, &[_]u8{ 0xC4, 0xA0 })) { // Ġ
+                            try decoded_text.append(' ');
+                            if (token.len > 2) {
+                                try decoded_text.appendSlice(token[2..]);
+                            }
+                        } else if (std.mem.startsWith(u8, token, &[_]u8{ 0xC4, 0x82 })) { // Ċ
+                            try decoded_text.append('\n');
+                            if (token.len > 2) {
+                                try decoded_text.appendSlice(token[2..]);
+                            }
+                        } else {
+                            if (need_space) {
+                                try decoded_text.append(' ');
+                            }
+                            try decoded_text.appendSlice(token);
                         }
+                    } else {
+                        if (need_space) {
+                            try decoded_text.append(' ');
+                        }
+                        try decoded_text.appendSlice(token);
                     }
+
                     found = true;
+                    need_space = false;
                     break;
                 }
             }
 
             if (!found) {
-                std.debug.print("Token not found: {}\n", .{token_id});
-                return error.TokenNotFound;
+                if (token_id < 256) {
+                    // Handle raw bytes
+                    try decoded_text.append(@intCast(token_id));
+                } else {
+                    return error.TokenNotFound;
+                }
             }
         }
 
         return decoded_text.toOwnedSlice();
+    }
+
+    fn isValidUtf8(text: []const u8) bool {
+        var i: usize = 0;
+        while (i < text.len) {
+            const byte = text[i];
+            const width = std.unicode.utf8ByteSequenceLength(byte) catch return false;
+            if (i + width > text.len) return false;
+
+            // Validate the sequence
+            const sequence = text[i..][0..width];
+            if (std.unicode.utf8Decode(sequence)) |_| {
+                i += width;
+            } else |_| {
+                return false;
+            }
+        }
+        return true;
     }
 
     fn deinit(self: *Self) void {
@@ -1477,6 +1617,11 @@ const Tokenizer = struct {
             self.allocator.free(key.*);
         }
         self.tokens.deinit();
+
+        for (self.special_tokens.items) |token| {
+            self.allocator.free(token.content);
+        }
+        self.special_tokens.deinit();
 
         for (self.merges.items) |merge| {
             self.allocator.free(merge);
@@ -1577,7 +1722,7 @@ const Model = struct {
             // 1. Layer Norm
             @memcpy(ln_in, hidden_states);
 
-            debug_tensor("Layer input", hidden_states, l);
+            // debug_tensor("Layer input", hidden_states, l);
 
             try layer_norm(
                 ln_in,
@@ -1587,7 +1732,7 @@ const Model = struct {
                 eps,
             );
 
-            debug_tensor("After LayerNorm", ln_in, l);
+            // debug_tensor("After LayerNorm", ln_in, l);
 
             // 2. QKV Projection
             try matmul(
@@ -1612,9 +1757,9 @@ const Model = struct {
                 @memcpy(v[seq_idx * dim .. (seq_idx + 1) * dim], qkv[v_start .. v_start + dim]);
             }
 
-            debug_tensor("Q tensor", q, l);
-            debug_tensor("K tensor", k, l);
-            debug_tensor("V tensor", v, l);
+            // debug_tensor("Q tensor", q, l);
+            // debug_tensor("K tensor", k, l);
+            // debug_tensor("V tensor", v, l);
 
             // 4. Reshape to (n_heads, q_len, head_dim)
             for (0..n_heads) |h| {
@@ -1658,17 +1803,17 @@ const Model = struct {
 
             // 10. Attention
             try self.attention(q_h, k_h, v_h, pos, q_len, l, attn_output);
-            debug_tensor("Attention output", attn_output, l);
+            // debug_tensor("Attention output", attn_output, l);
 
             // 11. MLP
             try self.mlp(embeddings, q_len, l, mlp_output);
-            debug_tensor("MLP output", mlp_output, l);
+            // debug_tensor("MLP output", mlp_output, l);
 
             // 12. Residual connections
             accumulate(hidden_states, attn_output);
             accumulate(hidden_states, mlp_output);
-            debug_tensor("Final hidden states", hidden_states, l);
-            check_gradients(hidden_states, "hidden_states");
+            // debug_tensor("Final hidden states", hidden_states, l);
+            // check_gradients(hidden_states, "hidden_states");
         }
         return hidden_states;
     }
@@ -1975,11 +2120,11 @@ const Model = struct {
         const hidden_dim = self.config.hidden_dim;
 
         // Debug input state
-        debug_tensor("MLP Input", input, l);
+        // debug_tensor("MLP Input", input, l);
 
         // Debug weight matrices
-        debug_tensor("FC1 Weights", self.weights.t_fc1_w[l * dim * hidden_dim .. (l + 1) * dim * hidden_dim], l);
-        debug_tensor("FC1 Bias", self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim], l);
+        // debug_tensor("FC1 Weights", self.weights.t_fc1_w[l * dim * hidden_dim .. (l + 1) * dim * hidden_dim], l);
+        // debug_tensor("FC1 Bias", self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim], l);
 
         const fc1_out = try self.allocator.alloc(f32, q_len * hidden_dim);
         defer self.allocator.free(fc1_out);
@@ -1999,24 +2144,24 @@ const Model = struct {
         );
 
         // Debug after first matmul
-        debug_tensor("After FC1 MatMul", fc1_out, l);
+        // debug_tensor("After FC1 MatMul", fc1_out, l);
 
         for (0..q_len) |i| {
             accumulate(fc1_out[i * hidden_dim .. (i + 1) * hidden_dim], self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim]);
         }
 
         // Debug after bias addition
-        debug_tensor("After FC1 Bias", fc1_out, l);
+        // debug_tensor("After FC1 Bias", fc1_out, l);
 
         // GeLU activation
         gelu(fc1_out);
 
         // Debug after activation
-        debug_tensor("After GeLU", fc1_out, l);
+        // debug_tensor("After GeLU", fc1_out, l);
 
-        // Debug second layer weights
-        debug_tensor("FC2 Weights", self.weights.t_fc2_w[l * hidden_dim * dim .. (l + 1) * hidden_dim * dim], l);
-        debug_tensor("FC2 Bias", self.weights.t_fc2_b[l * dim .. (l + 1) * dim], l);
+        // // Debug second layer weights
+        // debug_tensor("FC2 Weights", self.weights.t_fc2_w[l * hidden_dim * dim .. (l + 1) * hidden_dim * dim], l);
+        // debug_tensor("FC2 Bias", self.weights.t_fc2_b[l * dim .. (l + 1) * dim], l);
 
         // Second linear layer
         try matmul(
@@ -2030,17 +2175,17 @@ const Model = struct {
         );
 
         // Debug after second matmul
-        debug_tensor("After FC2 MatMul", fc2_out, l);
+        // debug_tensor("After FC2 MatMul", fc2_out, l);
 
         for (0..q_len) |i| {
             accumulate(fc2_out[i * dim .. (i + 1) * dim], self.weights.t_fc2_b[l * dim .. (l + 1) * dim]);
         }
 
         // Debug final output before copying
-        debug_tensor("Final MLP Output", fc2_out, l);
+        // debug_tensor("Final MLP Output", fc2_out, l);
 
         // Add gradient magnitude checking
-        check_gradients(fc2_out, "MLP Output Gradients");
+        // check_gradients(fc2_out, "MLP Output Gradients");
 
         @memcpy(output, fc2_out);
     }
@@ -2270,10 +2415,23 @@ const Model = struct {
     }
 
     fn merge_embed(self: Self, text_embed: []f32, image_embed: []f32) ![]f32 {
-        const embedding = try self.allocator.alloc(f32, text_embed.len + image_embed.len);
-        std.debug.print("Merging text embed of size {any} and image embed of size {any} \n", .{ text_embed.len / self.config.dim, image_embed.len / self.config.dim });
-        @memcpy(embedding[0..image_embed.len], image_embed);
-        @memcpy(embedding[image_embed.len..], text_embed);
+        const dim = self.config.dim;
+        const total_len = text_embed.len + image_embed.len;
+        const embedding = try self.allocator.alloc(f32, total_len);
+
+        // First token embedding
+        @memcpy(embedding[0..dim], text_embed[0..dim]);
+
+        // Image embeddings
+        @memcpy(embedding[dim..][0..image_embed.len], image_embed);
+
+        // Rest of text embeddings (if any)
+        if (text_embed.len > dim) {
+            @memcpy(embedding[dim + image_embed.len ..], text_embed[dim..]);
+        }
+
+        std.debug.print("Merged embeddings: text_len={d}, image_len={d}, total_len={d}\n", .{ text_embed.len, image_embed.len, total_len });
+
         return embedding;
     }
     /// This function will load the images and then preprocess them into the required format
@@ -2861,61 +3019,64 @@ const Model = struct {
 // std.debug.print("Pass! \n", .{});
 // inference
 fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    // Process image
     const preprocessed = try model.preprocess(image_path, allocator);
     defer allocator.free(preprocessed);
-
     @memcpy(model.state.img, preprocessed);
-
     try model.vision_encoder();
 
-    // Format prompt and encode tokens
+    // Format and tokenize prompt
     const formatted_prompt = try std.fmt.allocPrint(allocator, "\n\nQuestion: {s}\n\nAnswer:", .{prompt});
     defer allocator.free(formatted_prompt);
 
-    var tokens = try model.tokenizer.encode(formatted_prompt);
-    defer tokens.deinit();
+    // Create initial token sequence with EOS + prompt
+    var initial_tokens = std.ArrayList(u32).init(allocator);
+    defer initial_tokens.deinit();
 
-    var tokens_with_eos = std.ArrayList(u32).init(allocator);
-    defer tokens_with_eos.deinit();
-    try tokens_with_eos.append(model.tokenizer.eos_token);
-    try tokens_with_eos.appendSlice(tokens.items);
+    // Add EOS token first, then prompt tokens (matching PyTorch order)
+    try initial_tokens.append(model.tokenizer.eos_token);
+    var prompt_tokens = try model.tokenizer.encode(formatted_prompt);
+    defer prompt_tokens.deinit();
+    try initial_tokens.appendSlice(prompt_tokens.items);
 
-    // Get initial embeddings
-    const text_embed = try model.embed_tokens(tokens_with_eos);
+    // Get embeddings for text
+    const text_embed = try model.embed_tokens(initial_tokens);
     defer model.allocator.free(text_embed);
 
-    // Merge text and image embeddings
-    const init_embedding = try model.merge_embed(text_embed, model.state.projection);
+    // Merge embeddings: [text_embed[0:1], image_tensor, text_embed[1:]]
+    const init_embedding = try model.merge_embed(text_embed[0..model.config.dim], // First token embedding
+        model.state.projection);
     defer allocator.free(init_embedding);
 
     var pos: usize = 0;
 
-    // Process initial embeddings and update cache
+    // Process initial embeddings and set up KV cache
     var current_state = try model.text_model(init_embedding, pos);
     defer allocator.free(current_state);
     pos += init_embedding.len / model.config.dim;
 
-    // Initialize output buffer
+    // Output buffer
     var output = std.ArrayList(u8).init(allocator);
     defer output.deinit();
 
-    // Single token list for next token embedding
+    // Generation buffer
     var single_token_list = std.ArrayList(u32).init(model.allocator);
     defer single_token_list.deinit();
 
     const max_tokens: usize = 100;
+
     generation: for (0..max_tokens) |_| {
         const logits = try model.lm_head(current_state, 1);
         defer model.allocator.free(logits);
 
-        const next_token = try sampleNextToken(logits);
+        // Simple argmax sampling
+        const next_token = @as(u32, @intCast(argmax(logits)));
 
-        // Check for EOS
         if (next_token == model.tokenizer.eos_token) {
             break :generation;
         }
 
-        // Decode and append to output
+        // Decode token and append to output
         single_token_list.clearRetainingCapacity();
         try single_token_list.append(next_token);
 
@@ -2938,10 +3099,17 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
     return output.toOwnedSlice();
 }
 
-fn sampleNextToken(logits: []f32) !u32 {
-    // Use argmax to find the index of the maximum logit
-    const max_index = argmax(logits);
-    return @intCast(max_index);
+fn merge_embeddings_with_image(text_start: []f32, image: []f32, text_rest: []f32, allocator: Allocator) ![]f32 {
+    const total_len = text_start.len + image.len + text_rest.len;
+    const merged = try allocator.alloc(f32, total_len);
+    errdefer allocator.free(merged);
+
+    // Copy in order: [text_start, image, text_rest]
+    @memcpy(merged[0..text_start.len], text_start);
+    @memcpy(merged[text_start.len .. text_start.len + image.len], image);
+    @memcpy(merged[text_start.len + image.len ..], text_rest);
+
+    return merged;
 }
 
 // main
