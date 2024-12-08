@@ -1426,6 +1426,8 @@ const Tokenizer = struct {
         var decoded_text = std.ArrayList(u8).init(self.allocator);
         errdefer decoded_text.deinit();
 
+        std.debug.print("Decoding tokens: {any}\n", .{tokens.items});
+
         for (tokens.items) |token_id| {
             var found = false;
             var token_it = self.tokens.iterator();
@@ -1671,46 +1673,6 @@ const Model = struct {
         return hidden_states;
     }
 
-    fn handle_kv_cache(
-        self: Self,
-        k: []f32,
-        v: []f32,
-        l: usize,
-        pos: usize,
-        q_len: usize,
-    ) !struct { k_out: []f32, v_out: []f32 } {
-        const dim = self.config.dim;
-        const kv_seq_len = pos + q_len;
-
-        // Allocate buffers for concatenated KV
-        const k_out = try self.allocator.alloc(f32, kv_seq_len * dim);
-        errdefer self.allocator.free(k_out);
-        const v_out = try self.allocator.alloc(f32, kv_seq_len * dim);
-        errdefer self.allocator.free(v_out);
-
-        // First copy existing cache if pos > 0
-        if (pos > 0) {
-            const l_off = self.config.seq_len * dim;
-            const cache_start = l * l_off;
-            const cache_len = pos * dim;
-
-            @memcpy(k_out[0..cache_len], self.state.k_cache[cache_start .. cache_start + cache_len]);
-            @memcpy(v_out[0..cache_len], self.state.v_cache[cache_start .. cache_start + cache_len]);
-        }
-
-        // Then append new KV
-        @memcpy(k_out[pos * dim ..], k);
-        @memcpy(v_out[pos * dim ..], v);
-
-        // Update cache
-        const l_off = self.config.seq_len * dim;
-        const cache_start = l * l_off;
-        @memcpy(self.state.k_cache[cache_start .. cache_start + kv_seq_len * dim], k_out);
-        @memcpy(self.state.v_cache[cache_start .. cache_start + kv_seq_len * dim], v_out);
-
-        return .{ .k_out = k_out, .v_out = v_out };
-    }
-
     const Complex = struct {
         real: f32,
         imag: f32,
@@ -1874,9 +1836,9 @@ const Model = struct {
 
     fn attention(
         self: Self,
-        q: []f32, // Already in head format [n_heads * q_len * head_dim]
-        k: []f32, // Already in head format
-        v: []f32, // Already in head format
+        q: []f32, // In head format [n_heads * q_len * head_dim]
+        k: []f32, // In head format
+        v: []f32, // In head format
         pos: usize,
         q_len: usize,
         l: usize,
@@ -1892,6 +1854,45 @@ const Model = struct {
         const mask = try attention_mask(self.allocator, pos, q_len);
         defer self.allocator.free(mask);
 
+        // Allocate concatenated k/v buffers
+        const k_concat = try self.allocator.alloc(f32, n_heads * kv_seq_len * head_dim);
+        const v_concat = try self.allocator.alloc(f32, n_heads * kv_seq_len * head_dim);
+        defer self.allocator.free(k_concat);
+        defer self.allocator.free(v_concat);
+
+        // For each head, concatenate cached and current k/v
+        const l_off = self.config.seq_len * dim;
+        const cache_start = l * l_off;
+
+        for (0..n_heads) |h| {
+            // Copy cached keys
+            if (pos > 0) {
+                for (0..pos) |j| {
+                    const cache_ptr = self.state.k_cache[cache_start + j * dim + h * head_dim ..];
+                    const concat_idx = h * kv_seq_len * head_dim + j * head_dim;
+                    @memcpy(k_concat[concat_idx .. concat_idx + head_dim], cache_ptr[0..head_dim]);
+                }
+                // Copy cached values
+                for (0..pos) |j| {
+                    const cache_ptr = self.state.v_cache[cache_start + j * dim + h * head_dim ..];
+                    const concat_idx = h * kv_seq_len * head_dim + j * head_dim;
+                    @memcpy(v_concat[concat_idx .. concat_idx + head_dim], cache_ptr[0..head_dim]);
+                }
+            }
+
+            // Copy current k/v
+            const h_offset = h * q_len * head_dim;
+            const concat_offset = h * kv_seq_len * head_dim + pos * head_dim;
+            @memcpy(
+                k_concat[concat_offset .. concat_offset + q_len * head_dim],
+                k[h_offset .. h_offset + q_len * head_dim],
+            );
+            @memcpy(
+                v_concat[concat_offset .. concat_offset + q_len * head_dim],
+                v[h_offset .. h_offset + q_len * head_dim],
+            );
+        }
+
         // Temporary buffers
         const scores = try self.allocator.alloc(f32, q_len * kv_seq_len);
         defer self.allocator.free(scores);
@@ -1903,29 +1904,23 @@ const Model = struct {
         // Process each head
         for (0..n_heads) |h| {
             const h_offset = h * q_len * head_dim;
-            const l_off = self.config.seq_len * dim;
-            const cache_start = l * l_off;
+            const h_k_offset = h * kv_seq_len * head_dim;
 
             // 1. Scaled dot product attention
             for (0..q_len) |i| {
                 for (0..kv_seq_len) |j| {
-                    // Get query and key
                     var score: f32 = 0;
-                    const k_ptr = if (j < pos)
-                        self.state.k_cache[cache_start + j * dim + h * head_dim ..]
-                    else
-                        k[h_offset + (j - pos) * head_dim ..];
+                    const q_ptr = q[h_offset + i * head_dim ..];
+                    const k_ptr = k_concat[h_k_offset + j * head_dim ..];
 
                     // Q * K^T
                     for (0..head_dim) |d| {
-                        score += q[h_offset + i * head_dim + d] * k_ptr[d];
+                        score += q_ptr[d] * k_ptr[d];
                     }
-                    score *= scale;
 
-                    // Apply mask
-                    score *= scale;
+                    // Apply scale and mask
                     const mask_idx = i * kv_seq_len + j;
-                    scores[i * kv_seq_len + j] = score + mask[mask_idx];
+                    scores[i * kv_seq_len + j] = score * scale + mask[mask_idx];
                 }
 
                 // Softmax per row
@@ -1937,10 +1932,7 @@ const Model = struct {
             for (0..q_len) |i| {
                 for (0..kv_seq_len) |j| {
                     const score = scores[i * kv_seq_len + j];
-                    const v_ptr = if (j < pos)
-                        self.state.v_cache[cache_start + j * dim + h * head_dim ..]
-                    else
-                        v[h_offset + (j - pos) * head_dim ..];
+                    const v_ptr = v_concat[h_k_offset + j * head_dim ..];
 
                     for (0..head_dim) |d| {
                         head_output[i * head_dim + d] += score * v_ptr[d];
@@ -1977,6 +1969,7 @@ const Model = struct {
             }
         }
     }
+
     fn mlp(self: Self, input: []f32, q_len: usize, l: usize, output: []f32) !void {
         const dim = self.config.dim;
         const hidden_dim = self.config.hidden_dim;
@@ -2280,7 +2273,7 @@ const Model = struct {
         const embedding = try self.allocator.alloc(f32, text_embed.len + image_embed.len);
         std.debug.print("Merging text embed of size {any} and image embed of size {any} \n", .{ text_embed.len / self.config.dim, image_embed.len / self.config.dim });
         @memcpy(embedding[0..image_embed.len], image_embed);
-        @memcpy(embedding[0..text_embed.len], text_embed);
+        @memcpy(embedding[image_embed.len..], text_embed);
         return embedding;
     }
     /// This function will load the images and then preprocess them into the required format
