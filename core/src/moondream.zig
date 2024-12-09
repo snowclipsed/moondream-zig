@@ -1532,14 +1532,34 @@ const Tokenizer = struct {
 
     // TODO: Write Decode Function.
     fn decode(self: *const Tokenizer, tokens: std.ArrayList(u32)) ![]const u8 {
-        std.debug.print("Decoding token: {any}\n", .{tokens.items});
+        std.debug.print("Decoding tokens: {any}\n", .{tokens.items});
         var decoded_text = std.ArrayList(u8).init(self.allocator);
         errdefer decoded_text.deinit();
 
         var need_space = false;
 
         for (tokens.items) |token_id| {
-            var found = false;
+            // First check special tokens
+            var special_token_found = false;
+            for (self.special_tokens.items) |special| {
+                if (special.id == token_id) {
+                    // Handle special token
+                    if (special.lstrip and need_space) {
+                        try decoded_text.append(' ');
+                    }
+                    try decoded_text.appendSlice(special.content);
+                    need_space = special.rstrip;
+                    special_token_found = true;
+                    break;
+                }
+            }
+
+            if (special_token_found) {
+                continue;
+            }
+
+            // Then check regular tokens
+            var regular_token_found = false;
             var token_it = self.tokens.iterator();
             while (token_it.next()) |entry| {
                 if (entry.value_ptr.* == token_id) {
@@ -1569,23 +1589,37 @@ const Tokenizer = struct {
                         try decoded_text.appendSlice(token);
                     }
 
-                    found = true;
+                    regular_token_found = true;
                     need_space = false;
                     break;
                 }
             }
 
-            if (!found) {
+            if (!regular_token_found) {
+                // Handle special control tokens
+                if (token_id == self.eos_token) {
+                    // End of sequence token - can optionally add specific handling
+                    continue;
+                }
+                if (token_id == self.bos_token) {
+                    // Beginning of sequence token - can optionally add specific handling
+                    continue;
+                }
+                if (token_id == self.pad_token) {
+                    // Padding token - typically ignored in decoding
+                    continue;
+                }
+
+                // Handle raw bytes as last resort
                 if (token_id < 256) {
-                    // Handle raw bytes
                     try decoded_text.append(@intCast(token_id));
                 } else {
                     return error.TokenNotFound;
                 }
             }
         }
-        std.debug.print("Decoded text: {any}\n", .{decoded_text.items});
 
+        std.debug.print("Decoded text: {any}\n", .{decoded_text.items});
         return decoded_text.toOwnedSlice();
     }
 
@@ -1659,7 +1693,6 @@ const Model = struct {
 
     fn text_model(self: Self, embeddings: []f32, pos: usize) ![]f32 {
         assert(embeddings.len % self.config.dim == 0);
-
         const eps = 1e-5;
         const dim = self.config.dim;
         // const n_heads = self.config.n_heads;
@@ -1670,12 +1703,13 @@ const Model = struct {
             return error.SequenceTooLong;
         }
 
-        // Allocate buffers
+        // Input shape: [seq_len, dim]
         const hidden_states = try self.allocator.alloc(f32, embeddings.len);
         errdefer self.allocator.free(hidden_states);
 
-        const ln_in = try self.allocator.alloc(f32, embeddings.len);
-        defer self.allocator.free(ln_in);
+        // Pre-allocate buffers for the entire layer
+        const ln_out = try self.allocator.alloc(f32, embeddings.len);
+        defer self.allocator.free(ln_out);
 
         const attn_output = try self.allocator.alloc(f32, embeddings.len);
         defer self.allocator.free(attn_output);
@@ -1683,31 +1717,30 @@ const Model = struct {
         const mlp_output = try self.allocator.alloc(f32, embeddings.len);
         defer self.allocator.free(mlp_output);
 
-        // Copy input embeddings
         @memcpy(hidden_states, embeddings);
 
-        // Main layer loop
+        // Main layer loop - following PyTorch's ordering exactly
         for (0..self.config.n_layers) |l| {
-            // 1. Layer Norm
-            @memcpy(ln_in, hidden_states);
+            // 1. Layer Norm with shape [seq_len, dim]
+            @memcpy(ln_out, hidden_states);
+            const normalized_shape = [_]usize{dim};
             try layer_norm(
-                ln_in,
-                &[_]usize{dim},
+                ln_out,
+                &normalized_shape,
                 self.weights.t_ln_w[l * dim .. (l + 1) * dim],
                 self.weights.t_ln_b[l * dim .. (l + 1) * dim],
                 eps,
             );
 
-            // Debug normalized input
-            debug_tensor("ln_in", ln_in, l);
+            debug_tensor("layer_norm", ln_out, l);
 
-            // 2. Attention block
-            try self.attention_block(ln_in, pos, q_len, l, attn_output);
-            debug_tensor("attn_out", attn_output, l);
+            // 2. Attention Block
+            try self.attention_block(ln_out, pos, q_len, l, attn_output);
+            debug_tensor("attention_output", attn_output, l);
 
-            // 3. MLP using same normalized input as attention
-            try self.mlp(ln_in, q_len, l, mlp_output);
-            debug_tensor("mlp_out", mlp_output, l);
+            // 3. MLP - takes layer normalized input just like PyTorch
+            try self.mlp(ln_out, q_len, l, mlp_output);
+            debug_tensor("mlp_output", mlp_output, l);
 
             // 4. Residual connections
             for (0..hidden_states.len) |i| {
@@ -1910,7 +1943,7 @@ const Model = struct {
         const n_heads = self.config.n_heads;
         const head_dim = self.config.head_dim;
 
-        // 1. QKV projection - [seq_len, dim] -> [seq_len, 3*dim]
+        // 1. QKV Projection [seq_len, dim] -> [seq_len, 3*dim]
         const qkv = try self.allocator.alloc(f32, q_len * dim * 3);
         defer self.allocator.free(qkv);
 
@@ -1926,12 +1959,13 @@ const Model = struct {
 
         // Add QKV bias
         for (0..q_len) |seq| {
-            accumulate(qkv[seq * dim * 3 .. (seq + 1) * dim * 3], self.weights.t_Wqkv_b[layer * dim * 3 .. (layer + 1) * dim * 3]);
+            const bias = self.weights.t_Wqkv_b[layer * dim * 3 .. (layer + 1) * dim * 3];
+            accumulate(qkv[seq * dim * 3 .. (seq + 1) * dim * 3], bias);
         }
 
         debug_tensor("qkv_projected", qkv, layer);
 
-        // 2. Split and reshape QKV to [n_heads, seq_len, head_dim]
+        // 2. Split QKV and reshape to [n_heads, seq_len, head_dim]
         const q = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
         const k = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
         const v = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
@@ -1939,25 +1973,10 @@ const Model = struct {
         defer self.allocator.free(k);
         defer self.allocator.free(v);
 
-        // Split QKV and reshape
-        for (0..q_len) |seq_idx| {
-            for (0..n_heads) |h| {
-                for (0..head_dim) |d| {
-                    const src_q = seq_idx * (dim * 3) + h * head_dim + d;
-                    const src_k = src_q + dim;
-                    const src_v = src_k + dim;
-                    const dst = h * q_len * head_dim + seq_idx * head_dim + d;
-
-                    q[dst] = qkv[src_q];
-                    k[dst] = qkv[src_k];
-                    v[dst] = qkv[src_v];
-                }
-            }
-        }
-
-        debug_tensor("q_reshaped", q, layer);
-        debug_tensor("k_reshaped", k, layer);
-        debug_tensor("v_reshaped", v, layer);
+        try self.split_qkv(qkv, q, k, v, q_len);
+        debug_tensor("q_split", q, layer);
+        debug_tensor("k_split", k, layer);
+        debug_tensor("v_split", v, layer);
 
         // 3. Apply rotary embeddings
         const position_ids = try self.allocator.alloc(usize, q_len);
@@ -1972,53 +1991,71 @@ const Model = struct {
         debug_tensor("q_rotary", q, layer);
         debug_tensor("k_rotary", k, layer);
 
-        // 4. Process KV cache if needed
+        // 4. Handle KV Cache - matching PyTorch's dimension ordering
         const past_seq_len = if (pos > 0) @min(pos, self.config.seq_len - q_len) else 0;
         const total_seq_len = past_seq_len + q_len;
 
-        var k_combined: []f32 = undefined;
-        var v_combined: []f32 = undefined;
+        var k_combined = k;
+        var v_combined = v;
 
         if (past_seq_len > 0) {
-            // Allocate combined K/V buffers for past + present
-            k_combined = try self.allocator.alloc(f32, n_heads * total_seq_len * head_dim);
-            v_combined = try self.allocator.alloc(f32, n_heads * total_seq_len * head_dim);
-            defer self.allocator.free(k_combined);
-            defer self.allocator.free(v_combined);
+            // Get cached KV for this layer in [n_heads, past_seq_len, head_dim] format
+            const cache_offset = layer * self.config.seq_len * n_heads * head_dim;
+            const cache_k = self.state.k_cache[cache_offset .. cache_offset + past_seq_len * n_heads * head_dim];
+            const cache_v = self.state.v_cache[cache_offset .. cache_offset + past_seq_len * n_heads * head_dim];
 
-            // Get cached KV for this layer
-            const cache_offset = layer * self.config.seq_len * dim;
-            const cache_k = self.state.k_cache[cache_offset .. cache_offset + past_seq_len * dim];
-            const cache_v = self.state.v_cache[cache_offset .. cache_offset + past_seq_len * dim];
-
-            // Copy past cache
-            @memcpy(k_combined[0 .. past_seq_len * n_heads * head_dim], cache_k);
-            @memcpy(v_combined[0 .. past_seq_len * n_heads * head_dim], cache_v);
-
-            // Copy current k/v
-            @memcpy(k_combined[past_seq_len * n_heads * head_dim ..], k);
-            @memcpy(v_combined[past_seq_len * n_heads * head_dim ..], v);
-        } else {
-            k_combined = k;
-            v_combined = v;
+            // Concatenate along seq_len dimension
+            k_combined = try self.concat_cache(k, cache_k, n_heads, q_len, past_seq_len, head_dim);
+            v_combined = try self.concat_cache(v, cache_v, n_heads, q_len, past_seq_len, head_dim);
         }
 
-        // 5. Update KV cache with current values
-        const cache_start = layer * self.config.seq_len * dim + pos * dim;
-        const cache_len = q_len * dim;
+        // 5. Update KV Cache with current values
+        const cache_start = layer * self.config.seq_len * n_heads * head_dim + pos * n_heads * head_dim;
+        const cache_len = q_len * n_heads * head_dim;
         @memcpy(self.state.k_cache[cache_start .. cache_start + cache_len], k);
         @memcpy(self.state.v_cache[cache_start .. cache_start + cache_len], v);
 
-        // 6. Compute attention scores
-        try self.scaled_dot_product_attention(q, k_combined, v_combined, pos, q_len, total_seq_len, layer, output);
+        // 6. Compute attention
+        try self.scaled_dot_product_attention(q, k_combined, v_combined, q_len, total_seq_len, layer, output);
+    }
+
+    fn split_qkv(self: Self, qkv: []const f32, q: []f32, k: []f32, v: []f32, q_len: usize) !void {
+        const dim = self.config.dim;
+        const n_heads = self.config.n_heads;
+        const head_dim = self.config.head_dim;
+
+        // Split and reshape following PyTorch's chunk(3) -> view -> transpose operations
+        for (0..q_len) |seq_idx| {
+            for (0..n_heads) |h| {
+                for (0..head_dim) |d| {
+                    // First chunk into q,k,v sections
+                    const chunk_size = dim;
+                    const q_chunk_start = seq_idx * (dim * 3);
+                    const k_chunk_start = q_chunk_start + chunk_size;
+                    const v_chunk_start = k_chunk_start + chunk_size;
+
+                    // Then handle head offset within each chunk
+                    const head_offset = h * head_dim;
+                    const q_src = q_chunk_start + head_offset + d;
+                    const k_src = k_chunk_start + head_offset + d;
+                    const v_src = v_chunk_start + head_offset + d;
+
+                    // Write to [n_heads, seq_len, head_dim] format
+                    const dst = h * (q_len * head_dim) + seq_idx * head_dim + d;
+
+                    q[dst] = qkv[q_src];
+                    k[dst] = qkv[k_src];
+                    v[dst] = qkv[v_src];
+                }
+            }
+        }
     }
 
     fn scaled_dot_product_attention(
         self: Self,
-        q: []f32,
-        k: []f32,
-        v: []f32,
-        pos: usize,
+        q: []const f32,
+        k: []const f32,
+        v: []const f32,
         q_len: usize,
         total_seq_len: usize,
         layer: usize,
@@ -2029,94 +2066,83 @@ const Model = struct {
         const head_dim = self.config.head_dim;
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-        // Get attention mask
+        // Create attention mask matching PyTorch
         const attn_mask = try self.allocator.alloc(f32, q_len * total_seq_len);
         defer self.allocator.free(attn_mask);
-        try make_attention_mask(attn_mask, pos, q_len, total_seq_len);
+        try make_attention_mask(attn_mask, q_len, total_seq_len);
 
-        // Compute attention scores for each head: [n_heads, q_len, total_seq_len]
+        // Allocate score matrices
         const scores = try self.allocator.alloc(f32, n_heads * q_len * total_seq_len);
         defer self.allocator.free(scores);
 
+        // Compute attention scores for each head
         for (0..n_heads) |h| {
-            const h_offset = h * q_len * head_dim;
-            const score_offset = h * q_len * total_seq_len;
+            const q_head = q[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
+            const k_head = k[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
+            const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
 
-            for (0..q_len) |i| {
-                for (0..total_seq_len) |j| {
-                    var score: f32 = 0;
-                    const q_off = h_offset + i * head_dim;
-                    const k_off = h * total_seq_len * head_dim + j * head_dim;
+            // Matrix multiply Q @ K.T
+            try matmul(
+                self.allocator,
+                q_head,
+                k_head,
+                scores_head,
+                q_len,
+                total_seq_len,
+                head_dim,
+            );
 
-                    // Compute dot product
-                    for (0..head_dim) |d| {
-                        score += q[q_off + d] * k[k_off + d];
-                    }
-                    score *= scale;
-
-                    // Apply mask
-                    score += attn_mask[i * total_seq_len + j];
-                    scores[score_offset + i * total_seq_len + j] = score;
-                }
+            // Scale and add mask
+            for (scores_head, 0..) |*score, i| {
+                score.* *= scale;
+                score.* += attn_mask[i];
             }
-        }
 
-        // Apply softmax row-wise
-        for (0..n_heads) |h| {
-            for (0..q_len) |i| {
-                const row_start = h * q_len * total_seq_len + i * total_seq_len;
-                const row = scores[row_start .. row_start + total_seq_len];
+            // Apply softmax row-wise
+            var i: usize = 0;
+            while (i < q_len) : (i += 1) {
+                const row_start = i * total_seq_len;
+                const row = scores_head[row_start .. row_start + total_seq_len];
                 try apply_softmax(row);
             }
         }
 
-        debug_tensor("attention_scores", scores, layer);
+        // Compute attention output
+        const attn_out = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        defer self.allocator.free(attn_out);
 
-        // Compute weighted sum of values
-        const attn_output = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
-        defer self.allocator.free(attn_output);
-
+        // For each head, multiply scores @ V
         for (0..n_heads) |h| {
-            const h_score_offset = h * q_len * total_seq_len;
-            const h_v_offset = h * total_seq_len * head_dim;
-            const h_out_offset = h * q_len * head_dim;
+            const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
+            const v_head = v[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
+            const out_head = attn_out[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
 
-            for (0..q_len) |i| {
-                const out_off = h_out_offset + i * head_dim;
-                const score_row = h_score_offset + i * total_seq_len;
-
-                // Initialize output to 0
-                @memset(attn_output[out_off .. out_off + head_dim], 0);
-
-                // Weighted sum of values
-                for (0..total_seq_len) |j| {
-                    const v_off = h_v_offset + j * head_dim;
-                    const score = scores[score_row + j];
-
-                    for (0..head_dim) |d| {
-                        attn_output[out_off + d] += score * v[v_off + d];
-                    }
-                }
-            }
+            try matmul(
+                self.allocator,
+                scores_head,
+                v_head,
+                out_head,
+                q_len,
+                head_dim,
+                total_seq_len,
+            );
         }
 
-        debug_tensor("attention_output", attn_output, layer);
-
-        // 7. Reshape attention output back to [seq_len, dim]
+        // Reshape attention output from [n_heads, q_len, head_dim] to [q_len, dim]
         const reshaped = try self.allocator.alloc(f32, q_len * dim);
         defer self.allocator.free(reshaped);
 
         for (0..q_len) |i| {
             for (0..n_heads) |h| {
                 for (0..head_dim) |d| {
-                    const src = h * q_len * head_dim + i * head_dim + d;
-                    const dst = i * dim + h * head_dim + d;
-                    reshaped[dst] = attn_output[src];
+                    const src_idx = h * q_len * head_dim + i * head_dim + d;
+                    const dst_idx = i * dim + h * head_dim + d;
+                    reshaped[dst_idx] = attn_out[src_idx];
                 }
             }
         }
 
-        // 8. Final linear projection
+        // Final output projection
         try matmul(
             self.allocator,
             reshaped,
@@ -2129,23 +2155,54 @@ const Model = struct {
 
         // Add output projection bias
         for (0..q_len) |seq| {
-            accumulate(output[seq * dim .. (seq + 1) * dim], self.weights.t_out_proj_bias[layer * dim .. (layer + 1) * dim]);
+            const bias = self.weights.t_out_proj_bias[layer * dim .. (layer + 1) * dim];
+            accumulate(output[seq * dim .. (seq + 1) * dim], bias);
         }
     }
 
-    fn make_attention_mask(mask: []f32, pos: usize, q_len: usize, total_seq_len: usize) !void {
-        // Create causal mask that aligns with bottom right, matching PyTorch
+    fn make_attention_mask(mask: []f32, q_len: usize, total_seq_len: usize) !void {
+        // PyTorch:
+        // mask = torch.ones(seq_len, pos + seq_len, dtype=torch.bool)
+        // mask[:, pos:] = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+
+        // First set mask for past tokens (up to pos)
+        const past_len = total_seq_len - q_len;
+
         for (0..q_len) |i| {
             for (0..total_seq_len) |j| {
                 const idx = i * total_seq_len + j;
-                if (j < pos) {
-                    mask[idx] = 0; // Allow attending to all past tokens
+
+                if (j < past_len) {
+                    // Allow attention to all past tokens
+                    mask[idx] = 0;
                 } else {
-                    // Causal masking for current segment
-                    mask[idx] = if (j - pos <= i) 0 else -std.math.inf(f32);
+                    // Causal mask for current segment
+                    const relative_pos = j - past_len;
+                    mask[idx] = if (relative_pos <= i) 0 else -std.math.inf(f32);
                 }
             }
         }
+    }
+
+    fn concat_cache(self: Self, current: []const f32, cache: []const f32, n_heads: usize, q_len: usize, past_len: usize, head_dim: usize) ![]f32 {
+        const total_len = past_len + q_len;
+        var combined = try self.allocator.alloc(f32, n_heads * total_len * head_dim);
+        errdefer self.allocator.free(combined);
+
+        // Concatenate maintaining [n_heads, seq_len, head_dim] format
+        for (0..n_heads) |h| {
+            const head_offset = h * total_len * head_dim;
+            const past_head_offset = h * past_len * head_dim;
+            const curr_head_offset = h * q_len * head_dim;
+
+            // Copy past cache for this head
+            @memcpy(combined[head_offset..][0 .. past_len * head_dim], cache[past_head_offset..][0 .. past_len * head_dim]);
+
+            // Copy current keys/values for this head
+            @memcpy(combined[head_offset + past_len * head_dim ..][0 .. q_len * head_dim], current[curr_head_offset..][0 .. q_len * head_dim]);
+        }
+
+        return combined;
     }
 
     fn apply_softmax(x: []f32) !void {
@@ -3128,8 +3185,8 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
     const text_embed = try model.embed_tokens(initial_tokens);
     defer model.allocator.free(text_embed);
 
-    const init_embedding = try model.merge_embed(text_embed, model.state.projection);
-    // const init_embedding = model.state.projection;
+    // const init_embedding = try model.merge_embed(text_embed, model.state.projection);
+    const init_embedding = text_embed;
     defer allocator.free(init_embedding);
 
     var pos: usize = 0;
@@ -3146,7 +3203,7 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
     var single_token_list = std.ArrayList(u32).init(model.allocator);
     defer single_token_list.deinit();
 
-    const max_tokens: usize = 50;
+    const max_tokens: usize = 10;
 
     generation: for (0..max_tokens) |i| {
         if (pos >= model.config.seq_len) {
@@ -3261,7 +3318,7 @@ pub fn main() !void {
     // Constants //
     const bin_path: []const u8 = "../moondream_f32.bin";
     const config_path: ?[]const u8 = "../model_config.json";
-    const image_path: []const u8 = "images/catmonitor.png";
+    const image_path: []const u8 = "images/demo-1.jpg";
 
     // Start of loading config file //
     const config_file = try std.fs.cwd().openFile(config_path.?, .{}); // TODO: Add filereader inside the init function for config itself.
