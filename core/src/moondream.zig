@@ -1736,7 +1736,6 @@ const Model = struct {
 
             // 2. Attention Block
             try self.attention_block(ln_out, pos, q_len, l, attn_output);
-            debug_tensor("attention_output", attn_output, l);
 
             // 3. MLP - takes layer normalized input just like PyTorch
             try self.mlp(ln_out, q_len, l, mlp_output);
@@ -2024,21 +2023,16 @@ const Model = struct {
         const n_heads = self.config.n_heads;
         const head_dim = self.config.head_dim;
 
-        // Split and reshape following PyTorch's chunk(3) -> view -> transpose operations
+        // First chunk the QKV into separate q,k,v segments
         for (0..q_len) |seq_idx| {
+            const qkv_start = seq_idx * (dim * 3);
+
             for (0..n_heads) |h| {
                 for (0..head_dim) |d| {
-                    // First chunk into q,k,v sections
-                    const chunk_size = dim;
-                    const q_chunk_start = seq_idx * (dim * 3);
-                    const k_chunk_start = q_chunk_start + chunk_size;
-                    const v_chunk_start = k_chunk_start + chunk_size;
-
-                    // Then handle head offset within each chunk
-                    const head_offset = h * head_dim;
-                    const q_src = q_chunk_start + head_offset + d;
-                    const k_src = k_chunk_start + head_offset + d;
-                    const v_src = v_chunk_start + head_offset + d;
+                    // Calculate source indices within each chunk
+                    const q_src = qkv_start + h * head_dim + d;
+                    const k_src = qkv_start + dim + h * head_dim + d;
+                    const v_src = qkv_start + 2 * dim + h * head_dim + d;
 
                     // Write to [n_heads, seq_len, head_dim] format
                     const dst = h * (q_len * head_dim) + seq_idx * head_dim + d;
@@ -2098,6 +2092,8 @@ const Model = struct {
                 score.* += attn_mask[i];
             }
 
+            debug_tensor("raw_scores", scores_head, layer);
+
             // Apply softmax row-wise
             var i: usize = 0;
             while (i < q_len) : (i += 1) {
@@ -2105,6 +2101,8 @@ const Model = struct {
                 const row = scores_head[row_start .. row_start + total_seq_len];
                 try apply_softmax(row);
             }
+
+            debug_tensor("attention_probs", scores_head, layer);
         }
 
         // Compute attention output
@@ -2127,6 +2125,7 @@ const Model = struct {
                 total_seq_len,
             );
         }
+        debug_tensor("attention_output_before_reshape", attn_out, layer);
 
         // Reshape attention output from [n_heads, q_len, head_dim] to [q_len, dim]
         const reshaped = try self.allocator.alloc(f32, q_len * dim);
@@ -2141,6 +2140,8 @@ const Model = struct {
                 }
             }
         }
+
+        debug_tensor("attention_output_reshaped", reshaped, layer);
 
         // Final output projection
         try matmul(
@@ -2158,6 +2159,8 @@ const Model = struct {
             const bias = self.weights.t_out_proj_bias[layer * dim .. (layer + 1) * dim];
             accumulate(output[seq * dim .. (seq + 1) * dim], bias);
         }
+
+        debug_tensor("attention_output_projected", output, layer);
     }
 
     fn make_attention_mask(mask: []f32, q_len: usize, total_seq_len: usize) !void {
@@ -2497,7 +2500,7 @@ const Model = struct {
             }
 
             // Calculate final variance
-            const variance = m2 / count;
+            const variance = m2 / (count - 1);
             const inv_std = 1.0 / @sqrt(variance + eps);
 
             // Normalize and apply affine transform if provided
