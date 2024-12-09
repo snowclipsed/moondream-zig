@@ -1732,14 +1732,14 @@ const Model = struct {
                 eps,
             );
 
-            debug_tensor("layer_norm", ln_out, l);
+            // debug_tensor("layer_norm", ln_out, l);
 
             // 2. Attention Block
             try self.attention_block(ln_out, pos, q_len, l, attn_output);
 
             // 3. MLP - takes layer normalized input just like PyTorch
             try self.mlp(ln_out, q_len, l, mlp_output);
-            debug_tensor("mlp_output", mlp_output, l);
+            // debug_tensor("mlp_output", mlp_output, l);
 
             // 4. Residual connections
             for (0..hidden_states.len) |i| {
@@ -1962,7 +1962,7 @@ const Model = struct {
             accumulate(qkv[seq * dim * 3 .. (seq + 1) * dim * 3], bias);
         }
 
-        debug_tensor("qkv_projected", qkv, layer);
+        // debug_tensor("qkv_projected", qkv, layer);
 
         // 2. Split QKV and reshape to [n_heads, seq_len, head_dim]
         const q = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
@@ -1973,9 +1973,9 @@ const Model = struct {
         defer self.allocator.free(v);
 
         try self.split_qkv(qkv, q, k, v, q_len);
-        debug_tensor("q_split", q, layer);
-        debug_tensor("k_split", k, layer);
-        debug_tensor("v_split", v, layer);
+        // debug_tensor("q_split", q, layer);
+        // debug_tensor("k_split", k, layer);
+        // debug_tensor("v_split", v, layer);
 
         // 3. Apply rotary embeddings
         const position_ids = try self.allocator.alloc(usize, q_len);
@@ -1987,8 +1987,8 @@ const Model = struct {
         try self.apply_rotary_emb(q, self.freqs_cis, position_ids, q);
         try self.apply_rotary_emb(k, self.freqs_cis, position_ids, k);
 
-        debug_tensor("q_rotary", q, layer);
-        debug_tensor("k_rotary", k, layer);
+        // debug_tensor("q_rotary", q, layer);
+        // debug_tensor("k_rotary", k, layer);
 
         // 4. Handle KV Cache - matching PyTorch's dimension ordering
         const past_seq_len = if (pos > 0) @min(pos, self.config.seq_len - q_len) else 0;
@@ -2060,10 +2060,10 @@ const Model = struct {
         const head_dim = self.config.head_dim;
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-        // Create attention mask matching PyTorch
+        // Create attention mask
         const attn_mask = try self.allocator.alloc(f32, q_len * total_seq_len);
         defer self.allocator.free(attn_mask);
-        try make_attention_mask(attn_mask, q_len, total_seq_len);
+        make_attention_mask(attn_mask, q_len, total_seq_len);
 
         // Allocate score matrices
         const scores = try self.allocator.alloc(f32, n_heads * q_len * total_seq_len);
@@ -2075,36 +2075,59 @@ const Model = struct {
             const k_head = k[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
             const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
 
-            // Matrix multiply Q @ K.T
+            // 1. Transpose K for Q @ K.T
+            const k_head_t = try self.allocator.alloc(f32, total_seq_len * head_dim);
+            defer self.allocator.free(k_head_t);
+
+            for (0..total_seq_len) |i| {
+                for (0..head_dim) |j| {
+                    k_head_t[j * total_seq_len + i] = k_head[i * head_dim + j];
+                }
+            }
+
+            // 2. Compute Q @ K.T
             try matmul(
                 self.allocator,
                 q_head,
-                k_head,
+                k_head_t,
                 scores_head,
                 q_len,
                 total_seq_len,
                 head_dim,
             );
 
-            // Scale and add mask
-            for (scores_head, 0..) |*score, i| {
-                score.* *= scale;
-                score.* += attn_mask[i];
+            if (h == 0) {
+                debug_tensor("pre_scale_scores", scores_head, layer);
             }
 
-            debug_tensor("raw_scores", scores_head, layer);
+            // 3. Scale scores
+            for (scores_head) |*score| {
+                score.* *= scale;
+            }
 
-            // Apply softmax row-wise
+            if (h == 0) {
+                debug_tensor("pre_mask_scores", scores_head, layer);
+            }
+
+            // 4. Apply mask by setting masked positions to negative infinity
+            for (scores_head, 0..) |*score, i| {
+                if (attn_mask[i] == 0.0) {
+                    score.* = -std.math.inf(f32);
+                }
+            }
+
+            if (h == 0) {
+                debug_tensor("post_mask_scores", scores_head, layer);
+            }
+
+            // 5. Apply softmax row-wise
             var i: usize = 0;
             while (i < q_len) : (i += 1) {
                 const row_start = i * total_seq_len;
                 const row = scores_head[row_start .. row_start + total_seq_len];
                 try apply_softmax(row);
             }
-
-            debug_tensor("attention_probs", scores_head, layer);
         }
-
         // Compute attention output
         const attn_out = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
         defer self.allocator.free(attn_out);
@@ -2125,7 +2148,7 @@ const Model = struct {
                 total_seq_len,
             );
         }
-        debug_tensor("attention_output_before_reshape", attn_out, layer);
+        // debug_tensor("attention_output_before_reshape", attn_out, layer);
 
         // Reshape attention output from [n_heads, q_len, head_dim] to [q_len, dim]
         const reshaped = try self.allocator.alloc(f32, q_len * dim);
@@ -2141,7 +2164,7 @@ const Model = struct {
             }
         }
 
-        debug_tensor("attention_output_reshaped", reshaped, layer);
+        // debug_tensor("attention_output_reshaped", reshaped, layer);
 
         // Final output projection
         try matmul(
@@ -2160,29 +2183,19 @@ const Model = struct {
             accumulate(output[seq * dim .. (seq + 1) * dim], bias);
         }
 
-        debug_tensor("attention_output_projected", output, layer);
+        // debug_tensor("attention_output_projected", output, layer);
     }
-
-    fn make_attention_mask(mask: []f32, q_len: usize, total_seq_len: usize) !void {
-        // PyTorch:
-        // mask = torch.ones(seq_len, pos + seq_len, dtype=torch.bool)
-        // mask[:, pos:] = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
-
-        // First set mask for past tokens (up to pos)
+    pub fn make_attention_mask(mask: []f32, q_len: usize, total_seq_len: usize) void {
         const past_len = total_seq_len - q_len;
 
-        for (0..q_len) |i| {
-            for (0..total_seq_len) |j| {
-                const idx = i * total_seq_len + j;
+        // Fill with ones
+        @memset(mask, 1.0);
 
-                if (j < past_len) {
-                    // Allow attention to all past tokens
-                    mask[idx] = 0;
-                } else {
-                    // Causal mask for current segment
-                    const relative_pos = j - past_len;
-                    mask[idx] = if (relative_pos <= i) 0 else -std.math.inf(f32);
-                }
+        // Create triangular pattern for current context
+        for (0..q_len) |i| {
+            for (0..q_len) |j| {
+                const mask_idx = i * total_seq_len + (past_len + j);
+                mask[mask_idx] = if (j <= i) 1.0 else 0.0;
             }
         }
     }
