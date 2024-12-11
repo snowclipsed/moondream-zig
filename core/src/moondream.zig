@@ -218,6 +218,31 @@ pub fn accumulate(accum: []f32, x: []const f32) void {
     }
 }
 
+pub fn broadcast_add(dest: []f32, bias: []const f32, seq_len: usize) void {
+    const feat_dim = bias.len;
+    const VectorSize = std.simd.suggestVectorLength(f32) orelse 8;
+    const VectorType = @Vector(VectorSize, f32);
+
+    // For each sequence position
+    for (0..seq_len) |seq| {
+        const offset = seq * feat_dim;
+        var i: usize = 0;
+
+        // Process in SIMD-sized chunks
+        while (i + VectorSize <= feat_dim) : (i += VectorSize) {
+            var v_dest = @as(*align(4) VectorType, @ptrCast(dest[offset + i ..].ptr)).*;
+            const v_bias = @as(*align(4) const VectorType, @ptrCast(bias[i..].ptr)).*;
+            v_dest += v_bias;
+            @as(*align(4) VectorType, @ptrCast(dest[offset + i ..].ptr)).* = v_dest;
+        }
+
+        // Handle remaining elements
+        while (i < feat_dim) : (i += 1) {
+            dest[offset + i] += bias[i];
+        }
+    }
+}
+
 fn transposeSimd(allocator: std.mem.Allocator, matrix: []const f32, rows: usize, cols: usize) ![]f32 {
     // Ensure aligned allocation
     const alignment = 16; // For Vector(4, f32)
@@ -1268,8 +1293,8 @@ const RunState = struct {
             .v_attn = try allocator.alignedAlloc(f32, simd_align, total_patches * total_patches * config.n_vit_heads),
             .v_output = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
             .v_proj = try allocator.alignedAlloc(f32, simd_align, total_patches * config.vit_dim),
-            .k_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
-            .v_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.dim),
+            .k_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.n_heads * config.head_dim),
+            .v_cache = try allocator.alignedAlloc(f32, simd_align, config.n_layers * config.seq_len * config.n_heads * config.head_dim),
             .cos_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.head_dim / 2),
             .sin_cache = try allocator.alignedAlloc(f32, simd_align, config.max_pos_embeddings * config.head_dim / 2), // hardcoding the partial rotary factor as 1/2 here
             // .emb = try allocator.alignedAlloc(f32, simd_align, config.dim),
@@ -1368,7 +1393,7 @@ const Tokenizer = struct {
         const num_special = try reader.readInt(u32, .little);
         std.debug.print("Loading {} special tokens\n", .{num_special});
 
-        for (0..num_special) |i| {
+        for (0..num_special) |_| {
             // Read token metadata
             const token_id = try reader.readInt(u32, .little);
             const token_len = try reader.readInt(u32, .little);
@@ -1399,7 +1424,7 @@ const Tokenizer = struct {
                 .normalized = normalized,
             });
 
-            std.debug.print("Loaded special token {}: id={}, content='{s}'\n", .{ i, token_id, content });
+            // std.debug.print("Loaded special token {}: id={}, content='{s}'\n", .{ i, token_id, content });
         }
 
         // Read merges
@@ -1619,7 +1644,7 @@ const Tokenizer = struct {
             }
         }
 
-        std.debug.print("Decoded text: {any}\n", .{decoded_text.items});
+        // std.debug.print("Decoded text: {any}\n", .{decoded_text.items});
         return decoded_text.toOwnedSlice();
     }
 
@@ -1690,64 +1715,341 @@ const Model = struct {
 
         return model;
     }
-
-    fn text_model(self: Self, embeddings: []f32, pos: usize) ![]f32 {
-        assert(embeddings.len % self.config.dim == 0);
-        const eps = 1e-5;
+    fn text_model(self: Self, embeddings: []const f32, pos: usize) ![]f32 {
         const dim = self.config.dim;
-        // const n_heads = self.config.n_heads;
-        // const head_dim = self.config.head_dim;
         const q_len = embeddings.len / dim;
 
-        if (pos + q_len > self.config.seq_len) {
+        var hidden_states = try self.allocator.alloc(f32, q_len * dim);
+        @memcpy(hidden_states, embeddings);
+
+        for (0..self.config.n_layers) |l| {
+            // First apply layer norm
+            const ln_in = try self.allocator.alloc(f32, q_len * dim);
+            defer self.allocator.free(ln_in);
+            @memcpy(ln_in, hidden_states);
+
+            // Layer norm before attention
+            try layer_norm(ln_in, &.{dim}, self.weights.t_ln_w[l * dim .. (l + 1) * dim], self.weights.t_ln_b[l * dim .. (l + 1) * dim], 1e-5);
+
+            // Attention using normalized input
+            const attn_out = try self.allocator.alloc(f32, q_len * dim);
+            defer self.allocator.free(attn_out);
+            try self.attention_block(ln_in, pos, q_len, l, attn_out);
+
+            // MLP using normalized input
+            const mlp_out = try self.allocator.alloc(f32, q_len * dim);
+            defer self.allocator.free(mlp_out);
+            try self.mlp(ln_in, q_len, l, mlp_out);
+
+            // Residual connections
+            for (0..q_len * dim) |i| {
+                hidden_states[i] += attn_out[i] + mlp_out[i];
+            }
+        }
+        return hidden_states;
+    }
+
+    fn lm_head(self: Self, hidden_states: []f32) ![]f32 {
+        const dim = self.config.dim;
+        const vocab_size = self.config.vocab;
+
+        // Only take the last token's hidden state
+        // const last_hidden = hidden_states[(q_len - 1) * dim .. q_len * dim];
+
+        // Normalize before projection
+        const normalized = try self.allocator.alloc(f32, dim);
+        defer self.allocator.free(normalized);
+        @memcpy(normalized, hidden_states);
+
+        try layer_norm(normalized, &.{dim}, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
+
+        // Project to vocabulary
+        const logits = try self.allocator.alloc(f32, vocab_size);
+        try matmul(self.allocator, normalized, self.weights.t_linear_w, logits, 1, vocab_size, dim);
+
+        accumulate(logits, self.weights.t_linear_b);
+
+        return logits;
+    }
+
+    fn attention_block(self: Self, x: []f32, pos: usize, q_len: usize, layer: usize, output: []f32) !void {
+        const dim = self.config.dim;
+        const n_heads = self.config.n_heads;
+        const head_dim = self.config.head_dim;
+
+        // 1. QKV Projection [seq_len, dim] -> [seq_len, 3*dim]
+        const qkv = try self.allocator.alloc(f32, q_len * dim * 3);
+        defer self.allocator.free(qkv);
+
+        // debug_tensor("x : ", x, layer);
+
+        try matmul(
+            self.allocator,
+            x,
+            self.weights.t_Wqkv_w[layer * dim * 3 * dim .. (layer + 1) * dim * 3 * dim],
+            qkv,
+            q_len,
+            dim * 3,
+            dim,
+        );
+
+        // Add QKV bias
+        const bias = self.weights.t_Wqkv_b[layer * dim * 3 .. (layer + 1) * dim * 3];
+        broadcast_add(qkv, bias, q_len);
+
+        // debug_tensor("qkv after projection", qkv, layer);
+
+        // 2. Split QKV and reshape to [n_heads, seq_len, head_dim]
+        const q = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        const k = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        const v = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+
+        const q_r = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        const k_r = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        defer self.allocator.free(q);
+        defer self.allocator.free(k);
+        defer self.allocator.free(v);
+        defer self.allocator.free(q_r);
+        defer self.allocator.free(k_r);
+
+        try self.split_qkv(qkv, q, k, v, q_len);
+
+        // 3. Apply rotary embeddings
+        const position_ids = try self.allocator.alloc(usize, q_len);
+        defer self.allocator.free(position_ids);
+        for (0..q_len) |i| {
+            position_ids[i] = pos + i;
+        }
+
+        try self.apply_rotary_emb(q, self.freqs_cis, position_ids, q_r);
+        try self.apply_rotary_emb(k, self.freqs_cis, position_ids, k_r);
+
+        @memcpy(q, q_r);
+        @memcpy(k, k_r);
+
+        // 4. Handle KV Cache - in [n_heads, seq_len, head_dim] format
+        // Now handle KV cache with fixed indexing
+        const past_seq_len = if (pos > 0) pos else 0;
+        const total_seq_len = past_seq_len + q_len;
+
+        if (total_seq_len > self.config.seq_len) {
             return error.SequenceTooLong;
         }
 
-        // Input shape: [seq_len, dim]
-        const hidden_states = try self.allocator.alloc(f32, embeddings.len);
-        errdefer self.allocator.free(hidden_states);
+        // Prepare combined K/V buffers for attention
+        const k_combined = try self.allocator.alloc(f32, n_heads * total_seq_len * head_dim);
+        const v_combined = try self.allocator.alloc(f32, n_heads * total_seq_len * head_dim);
+        defer self.allocator.free(k_combined);
+        defer self.allocator.free(v_combined);
 
-        // Pre-allocate buffers for the entire layer
-        const ln_out = try self.allocator.alloc(f32, embeddings.len);
-        defer self.allocator.free(ln_out);
+        // Process each head's cache
+        for (0..n_heads) |h| {
+            // Calculate correct cache offsets for this layer and head
+            const cache_layer_offset = layer * self.config.seq_len * n_heads * head_dim;
+            const cache_head_offset = h * self.config.seq_len * head_dim;
+            const cache_base = cache_layer_offset + cache_head_offset;
 
-        const attn_output = try self.allocator.alloc(f32, embeddings.len);
-        defer self.allocator.free(attn_output);
+            // Get the cache slice for this head's past sequence
+            const k_cache_past = self.state.k_cache[cache_base + 0 .. cache_base + past_seq_len * head_dim];
+            const v_cache_past = self.state.v_cache[cache_base + 0 .. cache_base + past_seq_len * head_dim];
 
-        const mlp_output = try self.allocator.alloc(f32, embeddings.len);
-        defer self.allocator.free(mlp_output);
+            // Get current K/V for this head
+            const k_current = k[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
+            const v_current = v[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
 
-        @memcpy(hidden_states, embeddings);
+            // Combined buffer offsets for this head
+            const combined_head_offset = h * total_seq_len * head_dim;
 
-        // Main layer loop - following PyTorch's ordering exactly
-        for (0..self.config.n_layers) |l| {
-            // 1. Layer Norm with shape [seq_len, dim]
-            @memcpy(ln_out, hidden_states);
-            const normalized_shape = [_]usize{dim};
-            try layer_norm(
-                ln_out,
-                &normalized_shape,
-                self.weights.t_ln_w[l * dim .. (l + 1) * dim],
-                self.weights.t_ln_b[l * dim .. (l + 1) * dim],
-                eps,
+            if (past_seq_len > 0) {
+                // Copy past cache to combined buffers
+                @memcpy(k_combined[combined_head_offset .. combined_head_offset + past_seq_len * head_dim], k_cache_past);
+                @memcpy(v_combined[combined_head_offset .. combined_head_offset + past_seq_len * head_dim], v_cache_past);
+            }
+
+            // Append current K/V to combined buffers
+            @memcpy(k_combined[combined_head_offset + past_seq_len * head_dim .. combined_head_offset + total_seq_len * head_dim], k_current);
+            @memcpy(v_combined[combined_head_offset + past_seq_len * head_dim .. combined_head_offset + total_seq_len * head_dim], v_current);
+
+            // Update cache with current K/V
+            const cache_pos_offset = cache_base + past_seq_len * head_dim;
+            @memcpy(self.state.k_cache[cache_pos_offset .. cache_pos_offset + q_len * head_dim], k_current);
+            @memcpy(self.state.v_cache[cache_pos_offset .. cache_pos_offset + q_len * head_dim], v_current);
+        }
+
+        // Use combined K/V for attention computation
+        try self.scaled_dot_product_attention(q, k_combined, v_combined, q_len, pos, total_seq_len, layer, output);
+    }
+
+    fn split_qkv(self: Self, qkv: []const f32, q: []f32, k: []f32, v: []f32, q_len: usize) !void {
+        // checked, it works
+        const dim = self.config.dim;
+        const head_dim = self.config.head_dim;
+
+        for (0..q_len) |seq_idx| {
+            const qkv_start = seq_idx * (dim * 3);
+
+            for (0..dim) |d| {
+                const q_src = qkv_start + d;
+                const k_src = qkv_start + dim + d;
+                const v_src = qkv_start + 2 * dim + d;
+
+                const h = d / head_dim;
+                const d_head = d % head_dim;
+                const dst = h * (q_len * head_dim) + seq_idx * head_dim + d_head;
+
+                q[dst] = qkv[q_src];
+                k[dst] = qkv[k_src];
+                v[dst] = qkv[v_src];
+            }
+        }
+    }
+
+    fn scaled_dot_product_attention(
+        self: Self,
+        q: []const f32,
+        k: []const f32,
+        v: []const f32,
+        q_len: usize,
+        pos: usize,
+        total_seq_len: usize,
+        layer: usize,
+        output: []f32,
+    ) !void {
+        const dim = self.config.dim;
+        const n_heads = self.config.n_heads;
+        const head_dim = self.config.head_dim;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+        // const epsilon = 1e-5;
+
+        // Create attention mask
+        const attn_mask = try self.allocator.alloc(f32, q_len * total_seq_len);
+        // debug_tensor("attn mask init", attn_mask, layer);
+
+        defer self.allocator.free(attn_mask);
+        make_attention_mask(attn_mask, q_len, pos, total_seq_len);
+
+        // Allocate score matrices
+        const scores = try self.allocator.alloc(f32, n_heads * q_len * total_seq_len);
+        defer self.allocator.free(scores);
+
+        // Compute attention scores for each head
+        for (0..n_heads) |h| {
+            const q_head = q[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
+            const k_head = k[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
+            const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
+
+            // 1. Transpose K for Q @ K.T
+            const k_head_t = try self.allocator.alloc(f32, total_seq_len * head_dim);
+            defer self.allocator.free(k_head_t);
+
+            for (0..total_seq_len) |i| {
+                for (0..head_dim) |j| {
+                    k_head_t[j * total_seq_len + i] = k_head[i * head_dim + j];
+                }
+            }
+
+            // 2. Compute Q @ K.T
+            try matmul(
+                self.allocator,
+                q_head,
+                k_head_t,
+                scores_head,
+                q_len,
+                total_seq_len,
+                head_dim,
             );
 
-            // debug_tensor("layer_norm", ln_out, l);
+            // 3. Scale scores
+            for (scores_head) |*score| {
+                score.* *= scale;
+            }
 
-            // 2. Attention Block
-            try self.attention_block(ln_out, pos, q_len, l, attn_output);
+            // 4. Apply mask by setting masked positions to negative infinity
 
-            // 3. MLP - takes layer normalized input just like PyTorch
-            try self.mlp(ln_out, q_len, l, mlp_output);
-            // debug_tensor("mlp_output", mlp_output, l);
+            for (scores_head, 0..) |*score, i| {
+                if (attn_mask[i] == 0.0) {
+                    score.* = -std.math.inf(f32);
+                }
+            }
 
-            // 4. Residual connections
-            for (0..hidden_states.len) |i| {
-                hidden_states[i] += attn_output[i] + mlp_output[i];
+            // 5. Apply softmax row-wise
+            var i: usize = 0;
+            while (i < q_len) : (i += 1) {
+                const row_start = i * total_seq_len;
+
+                const row = scores_head[row_start .. row_start + total_seq_len];
+                try apply_softmax(row);
             }
         }
 
-        return hidden_states;
+        // debug_tensor("attention_output_before_reshape", scores, layer);
+        // Compute attention output
+        const attn_out = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        defer self.allocator.free(attn_out);
+
+        // For each head, multiply scores @ V
+        for (0..n_heads) |h| {
+            const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
+            const v_head = v[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
+            const out_head = attn_out[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
+
+            try matmul(
+                self.allocator,
+                scores_head,
+                v_head,
+                out_head,
+                q_len,
+                head_dim,
+                total_seq_len,
+            );
+        }
+        // debug_tensor("attention_output_before_reshape", attn_out, layer);
+
+        // Reshape attention output from [n_heads, q_len, head_dim] to [q_len, dim]
+        const reshaped = try self.allocator.alloc(f32, q_len * dim);
+        defer self.allocator.free(reshaped);
+
+        // Reshape attention output from [n_heads, q_len, head_dim] to [q_len, dim]
+        for (0..q_len) |seq_idx| {
+            for (0..n_heads) |h| {
+                for (0..head_dim) |d| {
+                    const src_idx = h * q_len * head_dim + seq_idx * head_dim + d;
+                    const dst_idx = seq_idx * dim + h * head_dim + d; // This layout is critical
+                    reshaped[dst_idx] = attn_out[src_idx];
+                }
+            }
+        }
+
+        // debug_tensor("pre-projection", reshaped, layer);
+
+        // Final output projection
+        try matmul(
+            self.allocator,
+            reshaped,
+            self.weights.t_out_proj_w[layer * dim * dim .. (layer + 1) * dim * dim],
+            output,
+            q_len,
+            dim,
+            dim,
+        );
+
+        // Add output projection bias
+        const out_bias = self.weights.t_out_proj_bias[layer * dim .. (layer + 1) * dim];
+        broadcast_add(output, out_bias, q_len);
+    }
+
+    fn make_attention_mask(mask: []f32, q_len: usize, pos: usize, total_seq_len: usize) void {
+        // Fill all positions as 1.0 initially
+        @memset(mask, 1.0);
+
+        // For the new sequence positions (from pos onwards), apply causal masking
+        for (0..q_len) |i| {
+            const row_start = i * total_seq_len;
+            // Start masking from pos + i + 1 to enforce causality for new tokens
+            for (pos + i + 1..total_seq_len) |j| {
+                mask[row_start + j] = 0.0;
+            }
+        }
     }
 
     const Complex = struct {
@@ -1849,403 +2151,25 @@ const Model = struct {
             }
         }
     }
-    fn lm_head(self: Self, hidden_states: []f32, q_len: usize) ![]f32 {
-        const dim = self.config.dim;
-        const vocab_size = self.config.vocab;
-
-        // Only process the last token for generation
-        const last_token_offset = (q_len - 1) * dim;
-        const last_hidden = hidden_states[last_token_offset .. last_token_offset + dim];
-
-        // Allocate memory for the last token's logits
-        const logits = try self.allocator.alloc(f32, vocab_size);
-        errdefer self.allocator.free(logits);
-
-        // Normalize the last hidden state
-        const normalized = try self.allocator.alloc(f32, dim);
-        defer self.allocator.free(normalized);
-
-        @memcpy(normalized, last_hidden);
-
-        const shape = [_]usize{dim};
-        try layer_norm(
-            normalized,
-            &shape,
-            self.weights.t_ln_out_w,
-            self.weights.t_ln_out_b,
-            1e-5, // epsilon
-        );
-
-        // Project to vocabulary size
-        try matmul(
-            self.allocator,
-            normalized,
-            self.weights.t_linear_w,
-            logits,
-            1, // single token
-            vocab_size,
-            dim,
-        );
-
-        // Add bias
-        accumulate(logits, self.weights.t_linear_b);
-
-        return logits;
-    }
-
-    fn attention_mask(
-        allocator: std.mem.Allocator,
-        pos: usize,
-        seq_len: usize,
-        n_heads: usize,
-    ) ![]f32 {
-        const total_seq_len = pos + seq_len;
-
-        // First create the base mask [seq_len, total_seq_len]
-        const base_mask = try allocator.alloc(f32, seq_len * total_seq_len);
-        defer allocator.free(base_mask);
-
-        // Initialize all to negative infinity (masked)
-        @memset(base_mask, -std.math.inf(f32));
-
-        // Set the mask pattern
-        for (0..seq_len) |i| {
-            const row_start = i * total_seq_len;
-
-            // Allow attention to all past tokens
-            for (0..pos) |j| {
-                base_mask[row_start + j] = 0.0;
-            }
-
-            // Create causal triangular mask for current sequence
-            const current_pos = pos + i;
-            for (pos..current_pos + 1) |j| {
-                base_mask[row_start + j] = 0.0;
-            }
-        }
-
-        // Create the broadcasted mask with head dimension [n_heads, seq_len, total_seq_len]
-        const mask = try allocator.alloc(f32, n_heads * seq_len * total_seq_len);
-        errdefer allocator.free(mask);
-
-        // Broadcast across heads
-        for (0..n_heads) |h| {
-            const head_offset = h * seq_len * total_seq_len;
-            @memcpy(mask[head_offset .. head_offset + seq_len * total_seq_len], base_mask);
-        }
-
-        return mask;
-    }
-
-    fn attention_block(self: Self, x: []f32, pos: usize, q_len: usize, layer: usize, output: []f32) !void {
-        const dim = self.config.dim;
-        const n_heads = self.config.n_heads;
-        const head_dim = self.config.head_dim;
-
-        // 1. QKV Projection [seq_len, dim] -> [seq_len, 3*dim]
-        const qkv = try self.allocator.alloc(f32, q_len * dim * 3);
-        defer self.allocator.free(qkv);
-
-        try matmul(
-            self.allocator,
-            x,
-            self.weights.t_Wqkv_w[layer * dim * 3 * dim .. (layer + 1) * dim * 3 * dim],
-            qkv,
-            q_len,
-            dim * 3,
-            dim,
-        );
-
-        // Add QKV bias
-        for (0..q_len) |seq| {
-            const bias = self.weights.t_Wqkv_b[layer * dim * 3 .. (layer + 1) * dim * 3];
-            accumulate(qkv[seq * dim * 3 .. (seq + 1) * dim * 3], bias);
-        }
-
-        // debug_tensor("qkv_projected", qkv, layer);
-
-        // 2. Split QKV and reshape to [n_heads, seq_len, head_dim]
-        const q = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
-        const k = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
-        const v = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
-        defer self.allocator.free(q);
-        defer self.allocator.free(k);
-        defer self.allocator.free(v);
-
-        try self.split_qkv(qkv, q, k, v, q_len);
-        // debug_tensor("q_split", q, layer);
-        // debug_tensor("k_split", k, layer);
-        // debug_tensor("v_split", v, layer);
-
-        // 3. Apply rotary embeddings
-        const position_ids = try self.allocator.alloc(usize, q_len);
-        defer self.allocator.free(position_ids);
-        for (0..q_len) |i| {
-            position_ids[i] = pos + i;
-        }
-
-        try self.apply_rotary_emb(q, self.freqs_cis, position_ids, q);
-        try self.apply_rotary_emb(k, self.freqs_cis, position_ids, k);
-
-        // debug_tensor("q_rotary", q, layer);
-        // debug_tensor("k_rotary", k, layer);
-
-        // 4. Handle KV Cache - matching PyTorch's dimension ordering
-        const past_seq_len = if (pos > 0) @min(pos, self.config.seq_len - q_len) else 0;
-        const total_seq_len = past_seq_len + q_len;
-
-        var k_combined = k;
-        var v_combined = v;
-
-        if (past_seq_len > 0) {
-            // Get cached KV for this layer in [n_heads, past_seq_len, head_dim] format
-            const cache_offset = layer * self.config.seq_len * n_heads * head_dim;
-            const cache_k = self.state.k_cache[cache_offset .. cache_offset + past_seq_len * n_heads * head_dim];
-            const cache_v = self.state.v_cache[cache_offset .. cache_offset + past_seq_len * n_heads * head_dim];
-
-            // Concatenate along seq_len dimension
-            k_combined = try self.concat_cache(k, cache_k, n_heads, q_len, past_seq_len, head_dim);
-            v_combined = try self.concat_cache(v, cache_v, n_heads, q_len, past_seq_len, head_dim);
-        }
-
-        // 5. Update KV Cache with current values
-        const cache_start = layer * self.config.seq_len * n_heads * head_dim + pos * n_heads * head_dim;
-        const cache_len = q_len * n_heads * head_dim;
-        @memcpy(self.state.k_cache[cache_start .. cache_start + cache_len], k);
-        @memcpy(self.state.v_cache[cache_start .. cache_start + cache_len], v);
-
-        // 6. Compute attention
-        try self.scaled_dot_product_attention(q, k_combined, v_combined, q_len, total_seq_len, layer, output);
-    }
-
-    fn split_qkv(self: Self, qkv: []const f32, q: []f32, k: []f32, v: []f32, q_len: usize) !void {
-        const dim = self.config.dim;
-        const n_heads = self.config.n_heads;
-        const head_dim = self.config.head_dim;
-
-        // First chunk the QKV into separate q,k,v segments
-        for (0..q_len) |seq_idx| {
-            const qkv_start = seq_idx * (dim * 3);
-
-            for (0..n_heads) |h| {
-                for (0..head_dim) |d| {
-                    // Calculate source indices within each chunk
-                    const q_src = qkv_start + h * head_dim + d;
-                    const k_src = qkv_start + dim + h * head_dim + d;
-                    const v_src = qkv_start + 2 * dim + h * head_dim + d;
-
-                    // Write to [n_heads, seq_len, head_dim] format
-                    const dst = h * (q_len * head_dim) + seq_idx * head_dim + d;
-
-                    q[dst] = qkv[q_src];
-                    k[dst] = qkv[k_src];
-                    v[dst] = qkv[v_src];
-                }
-            }
-        }
-    }
-
-    fn scaled_dot_product_attention(
-        self: Self,
-        q: []const f32,
-        k: []const f32,
-        v: []const f32,
-        q_len: usize,
-        total_seq_len: usize,
-        layer: usize,
-        output: []f32,
-    ) !void {
-        const dim = self.config.dim;
-        const n_heads = self.config.n_heads;
-        const head_dim = self.config.head_dim;
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-
-        // Create attention mask
-        const attn_mask = try self.allocator.alloc(f32, q_len * total_seq_len);
-        defer self.allocator.free(attn_mask);
-        make_attention_mask(attn_mask, q_len, total_seq_len);
-
-        // Allocate score matrices
-        const scores = try self.allocator.alloc(f32, n_heads * q_len * total_seq_len);
-        defer self.allocator.free(scores);
-
-        // Compute attention scores for each head
-        for (0..n_heads) |h| {
-            const q_head = q[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
-            const k_head = k[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
-            const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
-
-            // 1. Transpose K for Q @ K.T
-            const k_head_t = try self.allocator.alloc(f32, total_seq_len * head_dim);
-            defer self.allocator.free(k_head_t);
-
-            for (0..total_seq_len) |i| {
-                for (0..head_dim) |j| {
-                    k_head_t[j * total_seq_len + i] = k_head[i * head_dim + j];
-                }
-            }
-
-            // 2. Compute Q @ K.T
-            try matmul(
-                self.allocator,
-                q_head,
-                k_head_t,
-                scores_head,
-                q_len,
-                total_seq_len,
-                head_dim,
-            );
-
-            if (h == 0) {
-                debug_tensor("pre_scale_scores", scores_head, layer);
-            }
-
-            // 3. Scale scores
-            for (scores_head) |*score| {
-                score.* *= scale;
-            }
-
-            if (h == 0) {
-                debug_tensor("pre_mask_scores", scores_head, layer);
-            }
-
-            // 4. Apply mask by setting masked positions to negative infinity
-            for (scores_head, 0..) |*score, i| {
-                if (attn_mask[i] == 0.0) {
-                    score.* = -std.math.inf(f32);
-                }
-            }
-
-            if (h == 0) {
-                debug_tensor("post_mask_scores", scores_head, layer);
-            }
-
-            // 5. Apply softmax row-wise
-            var i: usize = 0;
-            while (i < q_len) : (i += 1) {
-                const row_start = i * total_seq_len;
-                const row = scores_head[row_start .. row_start + total_seq_len];
-                try apply_softmax(row);
-            }
-        }
-        // Compute attention output
-        const attn_out = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
-        defer self.allocator.free(attn_out);
-
-        // For each head, multiply scores @ V
-        for (0..n_heads) |h| {
-            const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
-            const v_head = v[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
-            const out_head = attn_out[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
-
-            try matmul(
-                self.allocator,
-                scores_head,
-                v_head,
-                out_head,
-                q_len,
-                head_dim,
-                total_seq_len,
-            );
-        }
-        // debug_tensor("attention_output_before_reshape", attn_out, layer);
-
-        // Reshape attention output from [n_heads, q_len, head_dim] to [q_len, dim]
-        const reshaped = try self.allocator.alloc(f32, q_len * dim);
-        defer self.allocator.free(reshaped);
-
-        for (0..q_len) |i| {
-            for (0..n_heads) |h| {
-                for (0..head_dim) |d| {
-                    const src_idx = h * q_len * head_dim + i * head_dim + d;
-                    const dst_idx = i * dim + h * head_dim + d;
-                    reshaped[dst_idx] = attn_out[src_idx];
-                }
-            }
-        }
-
-        // debug_tensor("attention_output_reshaped", reshaped, layer);
-
-        // Final output projection
-        try matmul(
-            self.allocator,
-            reshaped,
-            self.weights.t_out_proj_w[layer * dim * dim .. (layer + 1) * dim * dim],
-            output,
-            q_len,
-            dim,
-            dim,
-        );
-
-        // Add output projection bias
-        for (0..q_len) |seq| {
-            const bias = self.weights.t_out_proj_bias[layer * dim .. (layer + 1) * dim];
-            accumulate(output[seq * dim .. (seq + 1) * dim], bias);
-        }
-
-        // debug_tensor("attention_output_projected", output, layer);
-    }
-    pub fn make_attention_mask(mask: []f32, q_len: usize, total_seq_len: usize) void {
-        const past_len = total_seq_len - q_len;
-
-        // Fill with ones
-        @memset(mask, 1.0);
-
-        // Create triangular pattern for current context
-        for (0..q_len) |i| {
-            for (0..q_len) |j| {
-                const mask_idx = i * total_seq_len + (past_len + j);
-                mask[mask_idx] = if (j <= i) 1.0 else 0.0;
-            }
-        }
-    }
-
-    fn concat_cache(self: Self, current: []const f32, cache: []const f32, n_heads: usize, q_len: usize, past_len: usize, head_dim: usize) ![]f32 {
-        const total_len = past_len + q_len;
-        var combined = try self.allocator.alloc(f32, n_heads * total_len * head_dim);
-        errdefer self.allocator.free(combined);
-
-        // Concatenate maintaining [n_heads, seq_len, head_dim] format
-        for (0..n_heads) |h| {
-            const head_offset = h * total_len * head_dim;
-            const past_head_offset = h * past_len * head_dim;
-            const curr_head_offset = h * q_len * head_dim;
-
-            // Copy past cache for this head
-            @memcpy(combined[head_offset..][0 .. past_len * head_dim], cache[past_head_offset..][0 .. past_len * head_dim]);
-
-            // Copy current keys/values for this head
-            @memcpy(combined[head_offset + past_len * head_dim ..][0 .. q_len * head_dim], current[curr_head_offset..][0 .. q_len * head_dim]);
-        }
-
-        return combined;
-    }
 
     fn apply_softmax(x: []f32) !void {
-        var max: f32 = -std.math.inf(f32);
-
-        // Find max for numerical stability
-        for (x) |val| {
+        // Find max including -inf values (they won't affect the max)
+        var max: f32 = x[0];
+        for (x[1..]) |val| {
             if (val > max) max = val;
         }
 
-        // Compute exp and sum
+        // Apply exp and sum
         var sum: f32 = 0;
         for (x) |*val| {
-            if (val.* > -std.math.inf(f32)) {
-                val.* = @exp(val.* - max);
-                sum += val.*;
-            } else {
-                val.* = 0;
-            }
+            val.* = @exp(val.* - max);
+            sum += val.*; // exp(-inf) becomes 0 automatically
         }
 
         // Normalize
-        if (sum > 0) {
-            const inv_sum = 1.0 / sum;
-            for (x) |*val| {
-                val.* *= inv_sum;
-            }
+        const inv_sum = 1.0 / sum;
+        for (x) |*val| {
+            val.* *= inv_sum;
         }
     }
 
@@ -2280,9 +2204,7 @@ const Model = struct {
         // Debug after first matmul
         // debug_tensor("After FC1 MatMul", fc1_out, l);
 
-        for (0..q_len) |i| {
-            accumulate(fc1_out[i * hidden_dim .. (i + 1) * hidden_dim], self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim]);
-        }
+        broadcast_add(fc1_out, self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim], q_len);
 
         // Debug after bias addition
         // debug_tensor("After FC1 Bias", fc1_out, l);
@@ -2311,9 +2233,7 @@ const Model = struct {
         // Debug after second matmul
         // debug_tensor("After FC2 MatMul", fc2_out, l);
 
-        for (0..q_len) |i| {
-            accumulate(fc2_out[i * dim .. (i + 1) * dim], self.weights.t_fc2_b[l * dim .. (l + 1) * dim]);
-        }
+        broadcast_add(fc2_out, self.weights.t_fc2_b[l * dim .. (l + 1) * dim], q_len);
 
         // Debug final output before copying
         // debug_tensor("Final MLP Output", fc2_out, l);
@@ -2323,16 +2243,6 @@ const Model = struct {
 
         @memcpy(output, fc2_out);
     }
-
-    fn getvector(self: Self, vector: []f32, head_index: usize, seq_index: usize, head_dim_index: usize) f32 {
-        // Calculate the flat index for `q` assuming it's shaped as (num_heads, q_len, head_dim)
-        const flat_index = seq_index * self.config.dim + head_index * self.config.head_dim + head_dim_index;
-        return vector[flat_index];
-    }
-
-    // we will then transform each of q, k, v vectors
-    // they will go from (q_len, dim) to (n_heads, qlen, head_dim)
-    // dim = n_heads * head_dim
 
     pub const LayerNormError = error{
         EmptyInput,
@@ -2354,84 +2264,6 @@ const Model = struct {
             if (std.math.isInf(x)) return LayerNormError.InfInput;
         }
     }
-
-    const NumericalStats = struct {
-        min: f32,
-        max: f32,
-        mean: f32,
-        std: f32,
-        has_nan: bool,
-        has_inf: bool,
-    };
-
-    fn compute_stats(data: []const f32) NumericalStats {
-        if (data.len == 0) {
-            return .{
-                .min = 0,
-                .max = 0,
-                .mean = 0,
-                .std = 0,
-                .has_nan = false,
-                .has_inf = false,
-            };
-        }
-
-        var stats = NumericalStats{
-            .min = data[0],
-            .max = data[0],
-            .mean = 0,
-            .std = 0,
-            .has_nan = false,
-            .has_inf = false,
-        };
-
-        // First pass - min, max, mean, and check for nan/inf
-        var sum: f64 = 0; // Use f64 for better accuracy in sum
-        for (data) |val| {
-            if (std.math.isNan(val)) {
-                stats.has_nan = true;
-            }
-            if (std.math.isInf(val)) {
-                stats.has_inf = true;
-            }
-            if (val < stats.min) stats.min = val;
-            if (val > stats.max) stats.max = val;
-            sum += val;
-        }
-        stats.mean = @floatCast(sum / @as(f64, @floatFromInt(data.len)));
-
-        // Second pass - standard deviation
-        var sum_squared_diff: f64 = 0;
-        for (data) |val| {
-            const diff = val - stats.mean;
-            sum_squared_diff += diff * diff;
-        }
-        stats.std = @sqrt(@as(f32, @floatCast(sum_squared_diff / @as(f64, @floatFromInt(data.len)))));
-
-        return stats;
-    }
-
-    fn debug_tensor(name: []const u8, data: []const f32, layer: ?usize) void {
-        const stats = compute_stats(data);
-
-        std.debug.print(
-            \\{s} (layer {?d}):
-            \\  Range: [{d:0.6}, {d:0.6}]
-            \\  Mean: {d:0.6}, Std: {d:0.6}
-            \\  Has NaN: {}, Has Inf: {}
-            \\
-        , .{
-            name,
-            layer,
-            stats.min,
-            stats.max,
-            stats.mean,
-            stats.std,
-            stats.has_nan,
-            stats.has_inf,
-        });
-    }
-
     // Gradient checking utility
     fn check_gradients(tensor: []const f32, name: []const u8) void {
         var max_grad: f32 = 0;
@@ -2529,11 +2361,6 @@ const Model = struct {
                 x.* = normalized;
             }
         }
-    }
-
-    // Test helper function
-    fn approx_eq(a: f32, b: f32, tolerance: f32) bool {
-        return @abs(a - b) <= tolerance;
     }
 
     fn embed_tokens(self: Self, tokens: std.ArrayList(u32)) ![]f32 {
@@ -3168,122 +2995,236 @@ const Model = struct {
     }
 };
 
+const NumericalStats = struct {
+    min: f32,
+    max: f32,
+    mean: f32,
+    std: f32,
+    has_nan: bool,
+    has_inf: bool,
+};
+
+fn compute_stats(data: []const f32) NumericalStats {
+    if (data.len == 0) {
+        return .{
+            .min = 0,
+            .max = 0,
+            .mean = 0,
+            .std = 0,
+            .has_nan = false,
+            .has_inf = false,
+        };
+    }
+
+    var stats = NumericalStats{
+        .min = data[0],
+        .max = data[0],
+        .mean = 0,
+        .std = 0,
+        .has_nan = false,
+        .has_inf = false,
+    };
+
+    // First pass - min, max, mean, and check for nan/inf
+    var sum: f64 = 0; // Use f64 for better accuracy in sum
+    for (data) |val| {
+        if (std.math.isNan(val)) {
+            stats.has_nan = true;
+        }
+        if (std.math.isInf(val)) {
+            stats.has_inf = true;
+        }
+        if (val < stats.min) stats.min = val;
+        if (val > stats.max) stats.max = val;
+        sum += val;
+    }
+    stats.mean = @floatCast(sum / @as(f64, @floatFromInt(data.len)));
+
+    // Second pass - standard deviation
+    var sum_squared_diff: f64 = 0;
+    for (data) |val| {
+        const diff = val - stats.mean;
+        sum_squared_diff += diff * diff;
+    }
+    stats.std = @sqrt(@as(f32, @floatCast(sum_squared_diff / @as(f64, @floatFromInt(data.len)))));
+
+    return stats;
+}
+
+pub fn debug_tensor(name: []const u8, data: []const f32, layer: ?usize) void {
+    const stats = compute_stats(data);
+
+    std.debug.print(
+        \\{s} (layer {?d}):
+        \\  Range: [{d:0.6}, {d:0.6}]
+        \\  Mean: {d:0.6}, Std: {d:0.6}
+        \\  Has NaN: {}, Has Inf: {}
+        \\
+    , .{
+        name,
+        layer,
+        stats.min,
+        stats.max,
+        stats.mean,
+        stats.std,
+        stats.has_nan,
+        stats.has_inf,
+    });
+}
+
 // std.debug.print("Pass! \n", .{});
 // inference
+
 fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator: std.mem.Allocator) ![]const u8 {
-    // Clear KV cache at the start of generation
+    // Clear KV cache at start
     @memset(model.state.k_cache, 0);
     @memset(model.state.v_cache, 0);
-
-    std.debug.print("\n=== Starting Generation ===\n", .{});
-    std.debug.print("Initial prompt: {s}\n", .{prompt});
 
     // Process image
     const preprocessed = try model.preprocess(image_path, allocator);
     defer allocator.free(preprocessed);
     @memcpy(model.state.img, preprocessed);
+
     try model.vision_encoder();
 
     // Format and tokenize prompt
-    const formatted_prompt = try std.fmt.allocPrint(allocator, "\n\nQuestion: {s}\n\nAnswer:", .{prompt});
+    const formatted_prompt = try std.fmt.allocPrint(allocator, "<image>\nQuestion: {s}\nAnswer:", .{prompt});
     defer allocator.free(formatted_prompt);
 
-    var initial_tokens = std.ArrayList(u32).init(allocator);
-    defer initial_tokens.deinit();
+    // Initialize tokens
+    var context_tokens = std.ArrayList(u32).init(allocator);
+    defer context_tokens.deinit();
 
-    try initial_tokens.append(model.tokenizer.eos_token);
+    try context_tokens.append(model.tokenizer.bos_token);
     var prompt_tokens = try model.tokenizer.encode(formatted_prompt);
+
     defer prompt_tokens.deinit();
-    try initial_tokens.appendSlice(prompt_tokens.items);
+    try context_tokens.appendSlice(prompt_tokens.items);
 
-    std.debug.print("\nInitial tokens: {any}\n", .{initial_tokens.items});
+    // Initialize state tracking
+    var full_context: []f32 = undefined;
+    var context_length: usize = 0;
+    {
+        // Get initial embeddings
+        const text_embeddings = try model.embed_tokens(context_tokens);
+        defer allocator.free(text_embeddings);
 
-    const text_embed = try model.embed_tokens(initial_tokens);
-    defer model.allocator.free(text_embed);
+        // const init_embedding = try model.merge_embed(text_embeddings, model.state.projection);
+        const init_embedding = text_embeddings;
+        defer model.allocator.free(init_embedding);
 
-    // const init_embedding = try model.merge_embed(text_embed, model.state.projection);
-    const init_embedding = text_embed;
-    defer allocator.free(init_embedding);
+        // Initialize full context
+        context_length = init_embedding.len / model.config.dim;
+        full_context = try model.allocator.alloc(f32, init_embedding.len);
+        @memcpy(full_context, init_embedding);
+    }
+    defer model.allocator.free(full_context);
 
     var pos: usize = 0;
-
-    var current_state = try model.text_model(init_embedding, pos);
-    defer allocator.free(current_state);
-    pos += init_embedding.len / model.config.dim;
-
-    std.debug.print("\nStarting position after initial tokens: {d}\n", .{pos});
-
     var output = std.ArrayList(u8).init(allocator);
     errdefer output.deinit();
 
+    // Process initial context
+    var hidden_states = try model.text_model(full_context, pos);
+    defer model.allocator.free(hidden_states);
+    pos += context_length;
+
+    const max_tokens: usize = 20;
     var single_token_list = std.ArrayList(u32).init(model.allocator);
     defer single_token_list.deinit();
 
-    const max_tokens: usize = 10;
-
-    generation: for (0..max_tokens) |i| {
+    generation: for (0..max_tokens) |_| {
         if (pos >= model.config.seq_len) {
             std.debug.print("\nReached maximum sequence length\n", .{});
             break :generation;
         }
 
-        std.debug.print("\n--- Generation Step {d} ---\n", .{i});
-        std.debug.print("Current position: {d}\n", .{pos});
-
-        const logits = try model.lm_head(current_state, 1);
+        // Get logits for last token
+        const state_dim = model.config.dim;
+        const last_token_state = hidden_states[(context_length - 1) * state_dim .. context_length * state_dim];
+        debug_tensor("last token state", last_token_state, null);
+        const logits = try model.lm_head(last_token_state);
+        debug_tensor("logits: ", logits, null);
         defer model.allocator.free(logits);
 
-        // Debug top logits
         const top_k = @min(5, logits.len);
         const top_indices = try get_top_k_indices(allocator, logits, top_k);
-        defer allocator.free(top_indices);
 
-        std.debug.print("\nTop {d} tokens:\n", .{top_k});
-        for (top_indices, 0..) |token_idx, rank| {
-            var token_list = std.ArrayList(u32).init(allocator);
-            defer token_list.deinit();
-            try token_list.append(@intCast(token_idx));
-            const token_str = try model.tokenizer.decode(token_list);
-            defer allocator.free(token_str);
+        std.debug.print("Top k indices: {d}\n", .{top_indices});
 
-            std.debug.print("Rank {d}: Token {d} (logit: {d:.3}) -> '{s}'\n", .{
-                rank,
-                token_idx,
-                logits[token_idx],
-                token_str,
-            });
-        }
-
-        // Simple argmax sampling
         const next_token = @as(u32, @intCast(argmax(logits)));
-        std.debug.print("\nSelected token: {d}\n", .{next_token});
 
         if (next_token == model.tokenizer.eos_token) {
             std.debug.print("\nReached EOS token\n", .{});
             break :generation;
         }
 
+        // Update context tokens
+        try context_tokens.append(next_token);
+
+        // Decode and append output
         single_token_list.clearRetainingCapacity();
         try single_token_list.append(next_token);
-
         const token_str = try model.tokenizer.decode(single_token_list);
         defer model.allocator.free(token_str);
         try output.appendSlice(token_str);
 
-        std.debug.print("Generated text so far: {s}\n", .{output.items});
-
+        // Embed new token
         const next_embed = try model.embed_tokens(single_token_list);
-
-        // Process next token with updated position
-        const new_state = try model.text_model(next_embed, pos);
         defer model.allocator.free(next_embed);
-        allocator.free(current_state);
-        current_state = new_state;
 
+        // Extend context window
+        const new_context = try model.allocator.alloc(f32, (context_length + 1) * state_dim);
+        @memcpy(new_context[0 .. context_length * state_dim], full_context);
+        @memcpy(new_context[context_length * state_dim ..], next_embed);
+
+        // Update full context
+        model.allocator.free(full_context);
+        full_context = new_context;
+        context_length += 1;
+
+        // Process extended context
+        const new_hidden = try model.text_model(full_context, pos);
+        model.allocator.free(hidden_states);
+        hidden_states = new_hidden;
         pos += 1;
     }
 
     return output.toOwnedSlice();
+}
+
+fn sample_token(logits: []const f32) !u32 {
+    // Simple implementation - you might want something more sophisticated
+    var max_val: f32 = -std.math.inf(f32);
+    var max_idx: usize = 0;
+
+    for (logits, 0..) |val, i| {
+        if (val > max_val) {
+            max_val = val;
+            max_idx = i;
+        }
+    }
+
+    return @intCast(max_idx);
+}
+
+fn l2_norm(slice: []const f32) f32 {
+    var sum: f32 = 0;
+    for (slice) |val| {
+        sum += val * val;
+    }
+    return @sqrt(sum);
+}
+
+fn state_diff_norm(old: []const f32, new: []const f32) f32 {
+    if (old.len != new.len) return std.math.inf(f32);
+
+    var sum: f32 = 0;
+    for (old, new) |o, n| {
+        const diff = o - n;
+        sum += diff * diff;
+    }
+    return @sqrt(sum);
 }
 
 fn get_top_k_indices(allocator: std.mem.Allocator, logits: []const f32, k: usize) ![]usize {
@@ -3334,7 +3275,7 @@ pub fn main() !void {
     // Constants //
     const bin_path: []const u8 = "../moondream_f32.bin";
     const config_path: ?[]const u8 = "../model_config.json";
-    const image_path: []const u8 = "images/demo-1.jpg";
+    const image_path: []const u8 = "images/catmonitor.png";
 
     // Start of loading config file //
     const config_file = try std.fs.cwd().openFile(config_path.?, .{}); // TODO: Add filereader inside the init function for config itself.
@@ -3371,7 +3312,7 @@ pub fn main() !void {
     // initializing model struct //
     var model = try Model.init(config, weights, tokenizer, state, allocator);
 
-    const prompt = "Describe the image.";
+    const prompt = "Describe the image";
     // const max_new_tokens = 5;
 
     var timer = try std.time.Timer.start();

@@ -70,7 +70,7 @@ def convert_safetensors_to_custom_binary(input_file, output_file):
             # Text model start layers
             for tensor_name in text_start_layers:
                 tensor = f.get_tensor(tensor_name)
-                np_array = tensor.numpy().T  # Transpose the tensor
+                np_array = tensor.numpy()
                 
                 # Ensure the data is in float32 format
                 if np_array.dtype != np.float32:
