@@ -445,164 +445,6 @@ fn tiledMultiplyKernel(A: []const f32, B: []const f32, local_C: *[T][T]f32, N: u
     }
 }
 
-const BatchWorkItem = struct {
-    batch: usize,
-    i: usize,
-    j: usize,
-};
-
-const BatchThreadContext = struct {
-    A: []const f32,
-    B: []const f32,
-    C: []f32,
-    batch_size: usize,
-    M: usize,
-    N: usize,
-    K: usize,
-    work_queue: *std.ArrayList(BatchWorkItem),
-    mutex: std.Thread.Mutex,
-};
-
-pub fn batchedTiledMatMul(allocator: std.mem.Allocator, A: []const f32, B: []const f32, C: []f32, batch_size: usize, M: usize, N: usize, K: usize) !void {
-    const num_threads = try std.Thread.getCpuCount();
-
-    // Calculate tiles
-    const tiles_M = (M + T - 1) / T;
-    const tiles_N = (N + T - 1) / T;
-
-    var work_queue = std.ArrayList(BatchWorkItem).init(allocator);
-    defer work_queue.deinit();
-
-    // Create work items for all batches and tiles
-    for (0..batch_size) |b| {
-        for (0..tiles_M) |i| {
-            for (0..tiles_N) |j| {
-                try work_queue.append(.{ .batch = b, .i = i, .j = j });
-            }
-        }
-    }
-
-    // Shuffle work queue
-    var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-    rng.random().shuffle(BatchWorkItem, work_queue.items);
-
-    var thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, num_threads);
-    defer thread_pool.deinit();
-
-    var context = BatchThreadContext{
-        .A = A,
-        .B = B,
-        .C = C,
-        .batch_size = batch_size,
-        .M = M,
-        .N = N,
-        .K = K,
-        .work_queue = &work_queue,
-        .mutex = std.Thread.Mutex{},
-    };
-
-    for (0..num_threads) |_| {
-        try thread_pool.append(try std.Thread.spawn(.{}, batchedWorkerThread, .{&context}));
-    }
-
-    for (thread_pool.items) |thread| {
-        thread.join();
-    }
-}
-
-fn batchedWorkerThread(context: *BatchThreadContext) void {
-    const batch_stride_A = context.M * context.K; // Stride for A
-    const batch_stride_C = context.M * context.N; // Stride for C
-    // No batch stride for B since it's broadcasted
-
-    while (true) {
-        context.mutex.lock();
-        const work_item = if (context.work_queue.popOrNull()) |item| item else {
-            context.mutex.unlock();
-            break;
-        };
-        context.mutex.unlock();
-
-        const batch_offset_A = work_item.batch * batch_stride_A;
-        const batch_offset_C = work_item.batch * batch_stride_C;
-
-        const i_start = work_item.i * T;
-        const j_start = work_item.j * T;
-        const i_end = @min(i_start + T, context.M);
-        const j_end = @min(j_start + T, context.N);
-
-        var local_C: [T][T]f32 = [_][T]f32{[_]f32{0} ** T} ** T;
-
-        var k: usize = 0;
-        while (k < context.K) : (k += T) {
-            const k_end = @min(k + T, context.K);
-            batchedTiledMultiplyKernel(context.A[batch_offset_A..], context.B, &local_C, context.N, context.K, i_start, j_start, k, i_end, j_end, k_end);
-        }
-
-        // Accumulate results
-        for (i_start..i_end) |i| {
-            for (j_start..j_end) |j| {
-                context.C[batch_offset_C + i * context.N + j] += local_C[i - i_start][j - j_start];
-            }
-        }
-    }
-}
-
-fn batchedTiledMultiplyKernel(A: []const f32, B: []const f32, local_C: *[T][T]f32, N: usize, K: usize, i_start: usize, j_start: usize, k_start: usize, i_end: usize, j_end: usize, k_end: usize) void {
-    var A_local: [T][T]f32 = undefined;
-    var B_local: [T][T]f32 = undefined;
-
-    // Load A tile
-    for (0..T) |i| {
-        for (0..T) |k| {
-            if (i_start + i < i_end and k_start + k < k_end) {
-                A_local[i][k] = A[(i_start + i) * K + (k_start + k)];
-            } else {
-                A_local[i][k] = 0;
-            }
-        }
-    }
-
-    // Load B tile (now using original B without batch offset)
-    for (0..T) |k| {
-        for (0..T) |j| {
-            if (k_start + k < k_end and j_start + j < j_end) {
-                B_local[k][j] = B[(k_start + k) * N + (j_start + j)];
-            } else {
-                B_local[k][j] = 0;
-            }
-        }
-    }
-
-    // Compute tile
-    var i: usize = 0;
-    while (i < T and i_start + i < i_end) : (i += 1) {
-        var j: usize = 0;
-        while (j < T and j_start + j < j_end) : (j += V) {
-            const vec_size = @min(V, j_end - j_start - j);
-            var vec_sum: @Vector(V, f32) = @splat(0);
-
-            var k: usize = 0;
-            while (k < T and k_start + k < k_end) : (k += 1) {
-                const a_val = A_local[i][k];
-                const a_vec = @as(@Vector(V, f32), @splat(a_val));
-                const b_vec = blk: {
-                    var temp: @Vector(V, f32) = @splat(0);
-                    for (0..vec_size) |idx| {
-                        temp[idx] = B_local[k][j + idx];
-                    }
-                    break :blk temp;
-                };
-                vec_sum += a_vec * b_vec;
-            }
-
-            for (0..vec_size) |idx| {
-                local_C[i][j + idx] += vec_sum[idx];
-            }
-        }
-    }
-}
-
 // copied from https://github.com/cgbur/llama2.zig/blob/main/src/main.zig#L489
 
 // not copied to ops yet.
@@ -1781,8 +1623,6 @@ const Model = struct {
         const qkv = try self.allocator.alloc(f32, q_len * dim * 3);
         defer self.allocator.free(qkv);
 
-        // debug_tensor("x : ", x, layer);
-
         try matmul(
             self.allocator,
             x,
@@ -1796,8 +1636,6 @@ const Model = struct {
         // Add QKV bias
         const bias = self.weights.t_Wqkv_b[layer * dim * 3 .. (layer + 1) * dim * 3];
         broadcast_add(qkv, bias, q_len);
-
-        // debug_tensor("qkv after projection", qkv, layer);
 
         // 2. Split QKV and reshape to [n_heads, seq_len, head_dim]
         const q = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
@@ -1814,6 +1652,9 @@ const Model = struct {
 
         try self.split_qkv(qkv, q, k, v, q_len);
 
+        // out is (seq_len, dim) now.
+        // we are not reshaping.
+
         // 3. Apply rotary embeddings
         const position_ids = try self.allocator.alloc(usize, q_len);
         defer self.allocator.free(position_ids);
@@ -1827,8 +1668,10 @@ const Model = struct {
         @memcpy(q, q_r);
         @memcpy(k, k_r);
 
-        // 4. Handle KV Cache - in [n_heads, seq_len, head_dim] format
-        // Now handle KV cache with fixed indexing
+        // In attention_block:
+        // After we have Q, K, V in [seq_len, dim] format and have applied rotary embeddings
+
+        // 4. Handle KV Cache
         const past_seq_len = if (pos > 0) pos else 0;
         const total_seq_len = past_seq_len + q_len;
 
@@ -1836,196 +1679,44 @@ const Model = struct {
             return error.SequenceTooLong;
         }
 
-        // Prepare combined K/V buffers for attention
-        const k_combined = try self.allocator.alloc(f32, n_heads * total_seq_len * head_dim);
-        const v_combined = try self.allocator.alloc(f32, n_heads * total_seq_len * head_dim);
+        // Update cache with new K/V
+        const cache_layer_offset = layer * self.config.seq_len * dim;
+        for (0..q_len) |i| {
+            const cache_pos = past_seq_len + i;
+            const cache_offset = cache_layer_offset + cache_pos * dim;
+            const src_offset = i * dim;
+
+            @memcpy(self.state.k_cache[cache_offset .. cache_offset + dim], k[src_offset .. src_offset + dim]);
+            @memcpy(self.state.v_cache[cache_offset .. cache_offset + dim], v[src_offset .. src_offset + dim]);
+        }
+
+        // 4.1. Prepare combined K/V buffers for attention
+        const k_combined = try self.allocator.alloc(f32, total_seq_len * dim);
+        const v_combined = try self.allocator.alloc(f32, total_seq_len * dim);
         defer self.allocator.free(k_combined);
         defer self.allocator.free(v_combined);
 
-        // Process each head's cache
-        for (0..n_heads) |h| {
-            // Calculate correct cache offsets for this layer and head
-            const cache_layer_offset = layer * self.config.seq_len * n_heads * head_dim;
-            const cache_head_offset = h * self.config.seq_len * head_dim;
-            const cache_base = cache_layer_offset + cache_head_offset;
-
-            // Get the cache slice for this head's past sequence
-            const k_cache_past = self.state.k_cache[cache_base + 0 .. cache_base + past_seq_len * head_dim];
-            const v_cache_past = self.state.v_cache[cache_base + 0 .. cache_base + past_seq_len * head_dim];
-
-            // Get current K/V for this head
-            const k_current = k[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
-            const v_current = v[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
-
-            // Combined buffer offsets for this head
-            const combined_head_offset = h * total_seq_len * head_dim;
-
-            if (past_seq_len > 0) {
-                // Copy past cache to combined buffers
-                @memcpy(k_combined[combined_head_offset .. combined_head_offset + past_seq_len * head_dim], k_cache_past);
-                @memcpy(v_combined[combined_head_offset .. combined_head_offset + past_seq_len * head_dim], v_cache_past);
-            }
-
-            // Append current K/V to combined buffers
-            @memcpy(k_combined[combined_head_offset + past_seq_len * head_dim .. combined_head_offset + total_seq_len * head_dim], k_current);
-            @memcpy(v_combined[combined_head_offset + past_seq_len * head_dim .. combined_head_offset + total_seq_len * head_dim], v_current);
-
-            // Update cache with current K/V
-            const cache_pos_offset = cache_base + past_seq_len * head_dim;
-            @memcpy(self.state.k_cache[cache_pos_offset .. cache_pos_offset + q_len * head_dim], k_current);
-            @memcpy(self.state.v_cache[cache_pos_offset .. cache_pos_offset + q_len * head_dim], v_current);
+        // Copy past context from cache
+        if (past_seq_len > 0) {
+            const cache_start = cache_layer_offset;
+            @memcpy(k_combined[0 .. past_seq_len * dim], self.state.k_cache[cache_start .. cache_start + past_seq_len * dim]);
+            @memcpy(v_combined[0 .. past_seq_len * dim], self.state.v_cache[cache_start .. cache_start + past_seq_len * dim]);
         }
 
-        // Use combined K/V for attention computation
-        try self.scaled_dot_product_attention(q, k_combined, v_combined, q_len, pos, total_seq_len, layer, output);
-    }
+        // Copy current context
+        @memcpy(k_combined[past_seq_len * dim .. total_seq_len * dim], k[0 .. q_len * dim]);
+        @memcpy(v_combined[past_seq_len * dim .. total_seq_len * dim], v[0 .. q_len * dim]);
 
-    fn split_qkv(self: Self, qkv: []const f32, q: []f32, k: []f32, v: []f32, q_len: usize) !void {
-        // checked, it works
-        const dim = self.config.dim;
-        const head_dim = self.config.head_dim;
-
-        for (0..q_len) |seq_idx| {
-            const qkv_start = seq_idx * (dim * 3);
-
-            for (0..dim) |d| {
-                const q_src = qkv_start + d;
-                const k_src = qkv_start + dim + d;
-                const v_src = qkv_start + 2 * dim + d;
-
-                const h = d / head_dim;
-                const d_head = d % head_dim;
-                const dst = h * (q_len * head_dim) + seq_idx * head_dim + d_head;
-
-                q[dst] = qkv[q_src];
-                k[dst] = qkv[k_src];
-                v[dst] = qkv[v_src];
-            }
-        }
-    }
-
-    fn scaled_dot_product_attention(
-        self: Self,
-        q: []const f32,
-        k: []const f32,
-        v: []const f32,
-        q_len: usize,
-        pos: usize,
-        total_seq_len: usize,
-        layer: usize,
-        output: []f32,
-    ) !void {
-        const dim = self.config.dim;
-        const n_heads = self.config.n_heads;
-        const head_dim = self.config.head_dim;
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-        // const epsilon = 1e-5;
-
-        // Create attention mask
-        const attn_mask = try self.allocator.alloc(f32, q_len * total_seq_len);
-        // debug_tensor("attn mask init", attn_mask, layer);
-
-        defer self.allocator.free(attn_mask);
-        make_attention_mask(attn_mask, q_len, pos, total_seq_len);
-
-        // Allocate score matrices
-        const scores = try self.allocator.alloc(f32, n_heads * q_len * total_seq_len);
-        defer self.allocator.free(scores);
-
-        // Compute attention scores for each head
-        for (0..n_heads) |h| {
-            const q_head = q[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
-            const k_head = k[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
-            const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
-
-            // 1. Transpose K for Q @ K.T
-            const k_head_t = try self.allocator.alloc(f32, total_seq_len * head_dim);
-            defer self.allocator.free(k_head_t);
-
-            for (0..total_seq_len) |i| {
-                for (0..head_dim) |j| {
-                    k_head_t[j * total_seq_len + i] = k_head[i * head_dim + j];
-                }
-            }
-
-            // 2. Compute Q @ K.T
-            try matmul(
-                self.allocator,
-                q_head,
-                k_head_t,
-                scores_head,
-                q_len,
-                total_seq_len,
-                head_dim,
-            );
-
-            // 3. Scale scores
-            for (scores_head) |*score| {
-                score.* *= scale;
-            }
-
-            // 4. Apply mask by setting masked positions to negative infinity
-
-            for (scores_head, 0..) |*score, i| {
-                if (attn_mask[i] == 0.0) {
-                    score.* = -std.math.inf(f32);
-                }
-            }
-
-            // 5. Apply softmax row-wise
-            var i: usize = 0;
-            while (i < q_len) : (i += 1) {
-                const row_start = i * total_seq_len;
-
-                const row = scores_head[row_start .. row_start + total_seq_len];
-                try apply_softmax(row);
-            }
-        }
-
-        // debug_tensor("attention_output_before_reshape", scores, layer);
-        // Compute attention output
-        const attn_out = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
+        // 5. Call SDPA with combined buffers
+        const attn_out = try self.allocator.alloc(f32, q_len * dim);
         defer self.allocator.free(attn_out);
 
-        // For each head, multiply scores @ V
-        for (0..n_heads) |h| {
-            const scores_head = scores[h * q_len * total_seq_len .. (h + 1) * q_len * total_seq_len];
-            const v_head = v[h * total_seq_len * head_dim .. (h + 1) * total_seq_len * head_dim];
-            const out_head = attn_out[h * q_len * head_dim .. (h + 1) * q_len * head_dim];
+        try self.scaled_dot_product_attention(q, k_combined, v_combined, q_len, pos, total_seq_len, attn_out);
 
-            try matmul(
-                self.allocator,
-                scores_head,
-                v_head,
-                out_head,
-                q_len,
-                head_dim,
-                total_seq_len,
-            );
-        }
-        // debug_tensor("attention_output_before_reshape", attn_out, layer);
-
-        // Reshape attention output from [n_heads, q_len, head_dim] to [q_len, dim]
-        const reshaped = try self.allocator.alloc(f32, q_len * dim);
-        defer self.allocator.free(reshaped);
-
-        // Reshape attention output from [n_heads, q_len, head_dim] to [q_len, dim]
-        for (0..q_len) |seq_idx| {
-            for (0..n_heads) |h| {
-                for (0..head_dim) |d| {
-                    const src_idx = h * q_len * head_dim + seq_idx * head_dim + d;
-                    const dst_idx = seq_idx * dim + h * head_dim + d; // This layout is critical
-                    reshaped[dst_idx] = attn_out[src_idx];
-                }
-            }
-        }
-
-        // debug_tensor("pre-projection", reshaped, layer);
-
-        // Final output projection
+        // 6. Then apply output projection [seq_len, dim] -> [seq_len, dim]
         try matmul(
             self.allocator,
-            reshaped,
+            attn_out,
             self.weights.t_out_proj_w[layer * dim * dim .. (layer + 1) * dim * dim],
             output,
             q_len,
@@ -2036,6 +1727,97 @@ const Model = struct {
         // Add output projection bias
         const out_bias = self.weights.t_out_proj_bias[layer * dim .. (layer + 1) * dim];
         broadcast_add(output, out_bias, q_len);
+    }
+
+    fn split_qkv(self: Self, qkv: []const f32, q: []f32, k: []f32, v: []f32, q_len: usize) !void {
+        const dim = self.config.dim;
+
+        for (0..q_len) |seq_idx| {
+            const qkv_offset = seq_idx * (dim * 3);
+            const out_offset = seq_idx * dim;
+
+            // Keep dim order, just split Q, K, V
+            @memcpy(q[out_offset .. out_offset + dim], qkv[qkv_offset .. qkv_offset + dim]);
+            @memcpy(k[out_offset .. out_offset + dim], qkv[qkv_offset + dim .. qkv_offset + 2 * dim]);
+            @memcpy(v[out_offset .. out_offset + dim], qkv[qkv_offset + 2 * dim .. qkv_offset + 3 * dim]);
+        }
+    }
+
+    fn scaled_dot_product_attention(
+        self: Self,
+        q: []const f32, // [q_len, dim]
+        k: []const f32, // [total_seq_len, dim]
+        v: []const f32, // [total_seq_len, dim]
+        q_len: usize,
+        pos: usize,
+        total_seq_len: usize,
+        output: []f32,
+    ) !void {
+        const dim = self.config.dim;
+        const n_heads = self.config.n_heads;
+        const head_dim = self.config.head_dim;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+        // Create attention mask
+        const attn_mask = try self.allocator.alloc(f32, q_len * total_seq_len);
+        defer self.allocator.free(attn_mask);
+        make_attention_mask(attn_mask, q_len, pos, total_seq_len);
+
+        // Allocate scores matrix
+        const scores = try self.allocator.alloc(f32, q_len * total_seq_len);
+        defer self.allocator.free(scores);
+
+        // For each head
+        for (0..n_heads) |h| {
+            const head_offset = h * head_dim;
+
+            // Calculate attention scores for this head's portion
+            for (0..q_len) |i| {
+                for (0..total_seq_len) |j| {
+                    var score: f32 = 0;
+                    const q_offset = i * dim + head_offset;
+                    const k_offset = j * dim + head_offset;
+
+                    // Dot product of q[i] and k[j] for this head
+                    for (0..head_dim) |d| {
+                        score += q[q_offset + d] * k[k_offset + d];
+                    }
+                    scores[i * total_seq_len + j] = score * scale;
+                }
+            }
+
+            // Apply mask
+            for (0..q_len * total_seq_len) |i| {
+                if (attn_mask[i] == 0) {
+                    scores[i] = -std.math.inf(f32);
+                }
+            }
+
+            // Apply softmax row-wise
+            var i: usize = 0;
+            while (i < q_len) : (i += 1) {
+                const row = scores[i * total_seq_len .. (i + 1) * total_seq_len];
+                try apply_softmax(row);
+            }
+
+            // Compute attention output for this head
+            for (0..q_len) |seq| {
+                const out_offset = seq * dim + head_offset;
+
+                // Initialize output for this position to 0
+                @memset(output[out_offset .. out_offset + head_dim], 0);
+
+                // Weighted sum of values
+                for (0..total_seq_len) |j| {
+                    const score = scores[seq * total_seq_len + j];
+                    const v_offset = j * dim + head_offset;
+
+                    for (0..head_dim) |d| {
+                        output[out_offset + d] += score * v[v_offset + d];
+                    }
+                }
+            }
+        }
     }
 
     fn make_attention_mask(mask: []f32, q_len: usize, pos: usize, total_seq_len: usize) void {
@@ -2090,40 +1872,45 @@ const Model = struct {
 
     fn apply_rotary_emb(
         self: Self,
-        x: []const f32,
+        x: []const f32, // [seq_len, dim] format
         freqs_cis: []const Complex,
         position_ids: []const usize,
         out: []f32,
     ) !void {
+        const dim = self.config.dim;
         const head_dim = self.config.head_dim;
+        const n_heads = dim / head_dim;
         const seq_len = position_ids.len;
-        const n_heads = x.len / (seq_len * head_dim);
         const rot_dim = @min(head_dim, 32);
         const half_rot_dim = rot_dim / 2;
 
         assert(x.len == out.len);
-        assert(x.len == n_heads * seq_len * head_dim);
+        assert(x.len == seq_len * dim);
 
-        // If input and output are the same buffer, we need a temporary buffer for rotation
+        // If input and output are the same buffer, we need a temporary buffer
         var temp_buffer: ?[]f32 = null;
         if (x.ptr == out.ptr) {
             temp_buffer = try self.allocator.alloc(f32, rot_dim);
             defer if (temp_buffer) |buf| self.allocator.free(buf);
         }
 
-        for (0..n_heads) |h| {
-            for (0..seq_len) |s| {
-                const pos = position_ids[s];
-                const head_offset = h * seq_len * head_dim + s * head_dim;
+        // Process each sequence position
+        for (0..seq_len) |s| {
+            const pos = position_ids[s];
+            const seq_offset = s * dim;
 
+            // For each head
+            for (0..n_heads) |h| {
+                const head_offset = seq_offset + h * head_dim;
+
+                // Handle temporary buffer if needed
                 if (temp_buffer) |buf| {
                     @memcpy(buf[0..rot_dim], x[head_offset .. head_offset + rot_dim]);
                 }
 
-                // Process pairs of elements
+                // Process pairs within this head's chunk
                 var i: usize = 0;
                 while (i < half_rot_dim) : (i += 1) {
-                    // Get the rotation for this pair
                     const rot = freqs_cis[pos * rot_dim / 2 + i];
 
                     const x1 = if (temp_buffer) |buf|
@@ -2135,12 +1922,12 @@ const Model = struct {
                     else
                         x[head_offset + i + half_rot_dim];
 
-                    // Apply rotation using complex multiplication
+                    // Apply rotation
                     out[head_offset + i] = x1 * rot.real - x2 * rot.imag;
                     out[head_offset + i + half_rot_dim] = x1 * rot.imag + x2 * rot.real;
                 }
 
-                // Handle the pass-through part
+                // Handle pass-through portion
                 if (rot_dim < head_dim) {
                     if (x.ptr != out.ptr) {
                         const pass_start = head_offset + rot_dim;
@@ -2177,13 +1964,6 @@ const Model = struct {
         const dim = self.config.dim;
         const hidden_dim = self.config.hidden_dim;
 
-        // Debug input state
-        // debug_tensor("MLP Input", input, l);
-
-        // Debug weight matrices
-        // debug_tensor("FC1 Weights", self.weights.t_fc1_w[l * dim * hidden_dim .. (l + 1) * dim * hidden_dim], l);
-        // debug_tensor("FC1 Bias", self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim], l);
-
         const fc1_out = try self.allocator.alloc(f32, q_len * hidden_dim);
         defer self.allocator.free(fc1_out);
 
@@ -2201,23 +1981,10 @@ const Model = struct {
             dim,
         );
 
-        // Debug after first matmul
-        // debug_tensor("After FC1 MatMul", fc1_out, l);
-
         broadcast_add(fc1_out, self.weights.t_fc1_b[l * hidden_dim .. (l + 1) * hidden_dim], q_len);
-
-        // Debug after bias addition
-        // debug_tensor("After FC1 Bias", fc1_out, l);
 
         // GeLU activation
         gelu(fc1_out);
-
-        // Debug after activation
-        // debug_tensor("After GeLU", fc1_out, l);
-
-        // // Debug second layer weights
-        // debug_tensor("FC2 Weights", self.weights.t_fc2_w[l * hidden_dim * dim .. (l + 1) * hidden_dim * dim], l);
-        // debug_tensor("FC2 Bias", self.weights.t_fc2_b[l * dim .. (l + 1) * dim], l);
 
         // Second linear layer
         try matmul(
@@ -2230,16 +1997,7 @@ const Model = struct {
             hidden_dim,
         );
 
-        // Debug after second matmul
-        // debug_tensor("After FC2 MatMul", fc2_out, l);
-
         broadcast_add(fc2_out, self.weights.t_fc2_b[l * dim .. (l + 1) * dim], q_len);
-
-        // Debug final output before copying
-        // debug_tensor("Final MLP Output", fc2_out, l);
-
-        // Add gradient magnitude checking
-        // check_gradients(fc2_out, "MLP Output Gradients");
 
         @memcpy(output, fc2_out);
     }
@@ -2508,8 +2266,6 @@ const Model = struct {
 
         // we get the patch embedding by doing matmul with the patch embedding linear layer and adding bias
         // each patch is individually multiplied and then stored into self.state.patches!
-
-        // try batchedTiledMatMul(self.allocator, self.state.patches, self.weights.v_patch_embedding_linear_w, self.state.patch_emb, total_patches, 1, self.config.vit_dim, patch_elements);
 
         for (0..total_patches) |patch| {
 
@@ -3129,7 +2885,7 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
     defer model.allocator.free(hidden_states);
     pos += context_length;
 
-    const max_tokens: usize = 20;
+    const max_tokens: usize = 10;
     var single_token_list = std.ArrayList(u32).init(model.allocator);
     defer single_token_list.deinit();
 
