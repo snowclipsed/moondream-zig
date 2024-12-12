@@ -1329,52 +1329,34 @@ const Tokenizer = struct {
         var tokens = std.ArrayList(u32).init(self.allocator);
         errdefer tokens.deinit();
 
-        // First check for special tokens
-        for (self.special_tokens.items) |special| {
-            if (std.mem.indexOf(u8, text, special.content)) |_| {
-                if (special.is_special) {
-                    // Handle special token differently
-                    try tokens.append(special.id);
-                    return tokens;
-                }
-            }
-        }
-
-        // Regular tokenization process
         var current_pos: usize = 0;
         while (current_pos < text.len) {
-            var longest_match: ?struct { token: []const u8, id: u32, len: usize } = null;
-
-            // Check special tokens first
-            for (self.special_tokens.items) |special| {
-                if (current_pos + special.content.len <= text.len and
-                    std.mem.startsWith(u8, text[current_pos..], special.content))
-                {
-                    if (longest_match == null or special.content.len > longest_match.?.len) {
-                        longest_match = .{
-                            .token = special.content,
-                            .id = special.id,
-                            .len = special.content.len,
-                        };
-                    }
-                }
+            // Check for special characters first
+            if (text[current_pos] == ' ') {
+                try tokens.append(32); // Space token
+                current_pos += 1;
+                continue;
+            }
+            if (text[current_pos] == '\n') {
+                try tokens.append(10); // Newline token
+                current_pos += 1;
+                continue;
             }
 
-            // Then check regular tokens
-            if (longest_match == null) {
-                var token_it = self.tokens.iterator();
-                while (token_it.next()) |entry| {
-                    const token = entry.key_ptr.*;
-                    if (current_pos + token.len <= text.len and
-                        std.mem.startsWith(u8, text[current_pos..], token))
-                    {
-                        if (longest_match == null or token.len > longest_match.?.len) {
-                            longest_match = .{
-                                .token = token,
-                                .id = entry.value_ptr.*,
-                                .len = token.len,
-                            };
-                        }
+            // Regular token matching
+            var longest_match: ?struct { token: []const u8, id: u32, len: usize } = null;
+            var token_it = self.tokens.iterator();
+            while (token_it.next()) |entry| {
+                const token = entry.key_ptr.*;
+                if (current_pos + token.len <= text.len and
+                    std.mem.startsWith(u8, text[current_pos..], token))
+                {
+                    if (longest_match == null or token.len > longest_match.?.len) {
+                        longest_match = .{
+                            .token = token,
+                            .id = entry.value_ptr.*,
+                            .len = token.len,
+                        };
                     }
                 }
             }
@@ -1407,62 +1389,34 @@ const Tokenizer = struct {
                 continue;
             }
 
-            // First check special tokens
-            var special_token_found = false;
-            for (self.special_tokens.items) |special| {
-                if (special.id == token_id) {
-                    // Only append content if it's not a control token (like BOS/EOS)
-                    if (!special.is_special) {
-                        try decoded_text.appendSlice(special.content);
+            // Handle special replacements
+            switch (token_id) {
+                32 => try decoded_text.appendSlice(" "), // Space
+                10 => try decoded_text.appendSlice("\n"), // Newline
+                else => {
+                    // Regular token handling
+                    var token_found = false;
+                    var token_it = self.tokens.iterator();
+                    while (token_it.next()) |entry| {
+                        if (entry.value_ptr.* == token_id) {
+                            try decoded_text.appendSlice(entry.key_ptr.*);
+                            token_found = true;
+                            break;
+                        }
                     }
-                    special_token_found = true;
-                    break;
-                }
-            }
 
-            if (special_token_found) continue;
-
-            // Handle regular tokens
-            var token_found = false;
-            var token_it = self.tokens.iterator();
-            while (token_it.next()) |entry| {
-                if (entry.value_ptr.* == token_id) {
-                    const token = entry.key_ptr.*;
-                    try decoded_text.appendSlice(token);
-                    token_found = true;
-                    break;
-                }
-            }
-
-            // Handle raw bytes as last resort
-            if (!token_found) {
-                if (token_id < 256) {
-                    try decoded_text.append(@intCast(token_id));
-                } else {
-                    return error.TokenNotFound;
-                }
+                    if (!token_found) {
+                        if (token_id < 256) {
+                            try decoded_text.append(@intCast(token_id));
+                        } else {
+                            return error.TokenNotFound;
+                        }
+                    }
+                },
             }
         }
 
         return decoded_text.toOwnedSlice();
-    }
-
-    fn isValidUtf8(text: []const u8) bool {
-        var i: usize = 0;
-        while (i < text.len) {
-            const byte = text[i];
-            const width = std.unicode.utf8ByteSequenceLength(byte) catch return false;
-            if (i + width > text.len) return false;
-
-            // Validate the sequence
-            const sequence = text[i..][0..width];
-            if (std.unicode.utf8Decode(sequence)) |_| {
-                i += width;
-            } else |_| {
-                return false;
-            }
-        }
-        return true;
     }
 
     fn deinit(self: *Self) void {
@@ -1549,29 +1503,6 @@ const Model = struct {
         return hidden_states;
     }
 
-    fn lm_head(self: Self, hidden_states: []f32) ![]f32 {
-        const dim = self.config.dim;
-        const vocab_size = self.config.vocab;
-
-        // Only take the last token's hidden state
-        // const last_hidden = hidden_states[(q_len - 1) * dim .. q_len * dim];
-
-        // Normalize before projection
-        const normalized = try self.allocator.alloc(f32, dim);
-        defer self.allocator.free(normalized);
-        @memcpy(normalized, hidden_states);
-
-        try layer_norm(normalized, &.{dim}, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
-
-        // Project to vocabulary
-        const logits = try self.allocator.alloc(f32, vocab_size);
-        try matmul(self.allocator, normalized, self.weights.t_linear_w, logits, 1, vocab_size, dim);
-
-        accumulate(logits, self.weights.t_linear_b);
-
-        return logits;
-    }
-
     fn attention_block(self: Self, x: []f32, pos: usize, q_len: usize, layer: usize, output: []f32) !void {
         const dim = self.config.dim;
         const n_heads = self.config.n_heads;
@@ -1595,11 +1526,21 @@ const Model = struct {
         const bias = self.weights.t_Wqkv_b[layer * dim * 3 .. (layer + 1) * dim * 3];
         broadcast_add(qkv, bias, q_len);
 
-        // 2. Split QKV and reshape to [n_heads, seq_len, head_dim]
+        // Debug QKV ranges
+        {
+            var qkv_min: f32 = std.math.inf(f32);
+            var qkv_max: f32 = -std.math.inf(f32);
+            for (qkv) |v| {
+                if (v < qkv_min) qkv_min = v;
+                if (v > qkv_max) qkv_max = v;
+            }
+            std.debug.print("QKV after projection: min={d:.4}, max={d:.4}\n", .{ qkv_min, qkv_max });
+        }
+
+        // 2. Split QKV
         const q = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
         const k = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
         const v = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
-
         const q_r = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
         const k_r = try self.allocator.alloc(f32, n_heads * q_len * head_dim);
         defer self.allocator.free(q);
@@ -1610,26 +1551,20 @@ const Model = struct {
 
         try self.split_qkv(qkv, q, k, v, q_len);
 
-        // out is (seq_len, dim) now.
-        // we are not reshaping.
-
-        // 3. Apply rotary embeddings
+        // 3. Position handling and rotary embeddings
         const position_ids = try self.allocator.alloc(usize, q_len);
         defer self.allocator.free(position_ids);
+
         for (0..q_len) |i| {
-            position_ids[i] = pos + i;
+            position_ids[i] = pos + i; // Sequential positions regardless of batch/generation
         }
 
         try self.apply_rotary_emb(q, self.freqs_cis, position_ids, q_r);
         try self.apply_rotary_emb(k, self.freqs_cis, position_ids, k_r);
-
         @memcpy(q, q_r);
         @memcpy(k, k_r);
 
-        // In attention_block:
-        // After we have Q, K, V in [seq_len, dim] format and have applied rotary embeddings
-
-        // 4. Handle KV Cache
+        // 4. KV Cache handling
         const past_seq_len = if (pos > 0) pos else 0;
         const total_seq_len = past_seq_len + q_len;
 
@@ -1637,7 +1572,7 @@ const Model = struct {
             return error.SequenceTooLong;
         }
 
-        // Update cache with new K/V
+        // Update KV cache at the correct positions
         const cache_layer_offset = layer * self.config.seq_len * dim;
         for (0..q_len) |i| {
             const cache_pos = past_seq_len + i;
@@ -1648,30 +1583,28 @@ const Model = struct {
             @memcpy(self.state.v_cache[cache_offset .. cache_offset + dim], v[src_offset .. src_offset + dim]);
         }
 
-        // 4.1. Prepare combined K/V buffers for attention
+        // Prepare combined K/V buffers
         const k_combined = try self.allocator.alloc(f32, total_seq_len * dim);
         const v_combined = try self.allocator.alloc(f32, total_seq_len * dim);
         defer self.allocator.free(k_combined);
         defer self.allocator.free(v_combined);
 
-        // Copy past context from cache
         if (past_seq_len > 0) {
             const cache_start = cache_layer_offset;
             @memcpy(k_combined[0 .. past_seq_len * dim], self.state.k_cache[cache_start .. cache_start + past_seq_len * dim]);
             @memcpy(v_combined[0 .. past_seq_len * dim], self.state.v_cache[cache_start .. cache_start + past_seq_len * dim]);
         }
 
-        // Copy current context
         @memcpy(k_combined[past_seq_len * dim .. total_seq_len * dim], k[0 .. q_len * dim]);
         @memcpy(v_combined[past_seq_len * dim .. total_seq_len * dim], v[0 .. q_len * dim]);
 
-        // 5. Call SDPA with combined buffers
+        // 5. Scaled dot product attention
         const attn_out = try self.allocator.alloc(f32, q_len * dim);
         defer self.allocator.free(attn_out);
 
         try self.scaled_dot_product_attention(q, k_combined, v_combined, q_len, pos, total_seq_len, attn_out);
 
-        // 6. Then apply output projection [seq_len, dim] -> [seq_len, dim]
+        // 6. Output projection
         try matmul(
             self.allocator,
             attn_out,
@@ -1682,30 +1615,39 @@ const Model = struct {
             dim,
         );
 
-        // Add output projection bias
         const out_bias = self.weights.t_out_proj_bias[layer * dim .. (layer + 1) * dim];
         broadcast_add(output, out_bias, q_len);
     }
 
     fn split_qkv(self: Self, qkv: []const f32, q: []f32, k: []f32, v: []f32, q_len: usize) !void {
         const dim = self.config.dim;
+        const head_dim = self.config.head_dim;
+        const n_heads = self.config.n_heads;
+
+        // Important: verify dim = n_heads * head_dim
+        std.debug.assert(dim == n_heads * head_dim);
 
         for (0..q_len) |seq_idx| {
-            const qkv_offset = seq_idx * (dim * 3);
-            const out_offset = seq_idx * dim;
+            const qkv_start = seq_idx * (dim * 3);
+            const seq_out_start = seq_idx * dim;
 
-            // Keep dim order, just split Q, K, V
-            @memcpy(q[out_offset .. out_offset + dim], qkv[qkv_offset .. qkv_offset + dim]);
-            @memcpy(k[out_offset .. out_offset + dim], qkv[qkv_offset + dim .. qkv_offset + 2 * dim]);
-            @memcpy(v[out_offset .. out_offset + dim], qkv[qkv_offset + 2 * dim .. qkv_offset + 3 * dim]);
+            // The input qkv is [seq_len, 3*dim]
+            // We want to rearrange it to [seq_len, dim] for each of q,k,v
+            // While preserving head arrangement within dim
+            @memcpy(q[seq_out_start .. seq_out_start + dim], qkv[qkv_start .. qkv_start + dim]);
+            @memcpy(k[seq_out_start .. seq_out_start + dim], qkv[qkv_start + dim .. qkv_start + 2 * dim]);
+            @memcpy(v[seq_out_start .. seq_out_start + dim], qkv[qkv_start + 2 * dim .. qkv_start + 3 * dim]);
         }
+
+        // Debug print to verify shapes
+        std.debug.print("QKV split dims: seq_len={d}, dim={d}, n_heads={d}, head_dim={d}\n", .{ q_len, dim, n_heads, head_dim });
     }
 
     fn scaled_dot_product_attention(
         self: Self,
-        q: []const f32, // [q_len, dim]
-        k: []const f32, // [total_seq_len, dim]
-        v: []const f32, // [total_seq_len, dim]
+        q: []const f32,
+        k: []const f32,
+        v: []const f32,
         q_len: usize,
         pos: usize,
         total_seq_len: usize,
@@ -1716,27 +1658,29 @@ const Model = struct {
         const head_dim = self.config.head_dim;
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-        // Create attention mask
         const attn_mask = try self.allocator.alloc(f32, q_len * total_seq_len);
         defer self.allocator.free(attn_mask);
         make_attention_mask(attn_mask, q_len, pos, total_seq_len);
 
-        // Allocate scores matrix
         const scores = try self.allocator.alloc(f32, q_len * total_seq_len);
-        defer self.allocator.free(scores);
 
-        // For each head
+        std.debug.assert(scores.len == attn_mask.len);
+        std.debug.assert(scores.len == q_len * total_seq_len);
+        const head_output = try self.allocator.alloc(f32, q_len * dim);
+        defer self.allocator.free(scores);
+        defer self.allocator.free(head_output);
+
+        @memset(output, 0); // Important: initialize output to zero
+
         for (0..n_heads) |h| {
             const head_offset = h * head_dim;
 
-            // Calculate attention scores for this head's portion
+            // Compute scores for this head
             for (0..q_len) |i| {
+                const q_offset = i * dim + head_offset;
                 for (0..total_seq_len) |j| {
-                    var score: f32 = 0;
-                    const q_offset = i * dim + head_offset;
                     const k_offset = j * dim + head_offset;
-
-                    // Dot product of q[i] and k[j] for this head
+                    var score: f32 = 0;
                     for (0..head_dim) |d| {
                         score += q[q_offset + d] * k[k_offset + d];
                     }
@@ -1744,51 +1688,63 @@ const Model = struct {
                 }
             }
 
-            // Apply mask
-            for (0..q_len * total_seq_len) |i| {
-                if (attn_mask[i] == 0) {
-                    scores[i] = -std.math.inf(f32);
-                }
-            }
+            // Apply mask and softmax
+            for (0..q_len) |i| {
+                const row_start = i * total_seq_len;
+                const row = scores[row_start .. row_start + total_seq_len];
 
-            // Apply softmax row-wise
-            var i: usize = 0;
-            while (i < q_len) : (i += 1) {
-                const row = scores[i * total_seq_len .. (i + 1) * total_seq_len];
+                // Apply mask
+                for (0..total_seq_len) |j| {
+                    if (attn_mask[i * total_seq_len + j] == 0) {
+                        scores[row_start + j] = -std.math.inf(f32);
+                    }
+                }
                 try apply_softmax(row);
             }
-            // Compute attention output for this head
-            for (0..q_len) |seq| {
-                const out_offset = seq * dim + head_offset;
 
-                // Initialize output for this position to 0
-                @memset(output[out_offset .. out_offset + head_dim], 0);
+            // Debug attention pattern
+            if (h == 0) { // Print only for first head
+                std.debug.print("Head 0 attention pattern (first token): ", .{});
+                const first_row = scores[0..@min(total_seq_len, 5)];
+                for (first_row) |score| {
+                    std.debug.print("{d:.3} ", .{score});
+                }
+                std.debug.print("\n", .{});
+            }
 
-                // Weighted sum of values
+            // Compute head output - IMPORTANT: use += for accumulation
+            for (0..q_len) |i| {
                 for (0..total_seq_len) |j| {
-                    const score = scores[seq * total_seq_len + j];
+                    const score = scores[i * total_seq_len + j];
                     const v_offset = j * dim + head_offset;
 
+                    // Accumulate to this head's section
                     for (0..head_dim) |d| {
-                        output[out_offset + d] += score * v[v_offset + d];
+                        output[i * dim + head_offset + d] += score * v[v_offset + d];
                     }
                 }
             }
         }
     }
-
     fn make_attention_mask(mask: []f32, q_len: usize, pos: usize, total_seq_len: usize) void {
-        // Fill all positions as 1.0 initially
-        @memset(mask, 1.0);
+        @memset(mask, 0.0); // Start with all masked
+        std.debug.assert(mask.len == q_len * total_seq_len);
 
-        // For the new sequence positions (from pos onwards), apply causal masking
         for (0..q_len) |i| {
             const row_start = i * total_seq_len;
-            // Start masking from pos + i + 1 to enforce causality for new tokens
-            for (pos + i + 1..total_seq_len) |j| {
-                mask[row_start + j] = 0.0;
+            // Allow attention up to current position
+            const attn_up_to = pos + i + 1;
+            for (0..attn_up_to) |j| {
+                mask[row_start + j] = 1.0;
             }
         }
+
+        // Debug print
+        std.debug.print("Mask for pos={d} (first row): ", .{pos});
+        for (mask[0..@min(total_seq_len, 10)]) |v| {
+            std.debug.print("{d:.0} ", .{v});
+        }
+        std.debug.print("\n", .{});
     }
 
     const Complex = struct {
@@ -1959,6 +1915,29 @@ const Model = struct {
         @memcpy(output, fc2_out);
     }
 
+    fn lm_head(self: Self, hidden_states: []f32) ![]f32 {
+        const dim = self.config.dim;
+        const vocab_size = self.config.vocab;
+
+        // Only take the last token's hidden state
+        // const last_hidden = hidden_states[(q_len - 1) * dim .. q_len * dim];
+
+        // Normalize before projection
+        const normalized = try self.allocator.alloc(f32, dim);
+        defer self.allocator.free(normalized);
+        @memcpy(normalized, hidden_states);
+
+        try layer_norm(normalized, &.{dim}, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
+
+        // Project to vocabulary
+        const logits = try self.allocator.alloc(f32, vocab_size);
+        try matmul(self.allocator, normalized, self.weights.t_linear_w, logits, 1, vocab_size, dim);
+
+        accumulate(logits, self.weights.t_linear_b);
+
+        return logits;
+    }
+
     pub const LayerNormError = error{
         EmptyInput,
         DimensionMismatch,
@@ -2094,6 +2073,7 @@ const Model = struct {
             @memcpy(text_embed[dst_start..dst_end], self.weights.word_token_embedding[src_start..src_end]);
         }
 
+        std.debug.print("text embed len {any}", .{text_embed.len});
         return text_embed;
     }
 
@@ -2794,13 +2774,6 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
     @memset(model.state.k_cache, 0);
     @memset(model.state.v_cache, 0);
 
-    // std.debug.print("ln1 weights : {d:.4} \n", .{model.weights.t_ln_w[0..4]});
-    // std.debug.print("ln1 bias : {d:.4} \n", .{model.weights.t_ln_b[0..4]});
-    // std.debug.print("qkv weight: {d:.4} \n", .{model.weights.t_Wqkv_w[0..4]});
-    // std.debug.print("qkv bias: {d:.4} \n", .{model.weights.t_Wqkv_b[0..4]});
-    // std.debug.print("attn weight {d:.4} \n", .{model.weights.t_out_proj_w[0..4]});
-    // std.debug.print("attn bias {d:.4} \n", .{model.weights.t_out_proj_b[0..4]});
-
     // std.debug.print("====================================================\n", .{});
 
     // Process image
@@ -2832,8 +2805,8 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
         const text_embeddings = try model.embed_tokens(context_tokens);
         defer allocator.free(text_embeddings);
 
-        const init_embedding = try model.merge_embed(text_embeddings, model.state.projection);
-        // const init_embedding = text_embeddings;
+        // const init_embedding = try model.merge_embed(text_embeddings, model.state.projection);
+        const init_embedding = text_embeddings;
         defer model.allocator.free(init_embedding);
 
         // Initialize full context
@@ -2951,7 +2924,20 @@ fn get_top_k_indices(allocator: std.mem.Allocator, logits: []const f32, k: usize
 }
 
 pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var gpa = std.heap.GeneralPurposeAllocator(.{
+        .enable_memory_limit = true,
+        .safety = true,
+        .never_unmap = false,
+        .retain_metadata = true,
+    }){};
+    defer {
+        const check = gpa.deinit();
+        if (check == .leak) {
+            std.debug.print("Memory leak detected!\n", .{});
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
     const allocator = arena.allocator();
 
@@ -3035,99 +3021,113 @@ test "tokenizer" {
     }
     const allocator = gpa.allocator();
 
-    var tokenizer = try Tokenizer.fromFile("../tokenizer.bin", allocator);
+    var tokenizer = try Tokenizer.fromFile("/home/snow/projects/moondream-zig/tokenizer.bin", allocator);
     defer tokenizer.deinit();
 
-    // Simple token tests
     {
-        std.debug.print("\n=== Token Map Contents ===\n", .{});
-        var token_it = tokenizer.tokens.iterator();
-        while (token_it.next()) |entry| {
-            if (entry.value_ptr.* == 31640 or entry.value_ptr.* == 25966) {
-                std.debug.print("Token {}: '{s}' (len: {})\nBytes: ", .{
-                    entry.value_ptr.*,
-                    entry.key_ptr.*,
-                    entry.key_ptr.*.len,
-                });
-                for (entry.key_ptr.*) |byte| {
-                    std.debug.print("{x:0>2} ", .{byte});
-                }
-                std.debug.print("\n", .{});
-            }
-        }
-    }
-
-    // Special tokens handling test
-    {
-        std.debug.print("\n=== Testing special tokens handling ===\n", .{});
-        var tokens = std.ArrayList(u32).init(allocator);
+        std.debug.print("\n=== Testing Special Character Encoding ===\n", .{});
+        const test_str = "a\nb";
+        var tokens = try tokenizer.encode(test_str);
         defer tokens.deinit();
-        try tokens.appendSlice(&[_]u32{ tokenizer.bos_token, 31640, 25966, tokenizer.eos_token });
 
-        const decoded = try tokenizer.decode(tokens);
-        defer allocator.free(decoded);
-        std.debug.print("BOS+Moondream+EOS decoded: '{s}'\n", .{decoded});
-        std.debug.print("Decoded length: {}\n", .{decoded.len});
-        std.debug.print("Bytes in hex: ", .{});
-        for (decoded) |byte| {
-            std.debug.print("{x:0>2} ", .{byte});
+        std.debug.print("Input: 'a\\nb'\n", .{});
+        std.debug.print("Tokens: ", .{});
+        for (tokens.items) |token| {
+            std.debug.print("{} ", .{token});
         }
         std.debug.print("\n", .{});
 
-        try std.testing.expectEqualStrings("Moondream", decoded);
-    }
-
-    // Basic decoding test
-    {
-        std.debug.print("\n=== Testing basic decoding ===\n", .{});
-        var tokens = std.ArrayList(u32).init(allocator);
-        defer tokens.deinit();
-        try tokens.appendSlice(&[_]u32{ 31640, 25966 });
-
         const decoded = try tokenizer.decode(tokens);
         defer allocator.free(decoded);
-        std.debug.print("Moondream tokens decoded: '{s}'\n", .{decoded});
-        std.debug.print("Decoded length: {}\n", .{decoded.len});
-        std.debug.print("Bytes in hex: ", .{});
-        for (decoded) |byte| {
-            std.debug.print("{x:0>2} ", .{byte});
-        }
-        std.debug.print("\n", .{});
+        std.debug.print("Decoded: '{s}'\n", .{decoded});
     }
 
-    // Individual token tests
+    // First, let's examine special tokens
     {
-        std.debug.print("\n=== Testing individual tokens ===\n", .{});
-
-        {
-            var tokens = std.ArrayList(u32).init(allocator);
-            defer tokens.deinit();
-            try tokens.append(31640);
-            const decoded = try tokenizer.decode(tokens);
-            defer allocator.free(decoded);
-            std.debug.print("Token 31640 decodes to: '{s}'\n", .{decoded});
-        }
-
-        {
-            var tokens = std.ArrayList(u32).init(allocator);
-            defer tokens.deinit();
-            try tokens.append(25966);
-            const decoded = try tokenizer.decode(tokens);
-            defer allocator.free(decoded);
-            std.debug.print("Token 25966 decodes to: '{s}'\n", .{decoded});
+        std.debug.print("\n=== Special Tokens Analysis ===\n", .{});
+        for (tokenizer.special_tokens.items) |special| {
+            std.debug.print("Special token ID {}: '{s}' (is_special: {})\n", .{
+                special.id,
+                special.content,
+                special.is_special,
+            });
         }
     }
 
-    // Control token test
+    // Test full prompt tokenization
     {
-        std.debug.print("\n=== Testing control tokens ===\n", .{});
+        std.debug.print("\n=== Testing Full Prompt Tokenization ===\n", .{});
+        const prompt = "<image>\nQuestion: what is in this image?\nAnswer:";
+        var tokens = try tokenizer.encode(prompt);
+        defer tokens.deinit();
+
+        std.debug.print("Input prompt: '{s}'\n", .{prompt});
+        std.debug.print("Token sequence ({} tokens):\n", .{tokens.items.len});
+        for (tokens.items, 0..) |token, i| {
+            // Try to decode each token individually
+            var single_token = std.ArrayList(u32).init(allocator);
+            defer single_token.deinit();
+            try single_token.append(token);
+            const decoded = try tokenizer.decode(single_token);
+            defer allocator.free(decoded);
+
+            std.debug.print("Token {}: ID {} -> '{s}'\n", .{ i, token, decoded });
+        }
+    }
+
+    // Test with BOS token prepended
+    {
+        std.debug.print("\n=== Testing with BOS Token ===\n", .{});
+        const prompt = "<image>\nQuestion: what is in this image?\nAnswer:";
         var tokens = std.ArrayList(u32).init(allocator);
         defer tokens.deinit();
+
+        // Add BOS token
         try tokens.append(tokenizer.bos_token);
-        const decoded = try tokenizer.decode(tokens);
-        defer allocator.free(decoded);
-        std.debug.print("BOS token decoded: '{s}'\n", .{decoded});
-        std.debug.print("BOS decoded length: {}\n", .{decoded.len});
+
+        // Add encoded prompt
+        var prompt_tokens = try tokenizer.encode(prompt);
+        defer prompt_tokens.deinit();
+        try tokens.appendSlice(prompt_tokens.items);
+
+        std.debug.print("Full token sequence with BOS ({} tokens):\n", .{tokens.items.len});
+        for (tokens.items, 0..) |token, i| {
+            var single_token = std.ArrayList(u32).init(allocator);
+            defer single_token.deinit();
+            try single_token.append(token);
+            const decoded = try tokenizer.decode(single_token);
+            defer allocator.free(decoded);
+
+            std.debug.print("Token {}: ID {} -> '{s}'\n", .{ i, token, decoded });
+        }
+
+        // Try decoding the full sequence
+        const full_decoded = try tokenizer.decode(tokens);
+        defer allocator.free(full_decoded);
+        std.debug.print("\nFull sequence decoded: '{s}'\n", .{full_decoded});
+    }
+
+    // Test edge cases
+    {
+        std.debug.print("\n=== Testing Edge Cases ===\n", .{});
+
+        // Test empty string
+        {
+            var tokens = try tokenizer.encode("");
+            defer tokens.deinit();
+            std.debug.print("Empty string produces {} tokens\n", .{tokens.items.len});
+        }
+
+        // Test whitespace handling
+        {
+            var tokens = try tokenizer.encode(" \n \t ");
+            defer tokens.deinit();
+            std.debug.print("Whitespace string produces {} tokens: ", .{tokens.items.len});
+            for (tokens.items) |token| {
+                std.debug.print("{} ", .{token});
+            }
+            std.debug.print("\n", .{});
+        }
     }
 }
 

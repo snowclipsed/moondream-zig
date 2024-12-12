@@ -19,6 +19,10 @@ pub fn build(b: *std.Build) void {
         .owner = b,
         .sub_path = "dependencies",
     } });
+    exe.addIncludePath(std.Build.LazyPath{ .src_path = .{
+        .owner = b,
+        .sub_path = "dependencies",
+    } });
 
     // Link the stb_image library
     exe.linkSystemLibrary("stb_image");
