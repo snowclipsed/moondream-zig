@@ -3405,7 +3405,7 @@ pub fn main() !void {
     // initializing model struct //
     var model = try Model.init(config, weights, tokenizer, state, allocator);
 
-    const prompt = "Explain the image in detail!";
+    const prompt = "Describe the image";
     // const max_new_tokens = 5;
 
     var timer = try std.time.Timer.start();
