@@ -29,15 +29,21 @@ pub fn Tensor(comptime DataType: type) type {
         /// Errors:
         /// - Returns an error if memory allocation for the shape or data fails.
         pub fn init(allocator: Allocator, shape: []const usize) !Self {
-            var size: usize = 1;
+            var size: u128 = 1;
             for (shape) |dim| {
-                size *= dim;
+                size = size * dim;
+                // Check if we would overflow usize
+                if (size > std.math.maxInt(usize)) {
+                    std.debug.print("size entered = {any}", .{size});
+                    return error.TensorTooLarge;
+                }
             }
-
             const shape_copy = try allocator.alloc(usize, shape.len);
             @memcpy(shape_copy, shape);
 
-            const data = try allocator.alignedAlloc(DataType, 32, size);
+            // Now we know size fits in usize
+            const final_size: usize = @intCast(size);
+            const data = try allocator.alignedAlloc(DataType, 32, final_size);
             @memset(data, 0);
 
             return Self{
