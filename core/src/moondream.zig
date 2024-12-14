@@ -1391,6 +1391,8 @@ const Tokenizer = struct {
 
             // Handle special replacements
             switch (token_id) {
+                198 => try decoded_text.appendSlice("\n"),
+                220 => try decoded_text.appendSlice(" "),
                 32 => try decoded_text.appendSlice(" "), // Space
                 10 => try decoded_text.appendSlice("\n"), // Newline
                 else => {
@@ -1495,15 +1497,15 @@ const Model = struct {
             defer self.allocator.free(mlp_out);
             try self.mlp(ln_in, q_len, l, mlp_out);
 
-            debug_tensor("attn out ", attn_out, l);
-            debug_tensor("mlp out", mlp_out, l);
+            // debug_tensor("attn out ", attn_out, l);
+            // debug_tensor("mlp out", mlp_out, l);
 
             // Residual connections
             for (0..q_len * dim) |i| {
                 hidden_states[i] += attn_out[i] + mlp_out[i];
             }
 
-            debug_tensor("hidden states after residual", hidden_states, l);
+            // debug_tensor("hidden states after residual", hidden_states, l);
         }
         return hidden_states;
     }
@@ -1534,7 +1536,7 @@ const Model = struct {
         const bias = self.weights.t_Wqkv_b[layer * dim * 3 .. (layer + 1) * dim * 3];
         broadcast_add(qkv, bias, q_len);
 
-        try self.debug_position_alignment(pos, q_len);
+        // try self.debug_position_alignment(pos, q_len);
         self.track_head_magnitudes(qkv, layer, "after_projection");
 
         // 2. Split QKV into head-organized layout [n_heads * q_len * head_dim]
@@ -1578,7 +1580,7 @@ const Model = struct {
         std.debug.print("\n=== Sequence Info ===\n", .{});
         std.debug.print("pos: {d}, q_len: {d}, past_seq_len: {d}, total_seq_len: {d}\n", .{ pos, q_len, past_seq_len, total_seq_len });
 
-        try self.debug_kv_cache_alignment(layer, pos, q_len, total_seq_len);
+        // try self.debug_kv_cache_alignment(layer, pos, q_len, total_seq_len);
 
         if (total_seq_len > self.config.seq_len) {
             return error.SequenceTooLong;
@@ -1694,87 +1696,49 @@ const Model = struct {
 
     fn reorganize_cache_to_heads(
         self: Self,
-        k_cache: []const f32,
-        v_cache: []const f32,
-        k_heads: []f32,
-        v_heads: []f32,
+        k_cache: []const f32, // [seq_len × dim]
+        v_cache: []const f32, // [seq_len × dim]
+        k_heads: []f32, // [n_heads × total_seq_len × head_dim]
+        v_heads: []f32, // [n_heads × total_seq_len × head_dim]
         seq_len: usize,
     ) !void {
         const dim = self.config.dim;
         const head_dim = self.config.head_dim;
         const n_heads = self.config.n_heads;
 
+        // Verify dimensions
+        std.debug.assert(dim == n_heads * head_dim);
+        std.debug.assert(k_cache.len >= seq_len * dim);
+        std.debug.assert(v_cache.len >= seq_len * dim);
+        std.debug.assert(k_heads.len >= n_heads * seq_len * head_dim);
+        std.debug.assert(v_heads.len >= n_heads * seq_len * head_dim);
+
         // Early return if no sequence to process
         if (seq_len == 0) return;
-
-        // Debug prints for dimensions
-        std.debug.print("\n=== Cache to Heads Reorganization ===\n", .{});
-        std.debug.print("seq_len: {d}, dim: {d}, head_dim: {d}, n_heads: {d}\n", .{ seq_len, dim, head_dim, n_heads });
-        std.debug.print("k_cache.len: {d}, v_cache.len: {d}\n", .{ k_cache.len, v_cache.len });
-        std.debug.print("k_heads.len: {d}, v_heads.len: {d}\n", .{ k_heads.len, v_heads.len });
-
-        // Verify dimensions
-        if (k_cache.len < seq_len * dim) {
-            std.debug.print("k_cache too small: need {d}, have {d}\n", .{ seq_len * dim, k_cache.len });
-            return error.CacheSizeMismatch;
-        }
-        if (v_cache.len < seq_len * dim) {
-            std.debug.print("v_cache too small: need {d}, have {d}\n", .{ seq_len * dim, v_cache.len });
-            return error.CacheSizeMismatch;
-        }
-        if (k_heads.len < n_heads * seq_len * head_dim) {
-            std.debug.print("k_heads too small: need {d}, have {d}\n", .{ n_heads * seq_len * head_dim, k_heads.len });
-            return error.HeadBufferSizeMismatch;
-        }
-        if (v_heads.len < n_heads * seq_len * head_dim) {
-            std.debug.print("v_heads too small: need {d}, have {d}\n", .{ n_heads * seq_len * head_dim, v_heads.len });
-            return error.HeadBufferSizeMismatch;
-        }
 
         // Initialize heads to zero
         @memset(k_heads, 0);
         @memset(v_heads, 0);
 
-        // For each head
-        for (0..n_heads) |h| {
-            const head_dim_offset = h * head_dim;
+        // For each sequence position
+        for (0..seq_len) |seq_idx| {
+            const cache_seq_offset = seq_idx * dim;
 
-            // For each sequence position
-            for (0..seq_len) |seq_idx| {
-                const cache_offset = seq_idx * dim + head_dim_offset;
-                const head_offset = h * seq_len * head_dim + seq_idx * head_dim;
+            // For each head
+            for (0..n_heads) |h| {
+                const head_seq_offset = h * seq_len * head_dim + seq_idx * head_dim;
+                const cache_head_offset = h * head_dim;
 
-                // Verify bounds before copy
-                if (cache_offset + head_dim > k_cache.len) {
-                    std.debug.print("Cache access out of bounds: offset {d} + {d} > {d}\n", .{ cache_offset, head_dim, k_cache.len });
-                    return error.CacheAccessOutOfBounds;
-                }
-                if (head_offset + head_dim > k_heads.len) {
-                    std.debug.print("Head buffer access out of bounds: offset {d} + {d} > {d}\n", .{ head_offset, head_dim, k_heads.len });
-                    return error.HeadAccessOutOfBounds;
-                }
+                // Copy K values for this head at this position
+                @memcpy(k_heads[head_seq_offset .. head_seq_offset + head_dim], k_cache[cache_seq_offset + cache_head_offset .. cache_seq_offset + cache_head_offset + head_dim]);
 
-                // Debug first few positions
-                if (h < 2 and seq_idx < 2) {
-                    std.debug.print("Head {d}, Pos {d}: cache_offset={d}, head_offset={d}\n", .{ h, seq_idx, cache_offset, head_offset });
-                    std.debug.print("  K cache values: ", .{});
-                    for (k_cache[cache_offset .. cache_offset + @min(4, head_dim)]) |v| {
-                        std.debug.print("{d:.4} ", .{v});
-                    }
-                    std.debug.print("\n", .{});
-                }
-
-                @memcpy(k_heads[head_offset .. head_offset + head_dim], k_cache[cache_offset .. cache_offset + head_dim]);
-                @memcpy(v_heads[head_offset .. head_offset + head_dim], v_cache[cache_offset .. cache_offset + head_dim]);
+                // Copy V values for this head at this position
+                @memcpy(v_heads[head_seq_offset .. head_seq_offset + head_dim], v_cache[cache_seq_offset + cache_head_offset .. cache_seq_offset + cache_head_offset + head_dim]);
             }
         }
 
         // Verify successful copy
         if (seq_len > 0 and n_heads > 0) {
-            // Check first value isn't zero (assuming cache was initialized)
-            if (k_heads[0] == 0) {
-                std.debug.print("Warning: First value in k_heads is 0\n", .{});
-            }
             verify_head_layout("K after cache reorganization", k_heads, n_heads, seq_len, head_dim);
             verify_head_layout("V after cache reorganization", v_heads, n_heads, seq_len, head_dim);
         }
@@ -1782,16 +1746,23 @@ const Model = struct {
 
     fn reorganize_heads_to_cache(
         self: Self,
-        k_heads: []const f32,
-        v_heads: []const f32,
-        k_cache: []f32,
-        v_cache: []f32,
+        k_heads: []const f32, // [n_heads × q_len × head_dim]
+        v_heads: []const f32, // [n_heads × q_len × head_dim]
+        k_cache: []f32, // [seq_len × dim]
+        v_cache: []f32, // [seq_len × dim]
         q_len: usize,
         cache_offset_pos: usize,
     ) !void {
         const dim = self.config.dim;
         const head_dim = self.config.head_dim;
         const n_heads = self.config.n_heads;
+
+        // Verify dimensions
+        std.debug.assert(dim == n_heads * head_dim);
+        std.debug.assert(k_heads.len >= n_heads * q_len * head_dim);
+        std.debug.assert(v_heads.len >= n_heads * q_len * head_dim);
+        std.debug.assert(k_cache.len >= (cache_offset_pos + q_len) * dim);
+        std.debug.assert(v_cache.len >= (cache_offset_pos + q_len) * dim);
 
         // For each sequence position
         for (0..q_len) |seq_idx| {
@@ -1800,15 +1771,37 @@ const Model = struct {
 
             // For each head
             for (0..n_heads) |h| {
-                const head_dim_offset = h * head_dim;
-                const head_offset = h * q_len * head_dim + seq_idx * head_dim;
+                const cache_head_offset = cache_offset + (h * head_dim);
+                const head_seq_offset = h * q_len * head_dim + seq_idx * head_dim;
 
-                // Copy K values
-                @memcpy(k_cache[cache_offset + head_dim_offset .. cache_offset + head_dim_offset + head_dim], k_heads[head_offset .. head_offset + head_dim]);
+                // Copy K values from this head to cache
+                @memcpy(k_cache[cache_head_offset .. cache_head_offset + head_dim], k_heads[head_seq_offset .. head_seq_offset + head_dim]);
 
-                // Copy V values
-                @memcpy(v_cache[cache_offset + head_dim_offset .. cache_offset + head_dim_offset + head_dim], v_heads[head_offset .. head_offset + head_dim]);
+                // Copy V values from this head to cache
+                @memcpy(v_cache[cache_head_offset .. cache_head_offset + head_dim], v_heads[head_seq_offset .. head_seq_offset + head_dim]);
             }
+        }
+
+        // Verify cache layout if debug enabled
+        if (q_len > 0) {
+            verify_cache_layout("K cache after update", k_cache[cache_offset_pos * dim ..], q_len, dim);
+            verify_cache_layout("V cache after update", v_cache[cache_offset_pos * dim ..], q_len, dim);
+        }
+    }
+
+    fn verify_cache_layout(comptime desc: []const u8, cache: []const f32, seq_len: usize, dim: usize) void {
+        std.debug.print("\n=== Verifying {s} ===\n", .{desc});
+        if (seq_len == 0) return;
+
+        const check_positions = @min(2, seq_len);
+        const check_dims = @min(4, dim);
+
+        for (0..check_positions) |pos| {
+            std.debug.print("Position {d}: ", .{pos});
+            for (0..check_dims) |d| {
+                std.debug.print("{d:.4} ", .{cache[pos * dim + d]});
+            }
+            std.debug.print("\n", .{});
         }
     }
 
@@ -1825,41 +1818,27 @@ const Model = struct {
         const dim = self.config.dim;
         const n_heads = self.config.n_heads;
         const head_dim = self.config.head_dim;
+
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-        // Verify input dimensions
+        // Verify dimensions
         std.debug.assert(q.len == n_heads * q_len * head_dim);
         std.debug.assert(k.len == n_heads * total_seq_len * head_dim);
         std.debug.assert(v.len == n_heads * total_seq_len * head_dim);
         std.debug.assert(output.len == q_len * dim);
         std.debug.assert(dim == n_heads * head_dim);
 
-        // Verify input layouts
-        verify_head_layout("Q input", q, n_heads, q_len, head_dim);
-        verify_head_layout("K input", k, n_heads, total_seq_len, head_dim);
-        verify_head_layout("V input", v, n_heads, total_seq_len, head_dim);
+        // Initialize output to zero
+        @memset(output, 0);
 
-        // Allocate scores for current head
+        // Allocate attention scores
         const scores = try self.allocator.alloc(f32, q_len * total_seq_len);
         defer self.allocator.free(scores);
 
-        // Create attention mask
+        // Create and initialize attention mask
         const attn_mask = try self.allocator.alloc(f32, q_len * total_seq_len);
         defer self.allocator.free(attn_mask);
         make_attention_mask(attn_mask, q_len, pos, total_seq_len);
-
-        // Debug attention mask
-        std.debug.print("\n=== Attention Mask ===\n", .{});
-        for (0..@min(3, q_len)) |i| {
-            std.debug.print("Query {d}: ", .{i});
-            for (0..@min(8, total_seq_len)) |j| {
-                std.debug.print("{d:.0} ", .{attn_mask[i * total_seq_len + j]});
-            }
-            std.debug.print("\n", .{});
-        }
-
-        // Initialize output to zero
-        @memset(output, 0);
 
         // Process each head
         for (0..n_heads) |h| {
@@ -1867,143 +1846,155 @@ const Model = struct {
             const k_head_offset = h * total_seq_len * head_dim;
             const v_head_offset = h * total_seq_len * head_dim;
 
-            // Debug head processing
-            if (h < 2) { // Only first two heads
+            if (h < 2) {
                 std.debug.print("\n=== Processing Head {d} ===\n", .{h});
-                std.debug.print("Offsets - Q: {d}, K: {d}, V: {d}\n", .{ q_head_offset, k_head_offset, v_head_offset });
             }
 
-            // Compute attention scores for this head
+            // 1. Compute Q @ K.transpose(-2, -1) with scaling
             for (0..q_len) |i| {
                 const q_offset = q_head_offset + i * head_dim;
+                const score_offset = i * total_seq_len;
+
                 for (0..total_seq_len) |j| {
                     const k_offset = k_head_offset + j * head_dim;
                     var score: f32 = 0;
 
-                    // Compute dot product for this q-k pair
+                    // Dot product
                     for (0..head_dim) |d| {
                         score += q[q_offset + d] * k[k_offset + d];
                     }
-                    scores[i * total_seq_len + j] = score * scale;
+
+                    // Apply scaling
+                    scores[score_offset + j] = score * scale;
                 }
-            }
 
-            // Debug raw scores before mask/softmax
-            if (h < 2) {
-                std.debug.print("\nRaw scores before mask/softmax:\n", .{});
-                verify_attention_pattern(scores, q_len, total_seq_len, pos, h);
-            }
-
-            // Apply mask and softmax for each query position
-            for (0..q_len) |i| {
-                const row_start = i * total_seq_len;
-                const row = scores[row_start .. row_start + total_seq_len];
-
-                // Apply mask
+                // Apply attention mask by setting scores to -inf where mask is 0
                 for (0..total_seq_len) |j| {
+                    const idx = score_offset + j;
                     if (attn_mask[i * total_seq_len + j] == 0) {
-                        scores[row_start + j] = -std.math.inf(f32);
+                        scores[idx] = -std.math.inf(f32);
                     }
                 }
-                try apply_softmax(row);
-            }
 
-            // Debug scores after mask/softmax
-            if (h < 2) {
-                std.debug.print("\nScores after mask/softmax:\n", .{});
-                verify_attention_pattern(scores, q_len, total_seq_len, pos, h);
-            }
-
-            // Compute weighted sum of values for this head
-            for (0..q_len) |i| {
-                const out_offset = i * dim + h * head_dim;
-
-                // Debug value accumulation for first few positions
-                if (h < 2 and i < 2) {
-                    std.debug.print("Head {d}, Query {d} output offset: {d}\n", .{ h, i, out_offset });
+                // Find max for numerical stability (excluding -inf)
+                var max_score: f32 = -std.math.inf(f32);
+                for (0..total_seq_len) |j| {
+                    const score = scores[score_offset + j];
+                    if (score != -std.math.inf(f32) and score > max_score) {
+                        max_score = score;
+                    }
                 }
 
-                // Initialize output position
+                // Apply softmax
+                var sum: f32 = 0;
+                for (0..total_seq_len) |j| {
+                    const idx = score_offset + j;
+                    if (scores[idx] != -std.math.inf(f32)) {
+                        scores[idx] = @exp(scores[idx] - max_score);
+                        sum += scores[idx];
+                    } else {
+                        scores[idx] = 0;
+                    }
+                }
+
+                // Normalize
+                if (sum > 0) {
+                    const inv_sum = 1.0 / sum;
+                    for (0..total_seq_len) |j| {
+                        scores[score_offset + j] *= inv_sum;
+                    }
+                }
+
+                // Debug print attention distribution
+                if (h < 2 and i < 2) {
+                    std.debug.print("Head {d} Query {d} attention scores:\n", .{ h, i });
+                    for (0..@min(total_seq_len, 10)) |j| {
+                        std.debug.print("{d:.4} ", .{scores[score_offset + j]});
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
+
+            // 2. @ V - Compute weighted sum of values
+            for (0..q_len) |i| {
+                const out_offset = i * dim + h * head_dim;
                 @memset(output[out_offset .. out_offset + head_dim], 0);
 
-                // Accumulate weighted values
                 for (0..total_seq_len) |j| {
                     const score = scores[i * total_seq_len + j];
                     const v_offset = v_head_offset + j * head_dim;
 
-                    // Add weighted values to output
                     for (0..head_dim) |d| {
                         output[out_offset + d] += score * v[v_offset + d];
                     }
                 }
-            }
 
-            // Debug output for this head
-            if (h < 2) {
-                std.debug.print("\nOutput values for head {d}:\n", .{h});
-                for (0..@min(2, q_len)) |i| {
-                    const out_offset = i * dim + h * head_dim;
-                    std.debug.print("Query {d}: ", .{i});
-                    for (0..@min(4, head_dim)) |d| {
+                // Debug output values
+                if (h < 2 and i < 2) {
+                    std.debug.print("Head {d} Query {d} output values:\n", .{ h, i });
+                    for (0..@min(head_dim, 4)) |d| {
                         std.debug.print("{d:.4} ", .{output[out_offset + d]});
                     }
                     std.debug.print("\n", .{});
                 }
             }
         }
-
-        // Verify final output statistics
-        var max_val: f32 = -std.math.inf(f32);
-        var min_val: f32 = std.math.inf(f32);
-        var sum: f32 = 0;
-        for (output) |val| {
-            max_val = @max(max_val, val);
-            min_val = @min(min_val, val);
-            sum += val;
-        }
-        const mean = sum / @as(f32, @floatFromInt(output.len));
-
-        std.debug.print("\n=== Final Output Statistics ===\n", .{});
-        std.debug.print("Min: {d:.4}, Max: {d:.4}, Mean: {d:.4}\n", .{ min_val, max_val, mean });
     }
 
+    const OutputStats = struct {
+        max: f32,
+        min: f32,
+        sum: f32,
+    };
+
     fn make_attention_mask(mask: []f32, q_len: usize, pos: usize, total_seq_len: usize) void {
-        @memset(mask, 0.0); // Start with all masked
         std.debug.assert(mask.len == q_len * total_seq_len);
 
+        // Initialize mask to all ones (allowing attention)
+        @memset(mask, 1.0);
+
+        std.debug.print("\n=== Attention Mask Generation ===\n", .{});
+        std.debug.print("q_len: {d}, pos: {d}, total_seq_len: {d}\n", .{ q_len, pos, total_seq_len });
+
+        // First handle the prompt part (before pos)
+        // All queries can attend to all positions before pos
         for (0..q_len) |i| {
             const row_start = i * total_seq_len;
-            const current_pos = pos + i; // Absolute position in sequence
+            const query_pos = pos + i; // Absolute position of this query
 
-            // Can attend to all positions up to and including current_pos
-            for (0..current_pos + 1) |j| {
-                mask[row_start + j] = 1.0;
+            // For positions after pos, apply causal masking
+            for (pos..total_seq_len) |j| {
+                const mask_idx = row_start + j;
+                if (j > query_pos) {
+                    mask[mask_idx] = 0.0; // Cannot attend to future positions
+                }
             }
 
             // Debug first few positions
-            if (i == 0) {
-                std.debug.print("\nMask for pos={d}: ", .{current_pos});
-                for (0..@min(total_seq_len, 10)) |j| {
-                    std.debug.print("{d:.0} ", .{mask[row_start + j]});
+            if (i < 2) {
+                std.debug.print("\nQuery {d} (absolute pos {d}) mask:\n", .{ i, query_pos });
+                for (0..@min(10, total_seq_len)) |j| {
+                    std.debug.print("pos {d}: {d:.0} ", .{ j, mask[row_start + j] });
                 }
+                std.debug.print("\n", .{});
             }
         }
 
-        for (0..q_len) |i| {
-            const row_start = i * total_seq_len;
-            // Allow attention up to current position
-            const attn_up_to = pos + i + 1;
-            for (0..attn_up_to) |j| {
-                mask[row_start + j] = 1.0;
+        // Verify mask correctness
+        if (q_len > 0) {
+            std.debug.print("\nFirst query position mask check:\n", .{});
+            std.debug.print("Can attend up to: {d}\n", .{pos});
+
+            // Print first few positions of first few queries
+            for (0..@min(3, q_len)) |i| {
+                const row_start = i * total_seq_len;
+                std.debug.print("Query {d} can attend to: ", .{i});
+                for (0..@min(8, total_seq_len)) |j| {
+                    std.debug.print("{d} ", .{mask[row_start + j]});
+                }
+                std.debug.print("\n", .{});
             }
         }
-
-        // // Debug print
-        // std.debug.print("Mask for pos={d} (first row): ", .{pos});
-        // for (mask[0..@min(total_seq_len, 10)]) |v| {
-        //     std.debug.print("{d:.0} ", .{v});
-        // }
-        // std.debug.print("\n", .{});
     }
 
     const Complex = struct {
@@ -2012,26 +2003,29 @@ const Model = struct {
     };
 
     fn precompute_freqs_cis(self: Self, dim: usize, end: usize, theta: f32) ![]Complex {
-        const num_freqs = dim / 2; // For dim=8, this gives us 4 base frequencies
+        // For dim=32, we need 16 frequencies (dim//2)
+        const num_freqs = dim / 2;
 
-        // Calculate base frequencies exactly like PyTorch
+        // Calculate base frequencies
         var freqs = try self.allocator.alloc(f32, num_freqs);
         defer self.allocator.free(freqs);
 
-        // Calculate inverse frequencies exactly like PyTorch
+        // Important: Step by 2 in frequency calculation to match PyTorch
+        // freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim//2)] / dim))
         for (0..num_freqs) |i| {
-            // Important: use i*2 to match PyTorch's arange(0, dim, 2)
             const exponent = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(dim));
             freqs[i] = 1.0 / std.math.pow(f32, theta, exponent);
         }
 
-        // Allocate space for complex rotations for each position
+        // Allocate output complex frequencies
         const freqs_cis = try self.allocator.alloc(Complex, end * num_freqs);
 
-        // This is equivalent to t.unsqueeze(1) * freqs.unsqueeze(0)
+        // Outer product of positions and frequencies
+        // t.unsqueeze(1) * freqs.unsqueeze(0)
         for (0..end) |t| {
+            const t_float = @as(f32, @floatFromInt(t));
             for (0..num_freqs) |i| {
-                const freq = @as(f32, @floatFromInt(t)) * freqs[i];
+                const freq = t_float * freqs[i];
                 freqs_cis[t * num_freqs + i] = Complex{
                     .real = std.math.cos(freq),
                     .imag = std.math.sin(freq),
@@ -2041,9 +2035,10 @@ const Model = struct {
 
         return freqs_cis;
     }
+
     fn apply_rotary_emb(
         self: Self,
-        x: []const f32, // [n_heads * seq_len * head_dim]
+        x: []const f32, // [n_heads × seq_len × head_dim]
         freqs_cis: []const Complex,
         position_ids: []const usize,
         out: []f32,
@@ -2051,14 +2046,15 @@ const Model = struct {
         const head_dim = self.config.head_dim;
         const n_heads = self.config.n_heads;
         const seq_len = position_ids.len;
-        const rot_dim = @min(head_dim, 32);
-        const half_rot_dim = rot_dim / 2;
+        const rot_dim = 32; // Fixed to match PyTorch implementation
+        const half_rot_dim = rot_dim / 2; // This is how many complex pairs we'll rotate
 
         std.debug.assert(x.len == n_heads * seq_len * head_dim);
         std.debug.assert(out.len == x.len);
+        std.debug.assert(rot_dim <= head_dim);
 
-        // Verify input layout before rotation
-        verify_head_layout("Pre-Rotary", x, n_heads, seq_len, head_dim);
+        // Initialize output with input
+        @memcpy(out, x);
 
         // For each head
         for (0..n_heads) |h| {
@@ -2070,36 +2066,46 @@ const Model = struct {
                 const seq_offset = s * head_dim;
                 const x_offset = head_offset + seq_offset;
 
-                // Debug first few positions
-                if (h < 2 and s < 2) {
-                    std.debug.print("Applying rotation at head {d}, pos {d} (offset: {d})\n", .{ h, pos, x_offset });
-                }
+                // Split rotary and pass-through parts
+                // Only rotate first rot_dim dimensions
+                const x_rot = x[x_offset .. x_offset + rot_dim];
 
-                // Process pairs
-                var i: usize = 0;
-                while (i < half_rot_dim) : (i += 1) {
-                    const rot = freqs_cis[pos * rot_dim / 2 + i];
+                // Split into real and imaginary parts
+                const half_rot = rot_dim / 2;
+                const xq_r = x_rot[0..half_rot];
+                const xq_i = x_rot[half_rot..rot_dim];
 
-                    const x1 = x[x_offset + i];
-                    const x2 = x[x_offset + i + half_rot_dim];
+                // Get position-specific rotation
+                for (0..half_rot_dim) |i| {
+                    const rot = freqs_cis[pos * half_rot_dim + i];
 
+                    // Original values
+                    const x1 = xq_r[i];
+                    const x2 = xq_i[i];
+
+                    // Complex multiplication: (a + bi)(cos θ + i sin θ)
                     out[x_offset + i] = x1 * rot.real - x2 * rot.imag;
-                    out[x_offset + i + half_rot_dim] = x1 * rot.imag + x2 * rot.real;
+                    out[x_offset + half_rot + i] = x1 * rot.imag + x2 * rot.real;
                 }
 
-                // Pass-through remaining dimensions
-                if (rot_dim < head_dim) {
-                    const pass_start = x_offset + rot_dim;
-                    const pass_len = head_dim - rot_dim;
-                    @memcpy(out[pass_start .. pass_start + pass_len], x[pass_start .. pass_start + pass_len]);
-                }
+                // Pass-through for dimensions beyond rot_dim
+                // They're already copied due to the initial memcpy
             }
         }
 
-        // Verify output layout after rotation
-        verify_head_layout("Post-Rotary", out, n_heads, seq_len, head_dim);
+        // Debug verification
+        std.debug.print("\n=== Rotary Embedding Check ===\n", .{});
+        // Print first few positions of first head
+        const check_len = @min(4, rot_dim);
+        for (0..@min(2, seq_len)) |s| {
+            const offset = s * head_dim;
+            std.debug.print("Pos {d} rotated: ", .{s});
+            for (0..check_len) |i| {
+                std.debug.print("{d:.4} ", .{out[offset + i]});
+            }
+            std.debug.print("\n", .{});
+        }
     }
-
     fn apply_softmax(x: []f32) !void {
         // Find max including -inf values (they won't affect the max)
         var max: f32 = x[0];
@@ -3294,6 +3300,7 @@ fn generate(model: *Model, image_path: []const u8, prompt: []const u8, allocator
         // Decode and append output
         single_token_list.clearRetainingCapacity();
         try single_token_list.append(next_token);
+        std.debug.print(" \n Token to be decoded: {any}\n", .{single_token_list});
         const token_str = try model.tokenizer.decode(single_token_list);
         defer model.allocator.free(token_str);
         try output.appendSlice(token_str);
