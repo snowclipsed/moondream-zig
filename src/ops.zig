@@ -371,6 +371,17 @@ fn calculateSize(shape: []const usize) usize {
     return size;
 }
 
+fn createRandomTensor(comptime T: type, allocator: std.mem.Allocator, shape: []const usize, seed: u64) !Tensor(T) {
+    var tensor = try Tensor(T).init(allocator, shape);
+    errdefer tensor.deinit();
+
+    var rng = std.rand.DefaultPrng.init(seed);
+    for (tensor.data) |*val| {
+        val.* = rng.random().float(T) * 2.0 - 1.0; // Values between -1 and 1
+    }
+    return tensor;
+}
+
 // ----------------------------------------------------------------------------
 
 pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
