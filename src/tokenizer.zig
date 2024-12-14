@@ -12,7 +12,7 @@ const SpecialToken = struct {
     normalized: bool,
 };
 
-const Tokenizer = struct {
+pub const Tokenizer = struct {
     // TODO : Add handling external tokens to tokenizer
     const Self = @This();
     tokens: std.StringHashMap(u32),
@@ -35,7 +35,7 @@ const Tokenizer = struct {
         };
     }
 
-    fn fromFile(filename: []const u8, allocator: Allocator) !Tokenizer {
+    pub fn fromFile(filename: []const u8, allocator: Allocator) !Tokenizer {
         var self = Tokenizer.init(allocator);
         errdefer self.deinit();
 
@@ -158,7 +158,7 @@ const Tokenizer = struct {
         return null;
     }
 
-    fn encode(self: *const Tokenizer, text: []const u8) !std.ArrayList(u32) {
+    pub fn encode(self: *const Tokenizer, text: []const u8) !std.ArrayList(u32) {
         var tokens = std.ArrayList(u32).init(self.allocator);
         errdefer tokens.deinit();
 
@@ -212,7 +212,7 @@ const Tokenizer = struct {
         std.debug.print("merge list size: {}\n", .{self.merges.items.len});
     }
 
-    fn decode(self: *const Tokenizer, tokens: std.ArrayList(u32)) ![]const u8 {
+    pub fn decode(self: *const Tokenizer, tokens: std.ArrayList(u32)) ![]const u8 {
         var decoded_text = std.ArrayList(u8).init(self.allocator);
         errdefer decoded_text.deinit();
 
@@ -254,7 +254,7 @@ const Tokenizer = struct {
         return decoded_text.toOwnedSlice();
     }
 
-    fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         var token_it = self.tokens.keyIterator();
         while (token_it.next()) |key| {
             self.allocator.free(key.*);
