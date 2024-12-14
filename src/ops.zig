@@ -138,7 +138,7 @@ pub fn accumulate(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void 
 }
 
 pub fn checkStability(comptime T: type, tensor: Tensor(T)) !void {
-    const info = try getStabilityInfo(tensor);
+    const info = try getStabilityInfo(T, tensor);
     if (info.has_nan) {
         return StabilityError.HasNaN;
     }
@@ -184,17 +184,17 @@ pub fn getStabilityInfo(comptime T: type, tensor: Tensor(T)) !Tensor(T).Stabilit
 }
 
 pub fn isStable(comptime T: type, tensor: Tensor(T)) !bool {
-    const info = try getStabilityInfo(tensor);
+    const info = try getStabilityInfo(T, tensor);
     return !info.has_nan and !info.has_pos_inf and !info.has_neg_inf;
 }
 
 pub fn hasNaN(comptime T: type, tensor: Tensor(T)) !bool {
-    const info = try getStabilityInfo(tensor);
+    const info = try getStabilityInfo(T, tensor);
     return info.has_nan;
 }
 
 pub fn hasInf(comptime T: type, tensor: Tensor(T)) !bool {
-    const info = try getStabilityInfo(tensor);
+    const info = try getStabilityInfo(T, tensor);
     return info.has_pos_inf or info.has_neg_inf;
 }
 
