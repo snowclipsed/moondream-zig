@@ -279,24 +279,6 @@ pub fn Tensor(comptime DataType: type) type {
             return new_tensor;
         }
 
-        fn verifyCompatibleForConcat(self: Self, other: Self, dim: usize) !void {
-            // Check if dimension is valid
-            if (dim >= self.shape.len) {
-                return error.InvalidDimension;
-            }
-
-            // Check if tensors have same number of dimensions
-            if (self.shape.len != other.shape.len) {
-                return error.DimensionMismatch;
-            }
-
-            // Check if all dimensions except concat dim are equal
-            for (self.shape, 0..) |s, i| {
-                if (i != dim and s != other.shape[i]) {
-                    return error.IncompatibleShapes;
-                }
-            }
-        }
         /// Format a single value with proper precision
         fn formatValue(value: DataType, writer: anytype, options: PrintOptions) !void {
             switch (@typeInfo(DataType)) {
