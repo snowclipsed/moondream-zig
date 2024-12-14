@@ -370,3 +370,106 @@ fn calculateSize(shape: []const usize) usize {
     }
     return size;
 }
+
+// ----------------------------------------------------------------------------
+
+pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+    // Check input stability
+    try checkStability(T, input);
+    try checkStability(T, weight);
+    try checkStability(T, bias);
+
+    // Validate epsilon
+    if (eps <= 0) {
+        return error.InvalidEpsilon;
+    }
+
+    // Input validation
+    if (input.shape.len < 1) {
+        return error.InvalidShape;
+    }
+    const last_dim = input.shape[input.shape.len - 1];
+
+    if (weight.shape.len != 1 or weight.shape[0] != last_dim) {
+        return error.InvalidWeightShape;
+    }
+    if (bias.shape.len != 1 or bias.shape[0] != last_dim) {
+        return error.InvalidBiasShape;
+    }
+
+    // Calculate size of dimensions before the last dimension
+    var leading_dims: usize = 1;
+    for (input.shape[0 .. input.shape.len - 1]) |dim| {
+        leading_dims *= dim;
+    }
+
+    // Create output tensor with same shape as input
+    var output = try input.copy();
+    errdefer output.deinit();
+
+    // Compute mean and variance for each feature vector
+    var i: usize = 0;
+    while (i < leading_dims) : (i += 1) {
+        const start_idx = i * last_dim;
+        const end_idx = start_idx + last_dim;
+
+        // Calculate mean
+        var mean: T = 0;
+        for (start_idx..end_idx) |j| {
+            mean += input.data[j];
+        }
+        mean /= @as(T, @floatFromInt(last_dim));
+
+        // Calculate variance
+        var variance: T = 0;
+        for (start_idx..end_idx) |j| {
+            const diff = input.data[j] - mean;
+            variance += diff * diff;
+        }
+        variance /= @as(T, @floatFromInt(last_dim));
+
+        // Check for numerical stability in variance
+        if (variance < -eps) {
+            return error.NegativeVariance;
+        }
+
+        // Add stability checks for the normalization process
+        const std_dev = @sqrt(variance + eps);
+        if (std_dev == 0) {
+            return error.ZeroStandardDeviation;
+        }
+
+        // Normalize and apply scale and bias
+        for (start_idx..end_idx) |j| {
+            const feature_idx = j - start_idx;
+            const normalized = (input.data[j] - mean) / std_dev;
+            const scaled = normalized * weight.data[feature_idx];
+            const final_value = scaled + bias.data[feature_idx];
+
+            // Check for stability of computed value
+            if (std.math.isNan(final_value)) {
+                return error.ComputedNaN;
+            }
+            if (std.math.isInf(final_value)) {
+                return error.ComputedInfinity;
+            }
+
+            output.data[j] = final_value;
+        }
+    }
+
+    // Final stability check on output
+    try checkStability(T, output);
+    return output;
+}
+
+const LayerNormError = error{
+    InvalidShape,
+    InvalidWeightShape,
+    InvalidBiasShape,
+    InvalidEpsilon,
+    NegativeVariance,
+    ZeroStandardDeviation,
+    ComputedNaN,
+    ComputedInfinity,
+} || StabilityError;
