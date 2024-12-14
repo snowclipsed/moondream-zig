@@ -371,7 +371,7 @@ fn calculateSize(shape: []const usize) usize {
     return size;
 }
 
-fn createRandomTensor(comptime T: type, allocator: std.mem.Allocator, shape: []const usize, seed: u64) !Tensor(T) {
+pub fn createRandomTensor(comptime T: type, allocator: std.mem.Allocator, shape: []const usize, seed: u64) !Tensor(T) {
     var tensor = try Tensor(T).init(allocator, shape);
     errdefer tensor.deinit();
 
