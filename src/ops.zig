@@ -34,6 +34,8 @@ pub fn transpose(comptime T: type, tensor: *Tensor(T)) !void {
 
 pub fn add(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
+        std.debug.print("tensor shape: {d}\n", .{tensor.shape});
+        std.debug.print("other shape: {d}\n", .{other.shape});
         return error.ShapeMismatch;
     }
 
@@ -71,6 +73,86 @@ pub fn scalarAdd(comptime T: type, tensor: *Tensor(T), scalar: T) void {
 pub fn scalarMultiply(comptime T: type, tensor: *Tensor(T), scalar: T) void {
     for (tensor.data, 0..) |_, i| {
         tensor.data[i] *= scalar;
+    }
+}
+
+/// Performs broadcasted addition between two tensors.
+/// The smaller tensor is broadcast to match the shape of the larger tensor along
+/// matching dimensions from right to left.
+/// For example: [seq_len, dim] + [dim] -> broadcasts [dim] across seq_len
+/// Performs broadcasted addition between two tensors.
+/// The smaller tensor is broadcast to match the shape of the larger tensor along
+/// matching dimensions from right to left.
+/// For example: [seq_len, dim] + [dim] -> broadcasts [dim] across seq_len
+pub fn broadcast_add(comptime T: type, a: *Tensor(T), b: Tensor(T)) !void {
+    // Check that shapes can be broadcast
+    if (b.shape.len > a.shape.len) {
+        return error.InvalidBroadcast;
+    }
+
+    // Check that dimensions match from right to left
+    for (0..b.shape.len) |i| {
+        const a_dim = a.shape[a.shape.len - 1 - i];
+        const b_dim = b.shape[b.shape.len - 1 - i];
+        if (b_dim != a_dim and b_dim != 1) {
+            return error.IncompatibleBroadcast;
+        }
+    }
+
+    // For common case of [seq_len, dim] + [dim]
+    if (a.shape.len == 2 and b.shape.len == 1 and b.shape[0] == a.shape[1]) {
+        const seq_len = a.shape[0];
+        const dim = a.shape[1];
+
+        // Add bias to each row
+        var i: usize = 0;
+        while (i < seq_len) : (i += 1) {
+            const row_start = i * dim;
+            for (0..dim) |j| {
+                a.data[row_start + j] += b.data[j];
+            }
+        }
+        return;
+    }
+
+    // Handle general case
+    const total_elements = blk: {
+        var prod: usize = 1;
+        for (a.shape) |dim| {
+            prod *= dim;
+        }
+        break :blk prod;
+    };
+
+    // For each element in the output
+    var i: usize = 0;
+    while (i < total_elements) : (i += 1) {
+        // Calculate indices for both tensors
+        var a_coords = try a.allocator.alloc(usize, a.shape.len);
+        defer a.allocator.free(a_coords);
+        var temp = i;
+
+        // Convert flat index to coordinates
+        for (0..a.shape.len) |j| {
+            const rev_j = a.shape.len - 1 - j;
+            a_coords[rev_j] = temp % a.shape[rev_j];
+            temp /= a.shape[rev_j];
+        }
+
+        // Calculate corresponding b index
+        var b_idx: usize = 0;
+        var b_stride: usize = 1;
+
+        for (0..b.shape.len) |j| {
+            const b_j = b.shape.len - 1 - j;
+            const a_j = a.shape.len - 1 - j;
+            const coord = a_coords[a_j] % b.shape[b_j];
+            b_idx += coord * b_stride;
+            b_stride *= b.shape[b_j];
+        }
+
+        // Add values
+        a.data[i] += b.data[b_idx];
     }
 }
 
@@ -135,6 +217,19 @@ pub fn accumulate(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void 
             tensor.data[i] += tensor.data[i - 1];
         }
     }
+}
+
+// Calculate index in flattened array from n-dimensional coordinates
+pub fn calculateIndex(shape: []const usize, coords: []const usize) usize {
+    var index: usize = 0;
+    var stride: usize = 1;
+    var i: usize = shape.len;
+    while (i > 0) {
+        i -= 1;
+        index += coords[i] * stride;
+        stride *= shape[i];
+    }
+    return index;
 }
 
 pub fn checkStability(comptime T: type, tensor: Tensor(T)) !void {

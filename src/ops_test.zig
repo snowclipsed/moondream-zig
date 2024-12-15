@@ -1257,3 +1257,54 @@ test "layerNorm stability checks" {
         try testing.expectError(error.InvalidEpsilon, ops.layerNorm(f32, input, weight, bias, -1e-5));
     }
 }
+
+test "broadcast_add basic" {
+    const allocator = testing.allocator;
+
+    // Test case 1: [2,3] + [3]
+    {
+        var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+        defer a.deinit();
+        var b = try Tensor(f32).init(allocator, &[_]usize{3});
+        defer b.deinit();
+
+        // Initialize values
+        for (0..6) |i| {
+            a.data[i] = @floatFromInt(i);
+        }
+        for (0..3) |i| {
+            b.data[i] = 1.0;
+        }
+
+        try ops.broadcast_add(f32, &a, b);
+
+        // Check results
+        try testing.expectApproxEqAbs(a.data[0], 1.0, 1e-6);
+        try testing.expectApproxEqAbs(a.data[1], 2.0, 1e-6);
+        try testing.expectApproxEqAbs(a.data[2], 3.0, 1e-6);
+        try testing.expectApproxEqAbs(a.data[3], 4.0, 1e-6);
+        try testing.expectApproxEqAbs(a.data[4], 5.0, 1e-6);
+        try testing.expectApproxEqAbs(a.data[5], 6.0, 1e-6);
+    }
+
+    // Test case 2: [2,3] + [1]
+    {
+        var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+        defer a.deinit();
+        var b = try Tensor(f32).init(allocator, &[_]usize{1});
+        defer b.deinit();
+
+        // Initialize values
+        for (0..6) |i| {
+            a.data[i] = @floatFromInt(i);
+        }
+        b.data[0] = 1.0;
+
+        try ops.broadcast_add(f32, &a, b);
+
+        // Each element should be increased by 1
+        for (0..6) |i| {
+            try testing.expectApproxEqAbs(a.data[i], @as(f32, @floatFromInt(i)) + 1.0, 1e-6);
+        }
+    }
+}
