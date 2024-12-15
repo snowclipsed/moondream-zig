@@ -11,6 +11,10 @@ pub fn Tensor(comptime DataType: type) type {
         allocator: Allocator,
         shape: []usize,
         data: []align(32) DataType,
+        // id: usize = undefined,
+
+        // var id_mutex = std.Thread.Mutex{};
+        // var next_id: usize = 0;
 
         // Original functions...
         /// Initializes a tensor with the given shape and allocates memory for its data.
@@ -44,13 +48,27 @@ pub fn Tensor(comptime DataType: type) type {
             // Now we know size fits in usize
             const final_size: usize = @intCast(size);
             const data = try allocator.alignedAlloc(DataType, 32, final_size);
-            @memset(data, 0);
+            if (DataType == bool) {
+                @memset(data, false);
+            } else {
+                @memset(data, 0);
+            }
 
-            return Self{
+            const self = Tensor(DataType){
                 .allocator = allocator,
                 .shape = shape_copy,
                 .data = data,
             };
+
+            // Assign unique ID
+            // id_mutex.lock();
+            // defer id_mutex.unlock();
+            // self.id = next_id;
+            // next_id += 1;
+
+            // std.debug.print("Created tensor {d} at {x} with shape {any}\n", .{ self.id, @returnAddress(), shape });
+
+            return self;
         }
 
         /// Deinitializes the tensor by freeing its allocated memory for shape and data.
@@ -65,6 +83,7 @@ pub fn Tensor(comptime DataType: type) type {
         /// Ensure that the allocator used for allocating the shape and data is the same
         /// allocator used for freeing them to avoid undefined behavior.
         pub fn deinit(self: *Self) void {
+            // std.debug.print("Destroying tensor {d} at {x} with shape {any}\n", .{ self.id, @returnAddress(), self.shape });
             self.allocator.free(self.shape);
             self.allocator.free(self.data);
         }
