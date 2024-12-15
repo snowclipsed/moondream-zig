@@ -35,7 +35,40 @@ pub const TextModel = struct {
         self.* = undefined;
     }
 
-    // TODO: Implement deinit
+    pub fn text_encoder(self: Self, input_ids: Tensor(f32)) !Tensor(f32) {
+        if (input_ids.shape.len != 1) {
+            return error.InvalidInputShape;
+        }
+
+        const seq_length = input_ids.shape[0];
+        if (seq_length > self.config.seq_len) {
+            return error.SequenceTooLong;
+        }
+
+        const embedding_dim = self.weights.word_token_embedding.shape[1];
+
+        // Using ops.zeros instead of Tensor.zeros
+        var output = try ops.zeros(f32, self.allocator, &[_]usize{ seq_length, embedding_dim });
+        errdefer output.deinit();
+
+        // Rest of the function remains the same
+        for (0..seq_length) |s| {
+            const token_id = @as(usize, @intFromFloat(input_ids.data[s]));
+
+            if (token_id >= self.config.vocab) {
+                output.deinit();
+                return error.TokenIdOutOfBounds;
+            }
+
+            var embed_vec = try self.weights.word_token_embedding.getDimensionSlice(0, token_id);
+            defer embed_vec.deinit();
+
+            @memcpy(output.data[s * embedding_dim .. (s + 1) * embedding_dim], embed_vec.data);
+        }
+
+        return output;
+    }
+
     pub fn text_decoder(self: Self, input_embeds: Tensor(f32), kv_cache: ?*KVCache) !struct { output: Tensor(f32), cache: KVCache } {
         const eps = 1e-5; // TODO move to config
         var hidden = try input_embeds.copy();
