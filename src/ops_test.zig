@@ -9,6 +9,8 @@ const StabilityError = @import("tensor.zig").StabilityError;
 const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expectError = testing.expectError;
+const expectApproxEqAbs = testing.expectApproxEqAbs;
+
 test "tensor basic operations" {
     const allocator = testing.allocator;
 
@@ -1689,4 +1691,676 @@ test "transpose - special values" {
     try testing.expect(std.math.isNan(tensor.data[1]));
     try testing.expect(std.math.isNegativeInf(tensor.data[2]));
     try testing.expectApproxEqAbs(tensor.data[3], 0.0, 0.0001);
+}
+
+test "precomputeFreqsCis - basic functionality" {
+    const allocator = testing.allocator;
+    const dim: usize = 4;
+    const end: usize = 2;
+    const theta: f32 = 10000.0;
+
+    var result = try ops.precomputeFreqsCis(f32, allocator, dim, end, theta);
+    defer result.deinit();
+
+    // Check shape
+    try testing.expectEqual(result.shape.len, 3);
+    try testing.expectEqual(result.shape[0], end);
+    try testing.expectEqual(result.shape[1], dim / 2);
+    try testing.expectEqual(result.shape[2], 2);
+
+    // Verify that all values are between -1 and 1 (valid cos/sin range)
+    for (result.data) |val| {
+        try testing.expect(val >= -1.0 and val <= 1.0);
+    }
+
+    // Check that pairs are cos/sin pairs (sum of squares should be ~1)
+    var i: usize = 0;
+    while (i < result.data.len) : (i += 2) {
+        const sum_squares = result.data[i] * result.data[i] +
+            result.data[i + 1] * result.data[i + 1];
+        try testing.expectApproxEqAbs(sum_squares, 1.0, 1e-6);
+    }
+}
+
+test "precomputeFreqsCis - input validation" {
+    const allocator = testing.allocator;
+    const theta: f32 = 10000.0;
+
+    // Test invalid dimensions
+    try testing.expectError(error.DimensionNotEven, ops.precomputeFreqsCis(f32, allocator, 3, 1, theta));
+
+    try testing.expectError(error.DimensionTooSmall, ops.precomputeFreqsCis(f32, allocator, 0, 1, theta));
+
+    // Test invalid sequence length
+    try testing.expectError(error.EndTooSmall, ops.precomputeFreqsCis(f32, allocator, 4, 0, theta));
+
+    // Test invalid theta
+    try testing.expectError(error.ThetaTooSmall, ops.precomputeFreqsCis(f32, allocator, 4, 1, 0.0));
+
+    try testing.expectError(error.ThetaTooSmall, ops.precomputeFreqsCis(f32, allocator, 4, 1, -1.0));
+}
+
+test "precomputeFreqsCis - numerical properties" {
+    const allocator = testing.allocator;
+    const dim: usize = 32;
+    const end: usize = 4;
+    const theta: f32 = 10000.0;
+
+    var result = try ops.precomputeFreqsCis(f32, allocator, dim, end, theta);
+    defer result.deinit();
+
+    // Test periodicity: freqs[t+1] should rotate the complex number by a fixed amount
+    // compared to freqs[t] for each dimension
+    const half_dim = dim / 2;
+    for (0..half_dim) |d| {
+        for (0..end - 1) |t| {
+            const curr_real = result.data[t * half_dim * 2 + d * 2];
+            const curr_imag = result.data[t * half_dim * 2 + d * 2 + 1];
+            const next_real = result.data[(t + 1) * half_dim * 2 + d * 2];
+            const next_imag = result.data[(t + 1) * half_dim * 2 + d * 2 + 1];
+
+            // The angle difference should be consistent
+            // We can check this by verifying the dot product is consistent
+            if (t > 0) {
+                const prev_real = result.data[(t - 1) * half_dim * 2 + d * 2];
+                const prev_imag = result.data[(t - 1) * half_dim * 2 + d * 2 + 1];
+
+                const dot_prod1 = curr_real * prev_real + curr_imag * prev_imag;
+                const dot_prod2 = next_real * curr_real + next_imag * curr_imag;
+
+                try testing.expectApproxEqAbs(dot_prod1, dot_prod2, 1e-6);
+            }
+        }
+    }
+}
+
+test "precomputeFreqsCis - different types" {
+    const allocator = testing.allocator;
+    const dim: usize = 4;
+    const end: usize = 2;
+
+    // Test with f32
+    {
+        const theta: f32 = 10000.0;
+        var result = try ops.precomputeFreqsCis(f32, allocator, dim, end, theta);
+        defer result.deinit();
+        try testing.expectEqual(result.shape[2], 2);
+    }
+
+    // Test with f64
+    {
+        const theta: f64 = 10000.0;
+        var result = try ops.precomputeFreqsCis(f64, allocator, dim, end, theta);
+        defer result.deinit();
+        try testing.expectEqual(result.shape[2], 2);
+    }
+}
+
+test "precomputeFreqsCis - large values" {
+    const allocator = testing.allocator;
+    const dim: usize = 1024;
+    const end: usize = 2048;
+    const theta: f32 = 10000.0;
+
+    var result = try ops.precomputeFreqsCis(f32, allocator, dim, end, theta);
+    defer result.deinit();
+
+    // Check that we still have valid cosine/sine values even with large dimensions
+    for (result.data) |val| {
+        try testing.expect(val >= -1.0 and val <= 1.0);
+        try testing.expect(std.math.isFinite(val));
+    }
+}
+
+test "precomputeFreqsCis - memory management" {
+    const allocator = testing.allocator;
+    const dim: usize = 16;
+    const end: usize = 32;
+    const theta: f32 = 10000.0;
+
+    // Run multiple times to check for memory leaks
+    for (0..10) |_| {
+        var result = try ops.precomputeFreqsCis(f32, allocator, dim, end, theta);
+        defer result.deinit();
+    }
+}
+
+test "precomputeFreqsCis - first position special case" {
+    const allocator = testing.allocator;
+    const dim: usize = 4;
+    const end: usize = 1;
+    const theta: f32 = 10000.0;
+
+    var result = try ops.precomputeFreqsCis(f32, allocator, dim, end, theta);
+    defer result.deinit();
+
+    // At position 0, the real parts should all be 1.0 and imaginary parts 0.0
+    try testing.expectApproxEqAbs(result.data[0], 1.0, 1e-6); // first real part
+    try testing.expectApproxEqAbs(result.data[1], 0.0, 1e-6); // first imag part
+}
+
+fn expectTensorApproxEq(comptime T: type, expected: []const T, actual: []const T, eps: T) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, a| {
+        try testing.expectApproxEqAbs(e, a, eps);
+    }
+}
+const math = std.math;
+
+test "applyRotaryEmb - basic functionality" {
+    const allocator = testing.allocator;
+
+    // Test parameters
+    const num_heads: usize = 2;
+    const seq_len: usize = 4;
+    const head_dim: usize = 8;
+    const rot_dim: usize = 4;
+
+    // Create input tensor [num_heads, seq_len, head_dim]
+    var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
+    defer x.deinit();
+
+    for (0..x.data.len) |i| {
+        x.data[i] = @floatFromInt(i);
+    }
+
+    // Create frequency tensor [seq_len, rot_dim/2, 2]
+    var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
+    defer freqs_cis.deinit();
+
+    // Fill with cos/sin values
+    const pi: f32 = @floatCast(std.math.pi);
+    const angles = [_]f32{ 0, pi / 4.0, pi / 2.0, 3.0 * pi / 4.0 };
+
+    for (0..seq_len) |s| {
+        const angle = angles[s];
+        freqs_cis.data[s * rot_dim] = @cos(angle);
+        freqs_cis.data[s * rot_dim + 1] = @sin(angle);
+    }
+
+    // Create position IDs [seq_len]
+    var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
+    defer position_ids.deinit();
+
+    for (0..seq_len) |i| {
+        position_ids.data[i] = @floatFromInt(i);
+    }
+
+    // Test both interleaved and non-interleaved versions
+    {
+        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, true, allocator);
+        defer result.deinit();
+
+        // Check shape
+        try testing.expectEqual(result.shape.len, 3);
+        try testing.expectEqual(result.shape[0], num_heads);
+        try testing.expectEqual(result.shape[1], seq_len);
+        try testing.expectEqual(result.shape[2], head_dim);
+
+        // Verify the non-rotated part is unchanged
+        for (0..num_heads) |h| {
+            for (0..seq_len) |s| {
+                for (rot_dim..head_dim) |d| {
+                    const idx = h * seq_len * head_dim + s * head_dim + d;
+                    try testing.expectApproxEqAbs(result.data[idx], x.data[idx], 1e-6);
+                }
+            }
+        }
+    }
+}
+
+test "applyRotaryEmb - numerical correctness" {
+    const allocator = testing.allocator;
+
+    // Simple 1x2x4 test case with known output
+    var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 2, 4 });
+    defer x.deinit();
+
+    // Initialize input with simple pattern
+    const x_data = [_]f32{ 1.0, 2.0, 0.0, 0.0, 2.0, 1.0, -1.0, 0.0 };
+    @memcpy(x.data, &x_data);
+
+    // Create freq tensor for 90-degree rotation
+    var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 2, 1, 2 });
+    defer freqs_cis.deinit();
+
+    // Fill with simple rotation values:
+    // First position: no rotation (cos=1, sin=0)
+    // Second position: 90-degree rotation (cos=0, sin=1)
+    freqs_cis.data[0] = 1.0; // cos(0)
+    freqs_cis.data[1] = 0.0; // sin(0)
+    freqs_cis.data[2] = 0.0; // cos(pi/2)
+    freqs_cis.data[3] = 1.0; // sin(pi/2)
+
+    var position_ids = try Tensor(f32).init(allocator, &[_]usize{2});
+    defer position_ids.deinit();
+    position_ids.data[0] = 0;
+    position_ids.data[1] = 1;
+
+    // Test non-interleaved version
+    {
+        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 2, false, allocator);
+        defer result.deinit();
+
+        // First position should be unchanged
+        try testing.expectApproxEqAbs(result.data[0], 1.0, 1e-6);
+        try testing.expectApproxEqAbs(result.data[1], 2.0, 1e-6);
+
+        // Second position should be rotated 90 degrees
+        // For 90-degree rotation: (x + yi) * (0 + i) = -y + xi
+        try testing.expectApproxEqAbs(result.data[4], -1.0, 1e-6); // -y
+        try testing.expectApproxEqAbs(result.data[5], 2.0, 1e-6); // x
+
+        // Pass-through values should be unchanged
+        try testing.expectApproxEqAbs(result.data[2], 0.0, 1e-6);
+        try testing.expectApproxEqAbs(result.data[3], 0.0, 1e-6);
+        try testing.expectApproxEqAbs(result.data[6], -1.0, 1e-6);
+        try testing.expectApproxEqAbs(result.data[7], 0.0, 1e-6);
+    }
+}
+
+test "applyRotaryEmb - error cases" {
+    const allocator = testing.allocator;
+
+    // Invalid input shape
+    {
+        var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 2 }); // Wrong number of dimensions
+        defer x.deinit();
+        var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 4, 2, 2 });
+        defer freqs_cis.deinit();
+        var position_ids = try Tensor(f32).init(allocator, &[_]usize{4});
+        defer position_ids.deinit();
+
+        try testing.expectError(error.InvalidShape, ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 4, false, allocator));
+    }
+
+    // Invalid rotation dimension
+    {
+        var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 4, 8 });
+        defer x.deinit();
+        var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 4, 2, 2 });
+        defer freqs_cis.deinit();
+        var position_ids = try Tensor(f32).init(allocator, &[_]usize{4});
+        defer position_ids.deinit();
+
+        try testing.expectError(error.InvalidDimension, ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 16, false, allocator));
+    }
+}
+
+test "applyRotaryEmb - edge cases" {
+    const allocator = testing.allocator;
+
+    // Minimal dimensions
+    {
+        var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 1, 2 });
+        defer x.deinit();
+        var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 1, 1, 2 });
+        defer freqs_cis.deinit();
+        var position_ids = try Tensor(f32).init(allocator, &[_]usize{1});
+        defer position_ids.deinit();
+
+        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 2, false, allocator);
+        defer result.deinit();
+
+        try testing.expectEqual(result.shape[0], 1);
+        try testing.expectEqual(result.shape[2], 2);
+    }
+}
+
+test "applyRotaryEmb - stress test" {
+    const allocator = testing.allocator;
+
+    // Test with larger dimensions
+    const num_heads: usize = 8;
+    const seq_len: usize = 32;
+    const head_dim: usize = 64;
+    const rot_dim: usize = 32;
+
+    var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
+    defer x.deinit();
+    var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
+    defer freqs_cis.deinit();
+    var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
+    defer position_ids.deinit();
+
+    // Fill with test data
+    for (0..x.data.len) |i| {
+        x.data[i] = @floatFromInt(i % 100);
+    }
+    for (0..freqs_cis.data.len) |i| {
+        freqs_cis.data[i] = @sin(@as(f32, @floatFromInt(i)));
+    }
+    for (0..seq_len) |i| {
+        position_ids.data[i] = @floatFromInt(i);
+    }
+
+    // Test both versions
+    {
+        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, true, allocator);
+        defer result.deinit();
+
+        // Check stability
+        for (result.data) |val| {
+            try testing.expect(std.math.isFinite(val));
+        }
+    }
+
+    {
+        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, false, allocator);
+        defer result.deinit();
+
+        for (result.data) |val| {
+            try testing.expect(std.math.isFinite(val));
+        }
+    }
+}
+
+test "applyRotaryEmb - memory management" {
+    const allocator = testing.allocator;
+
+    const num_heads = 2;
+    const seq_len = 8;
+    const head_dim = 16;
+    const rot_dim = 8;
+
+    // Run multiple times to check for memory leaks
+    for (0..5) |_| {
+        var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
+        defer x.deinit();
+        var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
+        defer freqs_cis.deinit();
+        var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
+        defer position_ids.deinit();
+
+        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, false, allocator);
+        defer result.deinit();
+    }
+}
+
+// Helper function to check if two f32 values are approximately equal
+fn approxEqual(a: f32, b: f32) bool {
+    const epsilon = 1e-5;
+    return @abs(a - b) < epsilon;
+}
+
+// Helper function to print tensor contents for debugging
+fn printTensorContents(tensor: Tensor(bool)) void {
+    for (0..tensor.shape[2]) |i| {
+        for (0..tensor.shape[3]) |j| {
+            const idx = i * tensor.shape[3] + j;
+            std.debug.print("{} ", .{tensor.data[idx]});
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
+// Tests for attention mask creation
+test "createAttentionMask - basic functionality" {
+    const allocator = testing.allocator;
+    // Test case 1: pos = 0, seq_len = 2
+    {
+        var mask = try ops.createAttentionMask(allocator, 0, 2);
+        defer mask.deinit();
+
+        try expectEqual(mask.shape.len, 3);
+        try expectEqual(mask.shape[0], 1);
+        try expectEqual(mask.shape[1], 2);
+        try expectEqual(mask.shape[2], 2);
+
+        // Expected pattern for pos=0, seq_len=2:
+        // [1 0]
+        // [1 1]
+        try expectEqual(mask.data[0], true); // [0,0]
+        try expectEqual(mask.data[1], false); // [0,1]
+        try expectEqual(mask.data[2], true); // [1,0]
+        try expectEqual(mask.data[3], true); // [1,1]
+    }
+
+    // Test case 2: pos = 2, seq_len = 2
+    {
+        var mask = try ops.createAttentionMask(allocator, 2, 2);
+        defer mask.deinit();
+
+        try expectEqual(mask.shape[1], 2);
+        try expectEqual(mask.shape[2], 4); // pos + seq_len = 4
+
+        // Expected pattern:
+        // [1 1 1 0]
+        // [1 1 1 1]
+        const expected = [_]bool{ true, true, true, false, true, true, true, true };
+
+        for (mask.data, 0..) |val, i| {
+            try expectEqual(val, expected[i]);
+        }
+    }
+}
+
+test "createAttentionMask - edge cases" {
+    // Test case 1: seq_len = 1
+    {
+        const allocator = testing.allocator;
+        var mask = try ops.createAttentionMask(allocator, 3, 1);
+        defer mask.deinit();
+
+        try expectEqual(mask.shape[1], 1);
+        try expectEqual(mask.shape[2], 4);
+
+        // Should be [1 1 1 1]
+        for (mask.data) |val| {
+            try expectEqual(val, true);
+        }
+    }
+
+    // Test case 2: pos = 0, seq_len = 1
+    {
+        const allocator = testing.allocator;
+        var mask = try ops.createAttentionMask(allocator, 0, 1);
+        defer mask.deinit();
+
+        try expectEqual(mask.shape[1], 1);
+        try expectEqual(mask.shape[2], 1);
+
+        // Should be [1]
+        try expectEqual(mask.data[0], true);
+    }
+
+    // Test case 3: larger sequence
+    {
+        const allocator = testing.allocator;
+        var mask = try ops.createAttentionMask(allocator, 2, 4);
+        defer mask.deinit();
+
+        try expectEqual(mask.shape[1], 4);
+        try expectEqual(mask.shape[2], 6);
+
+        // Expected pattern:
+        // [1 1 1 0 0 0]
+        // [1 1 1 1 0 0]
+        // [1 1 1 1 1 0]
+        // [1 1 1 1 1 1]
+        const expected = [_]bool{
+            true, true, true, false, false, false,
+            true, true, true, true,  false, false,
+            true, true, true, true,  true,  false,
+            true, true, true, true,  true,  true,
+        };
+
+        for (mask.data, 0..) |val, i| {
+            try expectEqual(val, expected[i]);
+        }
+    }
+}
+
+const scaledDotProductAttention = ops.scaledDotProductAttention;
+
+// Helper function to create a filled tensor
+fn createFilledTensor(comptime T: type, allocator: std.mem.Allocator, shape: []const usize, values: []const T) !Tensor(T) {
+    var tensor = try Tensor(T).init(allocator, shape);
+    errdefer tensor.deinit(); // In case the memcpy fails
+    @memcpy(tensor.data, values);
+    return tensor;
+}
+
+test "SDPA - Basic Functionality" {
+    const allocator = testing.allocator;
+
+    // Test dimensions
+    const n_heads = 1;
+    const seq_len = 2;
+    const head_dim = 2;
+
+    // Create query tensor [1, 2, 2]
+    const q_data = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+    var query = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &q_data);
+    defer query.deinit();
+
+    // Create key tensor [1, 2, 2]
+    const k_data = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
+    var key = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &k_data);
+    defer key.deinit();
+
+    // Create value tensor [1, 2, 2]
+    const v_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var value = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &v_data);
+    defer value.deinit();
+
+    // Create causal mask [1, 2, 2]
+    const mask_data = [_]bool{ true, false, true, true };
+    var mask = try createFilledTensor(bool, allocator, &[_]usize{ 1, seq_len, seq_len }, &mask_data);
+    defer mask.deinit();
+
+    // Run SDPA
+    var result = try scaledDotProductAttention(f32, query, key, value, mask, allocator);
+    defer result.deinit();
+
+    // Expected output after applying mask, scaling (1/√2), and softmax
+    const expected_output = [_]f32{
+        1.0, 2.0, // First position attends only to itself
+        2.0, 3.0, // Second position attends to both positions
+    };
+
+    // Check results with tolerance
+    const tolerance = 1e-5;
+    for (result.data, 0..) |val, i| {
+        try expectApproxEqAbs(expected_output[i], val, tolerance);
+    }
+}
+
+test "SDPA - Multi-head Mask Broadcasting" {
+    const allocator = testing.allocator;
+
+    // Test dimensions
+    const n_heads = 2;
+    const seq_len = 2;
+    const head_dim = 2;
+
+    // Create tensors for 2 attention heads
+    var query = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
+    defer query.deinit();
+    query.fill(1.0);
+
+    var key = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
+    defer key.deinit();
+    key.fill(1.0);
+
+    var value = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
+    defer value.deinit();
+    value.fill(1.0);
+
+    // Create mask with upper triangular pattern [1, 2, 2]
+    const mask_data = [_]bool{ true, false, true, true };
+    var mask = try createFilledTensor(bool, allocator, &[_]usize{ 1, seq_len, seq_len }, &mask_data);
+    defer mask.deinit();
+
+    var result = try scaledDotProductAttention(f32, query, key, value, mask, allocator);
+    defer result.deinit();
+
+    // Verify both heads have same masking pattern
+    const head_size = seq_len * head_dim;
+    const tolerance = 1e-5;
+    for (0..seq_len) |i| {
+        for (0..head_dim) |j| {
+            const idx1 = i * head_dim + j;
+            const idx2 = head_size + i * head_dim + j;
+            try expectApproxEqAbs(result.data[idx1], result.data[idx2], tolerance);
+        }
+    }
+}
+
+test "SDPA - Numerical Stability" {
+    const allocator = testing.allocator;
+
+    // Test dimensions
+    const n_heads = 1;
+    const seq_len = 2;
+    const head_dim = 2;
+
+    // Create query with large values
+    const q_data = [_]f32{ 100.0, 100.0, 100.0, 100.0 };
+    var query = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &q_data);
+    defer query.deinit();
+
+    // Create key with large values
+    const k_data = [_]f32{ 100.0, 100.0, 100.0, 100.0 };
+    var key = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &k_data);
+    defer key.deinit();
+
+    // Normal values for value tensor
+    const v_data = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+    var value = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &v_data);
+    defer value.deinit();
+
+    // Full attention mask
+    const mask_data = [_]bool{ true, true, true, true };
+    var mask = try createFilledTensor(bool, allocator, &[_]usize{ 1, seq_len, seq_len }, &mask_data);
+    defer mask.deinit();
+
+    var result = try scaledDotProductAttention(f32, query, key, value, mask, allocator);
+    defer result.deinit();
+
+    // Check for NaN or Inf values
+    for (result.data) |val| {
+        try testing.expect(!std.math.isNan(val));
+        try testing.expect(!std.math.isInf(val));
+    }
+}
+
+test "SDPA - Zero Attention" {
+    const allocator = testing.allocator;
+
+    // Test dimensions
+    const n_heads = 1;
+    const seq_len = 2;
+    const head_dim = 2;
+
+    // Create zero query
+    var query = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
+    defer query.deinit();
+
+    // Create zero key
+    var key = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
+    defer key.deinit();
+
+    // Create non-zero value
+    const v_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var value = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &v_data);
+    defer value.deinit();
+
+    // Full attention mask
+    const mask_data = [_]bool{ true, true, true, true };
+    var mask = try createFilledTensor(bool, allocator, &[_]usize{ 1, seq_len, seq_len }, &mask_data);
+    defer mask.deinit();
+
+    var result = try scaledDotProductAttention(f32, query, key, value, mask, allocator);
+    defer result.deinit();
+
+    // With zero attention, softmax gives 0.5 to each position
+    // First position: 0.5 * [1,2] + 0.5 * [3,4] = [2,3]
+    // Second position: 0.5 * [1,2] + 0.5 * [3,4] = [2,3]
+    const expected_output = [_]f32{ 2.0, 3.0, 2.0, 3.0 };
+    const tolerance = 1e-5;
+
+    for (result.data, 0..) |val, i| {
+        try expectApproxEqAbs(expected_output[i], val, tolerance);
+    }
 }
