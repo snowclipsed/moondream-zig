@@ -1308,3 +1308,385 @@ test "broadcast_add basic" {
         }
     }
 }
+
+test "getChunk basic functionality" {
+    const allocator = testing.allocator;
+
+    // Test case 1: Simple 2D tensor chunking along dimension 1
+    {
+        var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 6 });
+        defer tensor.deinit();
+
+        // Fill with sequential values
+        for (0..12) |i| {
+            tensor.data[i] = @floatFromInt(i);
+        }
+
+        // Get middle chunk (should be values 2,3 and 8,9)
+        var chunk = try ops.getChunk(f32, tensor, 1, 1, 3);
+        defer chunk.deinit();
+
+        // Verify shape
+        try testing.expectEqual(chunk.shape.len, @as(usize, 2));
+        try testing.expectEqual(chunk.shape[0], @as(usize, 2));
+        try testing.expectEqual(chunk.shape[1], @as(usize, 2));
+
+        // Verify values
+        try testing.expectEqual(chunk.data[0], 2);
+        try testing.expectEqual(chunk.data[1], 3);
+        try testing.expectEqual(chunk.data[2], 8);
+        try testing.expectEqual(chunk.data[3], 9);
+    }
+
+    // Test case 2: 3D tensor chunking along middle dimension
+    {
+        var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 4, 3 });
+        defer tensor.deinit();
+
+        // Fill with sequential values
+        for (0..24) |i| {
+            tensor.data[i] = @floatFromInt(i);
+        }
+
+        // Get first chunk
+        var chunk = try ops.getChunk(f32, tensor, 1, 0, 2);
+        defer chunk.deinit();
+
+        // Verify shape
+        try testing.expectEqual(chunk.shape.len, @as(usize, 3));
+        try testing.expectEqual(chunk.shape[0], @as(usize, 2));
+        try testing.expectEqual(chunk.shape[1], @as(usize, 2));
+        try testing.expectEqual(chunk.shape[2], @as(usize, 3));
+    }
+}
+
+test "getChunk error cases" {
+    const allocator = testing.allocator;
+
+    // Setup test tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 6 });
+    defer tensor.deinit();
+
+    // Test case 1: Invalid dimension
+    try testing.expectError(error.InvalidDimension, ops.getChunk(f32, tensor, 2, 0, 2));
+
+    // Test case 2: Invalid number of chunks
+    try testing.expectError(error.InvalidNumChunks, ops.getChunk(f32, tensor, 1, 0, 7));
+    try testing.expectError(error.InvalidNumChunks, ops.getChunk(f32, tensor, 1, 0, 0));
+
+    // Test case 3: Invalid chunk index
+    try testing.expectError(error.InvalidChunkIndex, ops.getChunk(f32, tensor, 1, 3, 3));
+
+    // Test case 4: Uneven chunk size
+    try testing.expectError(error.UnevenChunkSize, ops.getChunk(f32, tensor, 1, 0, 4));
+}
+
+test "getChunk all chunks" {
+    const allocator = testing.allocator;
+
+    // Create a test tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 6 });
+    defer tensor.deinit();
+
+    // Fill with sequential values
+    for (0..12) |i| {
+        tensor.data[i] = @floatFromInt(i);
+    }
+
+    // Get all chunks and verify they combine to form the original tensor
+    const num_chunks = 3;
+    var chunks: [num_chunks]Tensor(f32) = undefined;
+    defer {
+        for (0..num_chunks) |i| {
+            if (chunks[i].data.len > 0) {
+                chunks[i].deinit();
+            }
+        }
+    }
+
+    // Get all chunks
+    for (0..num_chunks) |i| {
+        chunks[i] = try ops.getChunk(f32, tensor, 1, i, num_chunks);
+    }
+
+    // Verify dimensions of each chunk
+    for (chunks) |chunk| {
+        try testing.expectEqual(chunk.shape[0], @as(usize, 2));
+        try testing.expectEqual(chunk.shape[1], @as(usize, 2));
+    }
+
+    // Verify values in each chunk
+    // First chunk should have values 0,1,6,7
+    try testing.expectEqual(chunks[0].data[0], 0);
+    try testing.expectEqual(chunks[0].data[1], 1);
+    try testing.expectEqual(chunks[0].data[2], 6);
+    try testing.expectEqual(chunks[0].data[3], 7);
+
+    // Second chunk should have values 2,3,8,9
+    try testing.expectEqual(chunks[1].data[0], 2);
+    try testing.expectEqual(chunks[1].data[1], 3);
+    try testing.expectEqual(chunks[1].data[2], 8);
+    try testing.expectEqual(chunks[1].data[3], 9);
+
+    // Third chunk should have values 4,5,10,11
+    try testing.expectEqual(chunks[2].data[0], 4);
+    try testing.expectEqual(chunks[2].data[1], 5);
+    try testing.expectEqual(chunks[2].data[2], 10);
+    try testing.expectEqual(chunks[2].data[3], 11);
+}
+
+test "transpose - 2x2 matrix" {
+    const allocator = testing.allocator;
+
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+    defer tensor.deinit();
+
+    // Initialize with sequential values
+    tensor.data[0] = 1.0;
+    tensor.data[1] = 2.0;
+    tensor.data[2] = 3.0;
+    tensor.data[3] = 4.0;
+
+    try ops.transposeAxes(f32, &tensor, 0, 1);
+
+    try testing.expectEqual(tensor.shape[0], 2);
+    try testing.expectEqual(tensor.shape[1], 2);
+    try testing.expectApproxEqAbs(tensor.data[0], 1.0, 0.0001);
+    try testing.expectApproxEqAbs(tensor.data[1], 3.0, 0.0001);
+    try testing.expectApproxEqAbs(tensor.data[2], 2.0, 0.0001);
+    try testing.expectApproxEqAbs(tensor.data[3], 4.0, 0.0001);
+}
+
+test "transpose - 3x3 matrix" {
+    const allocator = testing.allocator;
+
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 3, 3 });
+    defer tensor.deinit();
+
+    // Initialize with sequential values
+    for (0..9) |i| {
+        tensor.data[i] = @floatFromInt(i + 1);
+    }
+
+    try ops.transposeAxes(f32, &tensor, 0, 1);
+
+    try testing.expectEqual(tensor.shape[0], 3);
+    try testing.expectEqual(tensor.shape[1], 3);
+
+    // Expected values after transpose:
+    // [1 4 7]
+    // [2 5 8]
+    // [3 6 9]
+    const expected = [_]f32{ 1, 4, 7, 2, 5, 8, 3, 6, 9 };
+    for (expected, 0..) |val, i| {
+        try testing.expectApproxEqAbs(tensor.data[i], val, 0.0001);
+    }
+}
+
+test "transpose - 3D tensor" {
+    const allocator = testing.allocator;
+    const dim1 = 2;
+    const dim2 = 3;
+    const dim3 = 2;
+
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ dim1, dim2, dim3 });
+    defer tensor.deinit();
+
+    // Fill with sequential values
+    for (0..tensor.data.len) |i| {
+        tensor.data[i] = @floatFromInt(i + 1);
+    }
+
+    // Test transposing first two dimensions
+    try ops.transposeAxes(f32, &tensor, 0, 1);
+
+    // Verify shape
+    try testing.expectEqual(tensor.shape[0], dim2);
+    try testing.expectEqual(tensor.shape[1], dim1);
+    try testing.expectEqual(tensor.shape[2], dim3);
+
+    // Test transposing with last dimension
+    try ops.transposeAxes(f32, &tensor, 1, 2);
+
+    // Verify new shape
+    try testing.expectEqual(tensor.shape[0], dim2);
+    try testing.expectEqual(tensor.shape[1], dim3);
+    try testing.expectEqual(tensor.shape[2], dim1);
+}
+
+test "transpose - error cases" {
+    const allocator = testing.allocator;
+
+    // Test invalid dimension indices
+    {
+        var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+        defer tensor.deinit();
+
+        try testing.expectError(error.InvalidDimension, ops.transposeAxes(f32, &tensor, 0, 2));
+        try testing.expectError(error.InvalidDimension, ops.transposeAxes(f32, &tensor, 2, 0));
+    }
+}
+
+test "transpose - edge cases" {
+    const allocator = testing.allocator;
+
+    // Test 1x1 matrix
+    {
+        var tensor = try Tensor(f32).init(allocator, &[_]usize{ 1, 1 });
+        defer tensor.deinit();
+        tensor.data[0] = 42.0;
+
+        try ops.transposeAxes(f32, &tensor, 0, 1);
+        try testing.expectEqual(tensor.shape[0], 1);
+        try testing.expectEqual(tensor.shape[1], 1);
+        try testing.expectApproxEqAbs(tensor.data[0], 42.0, 0.0001);
+    }
+
+    // Test 1xN matrix
+    {
+        var tensor = try Tensor(f32).init(allocator, &[_]usize{ 1, 3 });
+        defer tensor.deinit();
+        tensor.data[0] = 1.0;
+        tensor.data[1] = 2.0;
+        tensor.data[2] = 3.0;
+
+        try ops.transposeAxes(f32, &tensor, 0, 1);
+        try testing.expectEqual(tensor.shape[0], 3);
+        try testing.expectEqual(tensor.shape[1], 1);
+        try testing.expectApproxEqAbs(tensor.data[0], 1.0, 0.0001);
+        try testing.expectApproxEqAbs(tensor.data[1], 2.0, 0.0001);
+        try testing.expectApproxEqAbs(tensor.data[2], 3.0, 0.0001);
+    }
+}
+
+test "transpose - different data types" {
+    const allocator = testing.allocator;
+
+    // Test with integers
+    {
+        var tensor = try Tensor(i32).init(allocator, &[_]usize{ 2, 2 });
+        defer tensor.deinit();
+        tensor.data[0] = 1;
+        tensor.data[1] = 2;
+        tensor.data[2] = 3;
+        tensor.data[3] = 4;
+
+        try ops.transposeAxes(i32, &tensor, 0, 1);
+        try testing.expectEqual(tensor.data[0], 1);
+        try testing.expectEqual(tensor.data[1], 3);
+        try testing.expectEqual(tensor.data[2], 2);
+        try testing.expectEqual(tensor.data[3], 4);
+    }
+
+    // Test with f64
+    {
+        var tensor = try Tensor(f64).init(allocator, &[_]usize{ 2, 2 });
+        defer tensor.deinit();
+        tensor.data[0] = 1.5;
+        tensor.data[1] = 2.5;
+        tensor.data[2] = 3.5;
+        tensor.data[3] = 4.5;
+
+        try ops.transposeAxes(f64, &tensor, 0, 1);
+        try testing.expectApproxEqAbs(tensor.data[0], 1.5, 0.0001);
+        try testing.expectApproxEqAbs(tensor.data[1], 3.5, 0.0001);
+        try testing.expectApproxEqAbs(tensor.data[2], 2.5, 0.0001);
+        try testing.expectApproxEqAbs(tensor.data[3], 4.5, 0.0001);
+    }
+}
+
+test "transpose - stress test with large dimensions" {
+    const allocator = testing.allocator;
+
+    // Test with a large 3D tensor
+    {
+        const dim1 = 64;
+        const dim2 = 32;
+        const dim3 = 16;
+
+        var tensor = try Tensor(f32).init(allocator, &[_]usize{ dim1, dim2, dim3 });
+        defer tensor.deinit();
+
+        // Fill with a pattern we can verify
+        for (0..tensor.data.len) |i| {
+            tensor.data[i] = @floatFromInt(i % 100); // Use modulo to keep numbers manageable
+        }
+
+        // Transpose different combinations of axes
+        try ops.transposeAxes(f32, &tensor, 0, 1);
+        try ops.transposeAxes(f32, &tensor, 1, 2);
+        try ops.transposeAxes(f32, &tensor, 0, 2);
+
+        // Verify final dimensions
+        try testing.expectEqual(tensor.shape.len, 3);
+    }
+
+    // Test with a very large 2D matrix
+    {
+        const rows = 1000;
+        const cols = 1000;
+
+        var tensor = try Tensor(f32).init(allocator, &[_]usize{ rows, cols });
+        defer tensor.deinit();
+
+        // Fill with a verifiable pattern
+        for (0..tensor.data.len) |i| {
+            tensor.data[i] = @floatFromInt(i % 1000);
+        }
+
+        // Transpose multiple times
+        for (0..5) |_| {
+            try ops.transposeAxes(f32, &tensor, 0, 1);
+        }
+
+        // After even number of transposes, should be back to original shape
+        try testing.expectEqual(tensor.shape[0], rows);
+        try testing.expectEqual(tensor.shape[1], cols);
+    }
+}
+
+test "transpose - consecutive operations" {
+    const allocator = testing.allocator;
+
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3, 4 });
+    defer tensor.deinit();
+
+    // Fill with sequential values
+    for (0..tensor.data.len) |i| {
+        tensor.data[i] = @floatFromInt(i);
+    }
+
+    // Perform series of transpose operations
+    try ops.transposeAxes(f32, &tensor, 0, 1);
+    try ops.transposeAxes(f32, &tensor, 1, 2);
+    try ops.transposeAxes(f32, &tensor, 0, 2);
+
+    // Verify dimensions after multiple operations
+    try testing.expectEqual(tensor.shape.len, 3);
+}
+
+test "transpose - special values" {
+    const allocator = testing.allocator;
+
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+    defer tensor.deinit();
+
+    // Test with special floating point values
+    // Initial matrix:
+    // [inf    -inf]
+    // [nan     0.0]
+    tensor.data[0] = std.math.inf(f32);
+    tensor.data[1] = -std.math.inf(f32);
+    tensor.data[2] = std.math.nan(f32);
+    tensor.data[3] = 0.0;
+
+    try ops.transposeAxes(f32, &tensor, 0, 1);
+
+    // After transpose, should be:
+    // [inf     nan]
+    // [-inf    0.0]
+    try testing.expect(std.math.isInf(tensor.data[0]));
+    try testing.expect(std.math.isNan(tensor.data[1]));
+    try testing.expect(std.math.isNegativeInf(tensor.data[2]));
+    try testing.expectApproxEqAbs(tensor.data[3], 0.0, 0.0001);
+}

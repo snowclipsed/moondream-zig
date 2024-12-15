@@ -32,6 +32,91 @@ pub fn transpose(comptime T: type, tensor: *Tensor(T)) !void {
     tensor.shape[1] = temp;
 }
 
+/// Transposes a tensor by swapping specified dimensions
+/// Parameters:
+/// - tensor: Input tensor to transpose
+/// - dim0: First dimension to swap
+/// - dim1: Second dimension to swap
+pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: usize) !void {
+    if (dim0 >= tensor.shape.len or dim1 >= tensor.shape.len) {
+        return error.InvalidDimension;
+    }
+
+    // Calculate strides for the current shape
+    var strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+    defer tensor.allocator.free(strides);
+
+    strides[tensor.shape.len - 1] = 1;
+    var i: usize = tensor.shape.len - 1;
+    while (i > 0) : (i -= 1) {
+        strides[i - 1] = strides[i] * tensor.shape[i];
+    }
+
+    // Create new shape with swapped dimensions
+    var new_shape = try tensor.allocator.alloc(usize, tensor.shape.len);
+    errdefer tensor.allocator.free(new_shape);
+
+    for (tensor.shape, 0..) |dim, idx| {
+        if (idx == dim0) {
+            new_shape[idx] = tensor.shape[dim1];
+        } else if (idx == dim1) {
+            new_shape[idx] = tensor.shape[dim0];
+        } else {
+            new_shape[idx] = dim;
+        }
+    }
+
+    // Allocate memory for transposed data
+    var new_data = try tensor.allocator.alignedAlloc(T, 32, tensor.data.len);
+    errdefer tensor.allocator.free(new_data);
+
+    // Calculate new strides
+    var new_strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+    defer tensor.allocator.free(new_strides);
+
+    new_strides[tensor.shape.len - 1] = 1;
+    i = tensor.shape.len - 1;
+    while (i > 0) : (i -= 1) {
+        new_strides[i - 1] = new_strides[i] * new_shape[i];
+    }
+
+    // Create coordinate arrays
+    var coords = try tensor.allocator.alloc(usize, tensor.shape.len);
+    defer tensor.allocator.free(coords);
+    @memset(coords, 0);
+
+    // Perform the transpose operation
+    const total_elements = tensor.data.len;
+    var idx: usize = 0;
+    while (idx < total_elements) : (idx += 1) {
+        // Calculate source coordinates
+        var remaining = idx;
+        for (0..tensor.shape.len) |dim| {
+            coords[dim] = remaining / new_strides[dim];
+            remaining = remaining % new_strides[dim];
+        }
+
+        // Swap coordinates for the transposed dimensions
+        const temp = coords[dim0];
+        coords[dim0] = coords[dim1];
+        coords[dim1] = temp;
+
+        // Calculate source index using original strides
+        var src_idx: usize = 0;
+        for (0..tensor.shape.len) |dim| {
+            src_idx += coords[dim] * strides[dim];
+        }
+
+        new_data[idx] = tensor.data[src_idx];
+    }
+
+    // Update tensor with new data and shape
+    tensor.allocator.free(tensor.data);
+    tensor.data = new_data;
+    tensor.allocator.free(tensor.shape);
+    tensor.shape = new_shape;
+}
+
 pub fn add(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
         std.debug.print("tensor shape: {d}\n", .{tensor.shape});
@@ -217,6 +302,84 @@ pub fn accumulate(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void 
             tensor.data[i] += tensor.data[i - 1];
         }
     }
+}
+
+/// Gets a chunk of a tensor along a specified dimension.
+/// For example, if tensor has shape [2,6] and we chunk along dim 1 with chunk_size 2,
+/// we get 3 tensors of shape [2,2]
+pub fn getChunk(comptime T: type, tensor: Tensor(T), dim: usize, chunk_idx: usize, num_chunks: usize) !Tensor(T) {
+    // Validate inputs
+    if (dim >= tensor.shape.len) {
+        return error.InvalidDimension;
+    }
+
+    const dim_size = tensor.shape[dim];
+    if (num_chunks == 0 or dim_size < num_chunks) {
+        return error.InvalidNumChunks;
+    }
+
+    if (chunk_idx >= num_chunks) {
+        return error.InvalidChunkIndex;
+    }
+
+    // Calculate chunk size and start/end indices
+    const chunk_size = dim_size / num_chunks;
+    if (chunk_size * num_chunks != dim_size) {
+        return error.UnevenChunkSize;
+    }
+
+    const start_idx = chunk_idx * chunk_size;
+
+    // Create new shape array
+    var new_shape = try tensor.allocator.alloc(usize, tensor.shape.len);
+    errdefer tensor.allocator.free(new_shape);
+
+    for (tensor.shape, 0..) |s, i| {
+        new_shape[i] = if (i == dim) chunk_size else s;
+    }
+
+    // Create result tensor
+    var result = try Tensor(T).init(tensor.allocator, new_shape);
+    tensor.allocator.free(new_shape);
+    errdefer result.deinit();
+
+    // Calculate strides for the input tensor
+    var strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+    defer tensor.allocator.free(strides);
+
+    strides[tensor.shape.len - 1] = 1;
+    var i = tensor.shape.len - 1;
+    while (i > 0) : (i -= 1) {
+        strides[i - 1] = strides[i] * tensor.shape[i];
+    }
+
+    // Copy data
+    const total_elements = result.data.len;
+    var result_idx: usize = 0;
+    var coords = try tensor.allocator.alloc(usize, tensor.shape.len);
+    defer tensor.allocator.free(coords);
+    @memset(coords, 0);
+
+    while (result_idx < total_elements) : (result_idx += 1) {
+        // Calculate source coordinates
+        var temp = result_idx;
+        var src_idx: usize = 0;
+
+        for (0..tensor.shape.len) |j| {
+            const rev_j = tensor.shape.len - 1 - j;
+            if (rev_j == dim) {
+                coords[rev_j] = temp % chunk_size + start_idx;
+            } else {
+                coords[rev_j] = temp % tensor.shape[rev_j];
+            }
+            src_idx += coords[rev_j] * strides[rev_j];
+            temp /= if (rev_j == dim) chunk_size else tensor.shape[rev_j];
+        }
+
+        result.data[result_idx] = tensor.data[src_idx];
+    }
+
+    return result;
 }
 
 // Calculate index in flattened array from n-dimensional coordinates
