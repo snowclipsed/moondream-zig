@@ -1693,6 +1693,45 @@ test "transpose - special values" {
     try testing.expectApproxEqAbs(tensor.data[3], 0.0, 0.0001);
 }
 
+test "ops - zeros" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Test 1D tensor
+    {
+        const shape = [_]usize{3};
+        var tensor = try ops.zeros(f32, allocator, &shape);
+        defer tensor.deinit();
+
+        try expectEqual(tensor.shape.len, 1);
+        try expectEqual(tensor.shape[0], 3);
+        try expectEqual(tensor.data.len, 3);
+
+        // Verify all elements are zero
+        for (tensor.data) |val| {
+            try expectEqual(val, 0);
+        }
+    }
+
+    // Test 2D tensor
+    {
+        const shape = [_]usize{ 2, 3 };
+        var tensor = try ops.zeros(f32, allocator, &shape);
+        defer tensor.deinit();
+
+        try expectEqual(tensor.shape.len, 2);
+        try expectEqual(tensor.shape[0], 2);
+        try expectEqual(tensor.shape[1], 3);
+        try expectEqual(tensor.data.len, 6);
+
+        // Verify all elements are zero
+        for (tensor.data) |val| {
+            try expectEqual(val, 0);
+        }
+    }
+}
+
 test "precomputeFreqsCis - basic functionality" {
     const allocator = testing.allocator;
     const dim: usize = 4;

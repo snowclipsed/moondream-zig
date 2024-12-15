@@ -643,6 +643,31 @@ pub fn createRandomTensor(comptime T: type, allocator: std.mem.Allocator, shape:
     return tensor;
 }
 
+pub fn zeros(comptime T: type, allocator: Allocator, shape: []const usize) !Tensor(T) {
+    // Calculate total size
+    var total_size: usize = 1;
+    for (shape) |dim| {
+        total_size *= dim;
+    }
+
+    // Allocate aligned data array
+    const alignment = 32;
+    const data = try allocator.alignedAlloc(T, alignment, total_size);
+    // Initialize all elements to zero
+    @memset(data, 0);
+
+    // Create tensor shape
+    const tensor_shape = try allocator.alloc(usize, shape.len);
+    @memcpy(tensor_shape, shape);
+
+    // Return initialized tensor
+    return Tensor(T){
+        .data = data,
+        .shape = tensor_shape,
+        .allocator = allocator,
+    };
+}
+
 // ----------------------------------------------------------------------------
 
 pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
