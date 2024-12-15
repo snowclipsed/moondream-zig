@@ -2364,3 +2364,90 @@ test "SDPA - Zero Attention" {
         try expectApproxEqAbs(expected_output[i], val, tolerance);
     }
 }
+
+test "ops.gelu basic functionality f32" {
+    const allocator = testing.allocator;
+
+    // Test 1D tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{5});
+    defer tensor.deinit();
+
+    // Set test values
+    tensor.data[0] = -2.0;
+    tensor.data[1] = -1.0;
+    tensor.data[2] = 0.0;
+    tensor.data[3] = 1.0;
+    tensor.data[4] = 2.0;
+
+    try ops.gelu(f32, &tensor);
+
+    try testing.expectApproxEqAbs(tensor.data[0], -0.045402, 0.001);
+    try testing.expectApproxEqAbs(tensor.data[1], -0.158808, 0.001);
+    try testing.expectApproxEqAbs(tensor.data[2], 0.0, 0.001);
+    try testing.expectApproxEqAbs(tensor.data[3], 0.841192, 0.001);
+    try testing.expectApproxEqAbs(tensor.data[4], 1.954598, 0.001);
+}
+
+test "ops.gelu f64 precision" {
+    const allocator = testing.allocator;
+
+    var tensor = try Tensor(f64).init(allocator, &[_]usize{3});
+    defer tensor.deinit();
+
+    tensor.data[0] = -0.5;
+    tensor.data[1] = 0.5;
+    tensor.data[2] = 1.5;
+
+    try ops.gelu(f64, &tensor);
+
+    try testing.expectApproxEqAbs(tensor.data[0], -0.154286, 0.000001);
+    try testing.expectApproxEqAbs(tensor.data[1], 0.345714, 0.000001);
+    try testing.expectApproxEqAbs(tensor.data[2], 1.399572, 0.000001);
+}
+
+test "ops.gelu 2D tensor shape preservation" {
+    const allocator = testing.allocator;
+
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor.deinit();
+
+    // Fill with some values
+    for (tensor.data, 0..) |*x, i| {
+        x.* = @floatFromInt(i);
+    }
+
+    try ops.gelu(f32, &tensor);
+
+    // Just verify the shape is preserved
+    try testing.expect(tensor.shape.len == 2);
+    try testing.expect(tensor.shape[0] == 2);
+    try testing.expect(tensor.shape[1] == 3);
+}
+
+test "ops.gelu empty tensor" {
+    const allocator = testing.allocator;
+
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{0});
+    defer tensor.deinit();
+
+    try ops.gelu(f32, &tensor);
+}
+
+test "ops.gelu large values" {
+    const allocator = testing.allocator;
+
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{3});
+    defer tensor.deinit();
+
+    tensor.data[0] = -10.0;
+    tensor.data[1] = 10.0;
+    tensor.data[2] = 100.0;
+
+    try ops.gelu(f32, &tensor);
+
+    // For very negative values, GELU approaches 0
+    try testing.expectApproxEqAbs(tensor.data[0], 0.0, 0.001);
+    // For large positive values, GELU approaches the input value
+    try testing.expectApproxEqAbs(tensor.data[1], 10.0, 0.1);
+    try testing.expectApproxEqAbs(tensor.data[2], 100.0, 0.1);
+}

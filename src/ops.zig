@@ -1202,3 +1202,20 @@ fn softmax(comptime T: type, tensor: *Tensor(T), dim: usize) !void {
         }
     }
 }
+
+pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
+    if (@typeInfo(T) != .Float) {
+        @compileError("GELU operation requires floating-point tensor");
+    }
+
+    // Constants for GELU approximation
+    const sqrt_2_div_pi: T = @sqrt(2.0 / std.math.pi);
+    const alpha: T = 0.044715;
+
+    for (tensor.data) |*x| {
+        const val = x.*;
+        const x_cubed = val * val * val;
+        const inner = sqrt_2_div_pi * (val + alpha * x_cubed);
+        x.* = 0.5 * val * (1 + std.math.tanh(inner));
+    }
+}

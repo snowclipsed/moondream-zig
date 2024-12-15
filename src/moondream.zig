@@ -5,11 +5,16 @@ const Weights = @import("weights.zig").Weights;
 const Tensor = @import("tensor.zig").Tensor;
 const ops = @import("ops.zig");
 const TextModel = @import("text_model.zig").TextModel;
+const KVCache = @import("text_model.zig").KVCache;
+const LayerCache = @import("text_model.zig").LayerCache;
 const PrintOptions = @import("tensor.zig").PrintOptions;
 
 pub fn main() !void {
     // Get allocator
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{
+        .enable_memory_limit = true,
+        .verbose_log = true,
+    }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -48,12 +53,34 @@ pub fn main() !void {
     std.debug.print("v_patch_embedding_linear_w: {any}\n", .{weights.v_patch_embedding_linear_w.shape});
 
     // Initialize text model
-    var text_model = TextModel.init(config, weights, allocator);
-    var input_embeds: Tensor(f32) = try Tensor(f32).init(allocator, &[_]usize{ config.seq_len, config.dim });
-    input_embeds.fill(0.0);
-    try text_model.text_decoder(input_embeds);
+    var text_model = try TextModel.init(config, weights, allocator);
     defer text_model.deinit();
+
+    // Initialize input embeddings
+    var input_embeds = try Tensor(f32).init(allocator, &[_]usize{ config.seq_len, config.dim });
+
+    input_embeds.fill(0.0);
     defer input_embeds.deinit();
+
+    std.debug.print("config.seq_len: {d}\n", .{config.seq_len});
+    std.debug.print("config.dim: {d}\n", .{config.dim});
+
+    std.debug.print("Input embeddings initialized successfully with shape {any}\n", .{input_embeds.shape});
+
+    // Initialize KV cache (optional - pass null if you don't want to use cache)
+    var kv_cache = try KVCache.init(allocator, config.n_layers, config.n_heads, config.head_dim);
+    defer kv_cache.deinit();
+
+    // Call text_decoder with KV cache
+    var result = try text_model.text_decoder(input_embeds, &kv_cache);
+    // Print output shape or other debug info if needed
+    std.debug.print("Output tensor shape: {any}\n", .{result.output.shape});
+
+    defer result.output.deinit();
+    defer result.cache.deinit();
+    // find the memory leak??
+    // Note: don't need to defer result.cache.deinit() as it's the same as kv_cache and we can call deinit on it
+
 }
 
 // test "basic config and weights loading" {
