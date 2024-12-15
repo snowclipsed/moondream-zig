@@ -38,15 +38,15 @@ pub const TextModel = struct {
     // TODO: Implement deinit
     pub fn text_decoder(self: Self, input_embeds: Tensor(f32), kv_cache: ?*KVCache) !struct { output: Tensor(f32), cache: KVCache } {
         const eps = 1e-5; // TODO move to config
-        var hidden_BTC = try input_embeds.copy();
-        defer hidden_BTC.deinit();
+        var hidden = try input_embeds.copy();
+        defer hidden.deinit();
 
         // Initialize new KV cache
         var new_cache = try KVCache.init(self.allocator, self.config.n_layers, self.config.n_heads, self.config.head_dim);
         errdefer new_cache.deinit();
 
         // Add shape verification before the loop
-        if (hidden_BTC.shape.len != 2) {
+        if (hidden.shape.len != 2) {
             return error.InvalidInputShape;
         }
 
@@ -58,7 +58,7 @@ pub const TextModel = struct {
 
             var ln_in = try ops.layerNorm(
                 f32,
-                hidden_BTC,
+                hidden,
                 layer_ln_w,
                 layer_ln_b,
                 eps,
@@ -79,7 +79,7 @@ pub const TextModel = struct {
 
             try ops.add(f32, &attn_out, mlp_out);
 
-            try ops.add(f32, &hidden_BTC, attn_out);
+            try ops.add(f32, &hidden, attn_out);
 
             // frees
 
@@ -87,7 +87,7 @@ pub const TextModel = struct {
         }
 
         return .{
-            .output = try hidden_BTC.copy(),
+            .output = try hidden.copy(),
             .cache = new_cache,
         };
     }
@@ -221,6 +221,28 @@ pub const TextModel = struct {
         fc1.deinit();
 
         return fc2;
+    }
+
+    fn lm_head(self: Self, hidden: Tensor(f32)) !Tensor(f32) {
+        if (hidden.shape.len != 2) {
+            return error.InvalidInputShape;
+        }
+
+        const seq_len = hidden.shape[0];
+        // const hidden_dim = hidden.shape[1];
+
+        // Get last hidden state using getDimensionSlice
+        const last_hidden = try hidden.getDimensionSlice(0, seq_len - 1);
+        defer last_hidden.deinit();
+
+        const normalized = try ops.layerNorm(f32, last_hidden, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
+        defer normalized.deinit();
+
+        const logits = try matmul.matmul(f32, normalized, self.weights.t_linear_w, self.allocator);
+
+        try ops.broadcast_add(f32, logits, self.weights.t_linear_b);
+
+        return logits;
     }
 };
 
