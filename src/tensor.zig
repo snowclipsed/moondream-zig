@@ -254,7 +254,7 @@ pub fn Tensor(comptime DataType: type) type {
         }
 
         // Calculate index in flattened array from n-dimensional coordinates
-        fn calculateIndex(shape: []const usize, coords: []const usize) usize {
+        pub fn calculateIndex(shape: []const usize, coords: []const usize) usize {
             var index: usize = 0;
             var stride: usize = 1;
             var i: usize = shape.len;
