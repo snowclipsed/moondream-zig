@@ -70,6 +70,17 @@ pub const TextModel = struct {
             var attn_out = try self.attention_block(ln_in, layer, layer_kv_cache);
             defer attn_out.deinit();
 
+            // MLP
+
+            var mlp_out = try self.mlp(ln_in, layer);
+            defer mlp_out.deinit();
+
+            // Residual connection
+
+            try ops.add(f32, &attn_out, mlp_out);
+
+            try ops.add(f32, &hidden_BTC, attn_out);
+
             // frees
 
             defer ln_in.deinit(); // this needs to be here.
@@ -113,7 +124,6 @@ pub const TextModel = struct {
         var k = try ops.getChunk(f32, qkv, 1, 1, num_chunks);
         defer k.deinit();
         var v = try ops.getChunk(f32, qkv, 1, 2, num_chunks);
-        defer v.deinit();
 
         // 3. Reshape each tensor from [seq_len, n_heads * head_dim] to [seq_len, n_heads, head_dim]
         try q.reshape(&[_]usize{ seq_len, n_heads, head_dim });
@@ -136,7 +146,6 @@ pub const TextModel = struct {
         var qr = try ops.applyRotaryEmb(f32, q, self.freqs_cis, position_ids, n_heads, false, self.allocator);
         defer qr.deinit();
         var kr = try ops.applyRotaryEmb(f32, k, self.freqs_cis, position_ids, n_heads, true, self.allocator);
-        defer kr.deinit();
 
         // Handle KV cache
         var k_final: Tensor(f32) = undefined;
@@ -151,15 +160,15 @@ pub const TextModel = struct {
             cache.key.deinit();
             cache.value.deinit();
 
-            // Transfer ownership instead of copying
+            // Transfer ownership
             cache.key = kr; // kr ownership moved to cache
             cache.value = v; // v ownership moved to cache
 
-            // Remove the defer kr.deinit() and v.deinit() since we transferred ownership
+            // Remove the defers for kr and v since ownership is transferred
+            // (make sure no defer kr.deinit() or defer v.deinit() exist)
         } else {
             k_final = try kr.copy();
             v_final = try v.copy();
-            // Here we still need the defers since we made copies
             defer kr.deinit();
             defer v.deinit();
         }
@@ -190,6 +199,28 @@ pub const TextModel = struct {
         try ops.broadcast_add(f32, &out_proj, layer_out_proj_b);
 
         return out_proj;
+    }
+
+    fn mlp(self: Self, input: Tensor(f32), layer: usize) !Tensor(f32) {
+        var layer_t_fc1_w = try self.weights.t_fc1_w.getDimensionSlice(0, layer);
+        defer layer_t_fc1_w.deinit();
+        var layer_t_fc1_b = try self.weights.t_fc1_b.getDimensionSlice(0, layer);
+        defer layer_t_fc1_b.deinit();
+        var layer_t_fc2_w = try self.weights.t_fc2_w.getDimensionSlice(0, layer);
+        defer layer_t_fc2_w.deinit();
+        var layer_t_fc2_b = try self.weights.t_fc2_b.getDimensionSlice(0, layer);
+        defer layer_t_fc2_b.deinit();
+
+        var fc1 = try matmul.matmul(f32, input, layer_t_fc1_w, self.allocator);
+        try ops.broadcast_add(f32, &fc1, layer_t_fc1_b);
+
+        try ops.gelu(f32, &fc1);
+
+        var fc2 = try matmul.matmul(f32, fc1, layer_t_fc2_w, self.allocator);
+        try ops.broadcast_add(f32, &fc2, layer_t_fc2_b);
+        fc1.deinit();
+
+        return fc2;
     }
 };
 
