@@ -20,7 +20,7 @@ pub fn main() !void {
     const bin_path: []const u8 = "../moondream_f32.bin";
     const config_path: []const u8 = "../model_config.json";
     const tokenizer_path: []const u8 = "../tokenizer.bin";
-    const max_tokens: usize = 10; // Equivalent to args.max_tokens
+    const max_tokens: usize = 2; // Equivalent to args.max_tokens
 
     // Load tokenizer
     var tokenizer = try Tokenizer.fromFile(tokenizer_path, allocator);
@@ -40,19 +40,39 @@ pub fn main() !void {
 
     // Load model weights
     const weights = try Weights.init(config, bin_path, allocator);
-    print("lm head weights shape: {any}\n", .{weights.t_linear_w.shape});
 
     // Initialize text model
     var text_model = try TextModel.init(config, weights, allocator);
     defer text_model.deinit();
 
     // Initialize prompt
-    const prompt = "\n\nQuestion?\n\nAnswer:";
-    var token_ids = try tokenizer.encode(prompt);
+    // const prompt = "\n\nQuestion?\n\nAnswer:";
+    // var token_ids = try tokenizer.encode(prompt);
+    // defer token_ids.deinit();
+
+    // // Add EOS token at the beginning
+    // try token_ids.insert(0, tokenizer.eos_token);
+
+    // Initialize tokens for debugging
+    var token_ids = std.ArrayList(u32).init(allocator);
     defer token_ids.deinit();
 
-    // Add EOS token at the beginning
-    try token_ids.insert(0, tokenizer.eos_token);
+    // Add specific tokens
+    try token_ids.appendSlice(&[_]u32{
+        50256, // EOS token
+        198,
+        198,
+        24361,
+        25,
+        39373,
+        4892,
+        262,
+        2939,
+        198,
+        198,
+        33706,
+        25,
+    });
 
     // Convert token_ids to tensor
     var input_ids = try Tensor(f32).init(allocator, &[_]usize{token_ids.items.len});
@@ -62,7 +82,7 @@ pub fn main() !void {
     }
 
     // Get input embeddings
-    var input_embeds = try text_model.text_encoder(input_ids);
+    var input_embeds = try text_model.text_encoder(input_ids); // this is correct, verified.
     defer input_embeds.deinit();
 
     // Initialize KV cache
@@ -92,6 +112,7 @@ pub fn main() !void {
 
         // Check for EOS token
         if (next_token_id == tokenizer.eos_token) {
+            print("eos token found\n", .{});
             break;
         }
 
@@ -125,6 +146,7 @@ pub fn main() !void {
 
 // TODO list
 // - Debug and Fix generation loop
+// - Try specifically with tokens : [ 50256,   198,   198, 24361,    25, 39373,  4892,   262,  2939,   198, 198, 33706,    25]
 // - Check correctness of lm head
 // - Check correctness of all weights
 // - add epsilon to config

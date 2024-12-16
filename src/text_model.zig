@@ -97,6 +97,8 @@ pub const TextModel = struct {
                 eps,
             );
 
+            //layernorm is probably okay!
+
             // Get layer cache if it exists
             const layer_kv_cache = if (kv_cache) |cache| try cache.getLayerCache(layer) else null;
 
