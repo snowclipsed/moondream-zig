@@ -123,31 +123,10 @@ pub fn main() !void {
     try std.io.getStdOut().writer().writeByte('\n');
 }
 
-// test "basic config and weights loading" {
-//     const allocator = std.testing.allocator;
-
-//     const bin_path: []const u8 = "/home/snow/projects/moondream-zig/model.bin";
-//     const config_path: []const u8 = "/home/snow/projects/moondream-zig/model_config.json";
-
-//     // Load and parse config
-//     const config_file = try std.fs.cwd().openFile(config_path, .{});
-//     defer config_file.close();
-
-//     const config_size = (try config_file.stat()).size;
-//     const config_buffer = try allocator.alloc(u8, config_size);
-//     defer allocator.free(config_buffer);
-//     _ = try config_file.readAll(config_buffer);
-
-//     var json_tree = try std.json.parseFromSlice(ConfigReader, allocator, config_buffer, .{});
-//     defer json_tree.deinit();
-
-//     const config = json_tree.value.config();
-
-//     // Load weights
-//     var weights = try Weights.init(config, bin_path, allocator);
-//     defer weights.deinit();
-
-//     // Add basic shape verifications
-//     try std.testing.expectEqual(config.vocab, weights.word_token_embedding.shape[0]);
-//     try std.testing.expectEqual(config.dim, weights.word_token_embedding.shape[1]);
-// }
+// TODO list
+// - Debug and Fix generation loop
+// - Check correctness of lm head
+// - Check correctness of all weights
+// - add epsilon to config
+// - Add vision encoder
+// - Add proper tests for the generation loop
