@@ -158,38 +158,88 @@ pub const Tokenizer = struct {
         return null;
     }
 
+    fn bytesToUtf8(bytes: []const u8) ![]u8 {
+        // Convert raw bytes to proper UTF-8 string
+        return std.unicode.utf8Encode(bytes);
+    }
+
+    fn preprocessText(text: []const u8, allocator: Allocator) ![]u8 {
+        // Add space prefix to words
+        var result = std.ArrayList(u8).init(allocator);
+        errdefer result.deinit();
+
+        var i: usize = 0;
+        var last_was_space = true; // Start with true to handle first word
+
+        while (i < text.len) {
+            const c = text[i];
+            if (std.ascii.isWhitespace(c)) {
+                try result.append(c);
+                last_was_space = true;
+            } else {
+                if (!last_was_space) {
+                    try result.append(c);
+                } else {
+                    // Add the special GPT2 space marker (Ġ) followed by the character
+                    try result.appendSlice("Ġ");
+                    try result.append(c);
+                }
+                last_was_space = false;
+            }
+            i += 1;
+        }
+
+        return result.toOwnedSlice();
+    }
+
     pub fn encode(self: *const Tokenizer, text: []const u8) !std.ArrayList(u32) {
         var tokens = std.ArrayList(u32).init(self.allocator);
         errdefer tokens.deinit();
 
         var current_pos: usize = 0;
+        var prev_was_whitespace = true; // Start with true to handle first word
+
         while (current_pos < text.len) {
-            // Check for special characters first
-            if (text[current_pos] == ' ') {
-                try tokens.append(32); // Space token
+            // Special handling for whitespace
+            if (std.ascii.isWhitespace(text[current_pos])) {
+                if (text[current_pos] == ' ') {
+                    try tokens.append(32); // Standard space token
+                } else if (text[current_pos] == '\n') {
+                    try tokens.append(198); // Newline token
+                }
                 current_pos += 1;
-                continue;
-            }
-            if (text[current_pos] == '\n') {
-                try tokens.append(10); // Newline token
-                current_pos += 1;
+                prev_was_whitespace = true;
                 continue;
             }
 
-            // Regular token matching
             var longest_match: ?struct { token: []const u8, id: u32, len: usize } = null;
             var token_it = self.tokens.iterator();
+
+            // Try to find the longest matching token
             while (token_it.next()) |entry| {
                 const token = entry.key_ptr.*;
-                if (current_pos + token.len <= text.len and
-                    std.mem.startsWith(u8, text[current_pos..], token))
-                {
-                    if (longest_match == null or token.len > longest_match.?.len) {
-                        longest_match = .{
-                            .token = token,
-                            .id = entry.value_ptr.*,
-                            .len = token.len,
-                        };
+
+                // Skip Ġ tokens when not at a word boundary
+                if (token.len >= 3 and std.mem.startsWith(u8, token, "Ġ") and !prev_was_whitespace) {
+                    continue;
+                }
+
+                const token_content = if (token.len >= 3 and std.mem.startsWith(u8, token, "Ġ"))
+                    token[3..]
+                else
+                    token;
+
+                // Check if we have enough text left to match
+                if (current_pos + token_content.len <= text.len) {
+                    const text_slice = text[current_pos .. current_pos + token_content.len];
+                    if (std.mem.eql(u8, token_content, text_slice)) {
+                        if (longest_match == null or token_content.len > longest_match.?.len) {
+                            longest_match = .{
+                                .token = token_content,
+                                .id = entry.value_ptr.*,
+                                .len = token_content.len,
+                            };
+                        }
                     }
                 }
             }
@@ -197,10 +247,28 @@ pub const Tokenizer = struct {
             if (longest_match) |match| {
                 try tokens.append(match.id);
                 current_pos += match.len;
+                prev_was_whitespace = false;
             } else {
-                // Handle unknown byte
-                try tokens.append(text[current_pos]);
-                current_pos += 1;
+                // Handle UTF-8 sequences properly
+                const byte = text[current_pos];
+                if (byte >= 0x80) { // UTF-8 leading byte
+                    const utf8_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+                    if (current_pos + utf8_len <= text.len) {
+                        const sequence = text[current_pos .. current_pos + utf8_len];
+                        // Store the entire UTF-8 sequence as bytes
+                        for (sequence) |b| {
+                            try tokens.append(b);
+                        }
+                        current_pos += utf8_len;
+                    } else {
+                        try tokens.append(byte);
+                        current_pos += 1;
+                    }
+                } else {
+                    try tokens.append(byte);
+                    current_pos += 1;
+                }
+                prev_was_whitespace = false;
             }
         }
 
@@ -216,39 +284,79 @@ pub const Tokenizer = struct {
         var decoded_text = std.ArrayList(u8).init(self.allocator);
         errdefer decoded_text.deinit();
 
-        for (tokens.items) |token_id| {
-            // Skip BOS/EOS/PAD tokens
+        var i: usize = 0;
+        var prev_was_space = false;
+
+        while (i < tokens.items.len) {
+            const token_id = tokens.items[i];
+
+            // Handle special tokens first
             if (token_id == self.bos_token or token_id == self.eos_token or token_id == self.pad_token) {
+                i += 1;
                 continue;
             }
 
-            // Handle special replacements
             switch (token_id) {
-                198 => try decoded_text.appendSlice("\n"),
-                220 => try decoded_text.appendSlice(" "),
-                32 => try decoded_text.appendSlice(" "), // Space
-                10 => try decoded_text.appendSlice("\n"), // Newline
+                32 => { // Space token
+                    try decoded_text.append(' ');
+                    prev_was_space = true;
+                },
+                198 => { // Newline token
+                    try decoded_text.append('\n');
+                    prev_was_space = false;
+                },
                 else => {
-                    // Regular token handling
                     var token_found = false;
                     var token_it = self.tokens.iterator();
                     while (token_it.next()) |entry| {
                         if (entry.value_ptr.* == token_id) {
-                            try decoded_text.appendSlice(entry.key_ptr.*);
+                            const token = entry.key_ptr.*;
+
+                            // Handle Ġ prefix tokens
+                            if (token.len >= 3 and std.mem.startsWith(u8, token, "Ġ")) {
+                                const content = token[3..];
+                                // Only add space if we're not at the start and not after another space
+                                if (!prev_was_space and decoded_text.items.len > 0) {
+                                    try decoded_text.append(' ');
+                                }
+                                try decoded_text.appendSlice(content);
+                            } else {
+                                // For non-Ġ tokens, just append directly
+                                try decoded_text.appendSlice(token);
+                            }
                             token_found = true;
+                            prev_was_space = false;
                             break;
                         }
                     }
 
                     if (!token_found) {
+                        // Handle byte tokens
                         if (token_id < 256) {
                             try decoded_text.append(@intCast(token_id));
+                            if (token_id >= 0x80) { // Part of UTF-8 sequence
+                                const remaining_bytes = std.unicode.utf8ByteSequenceLength(@intCast(token_id)) catch 1;
+                                // Try to collect the full UTF-8 sequence
+                                var bytes_collected: usize = 1;
+                                while (bytes_collected < remaining_bytes and i + 1 < tokens.items.len) {
+                                    const next_byte = tokens.items[i + 1];
+                                    if (next_byte < 256) {
+                                        try decoded_text.append(@intCast(next_byte));
+                                        i += 1;
+                                        bytes_collected += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
                         } else {
                             return error.TokenNotFound;
                         }
+                        prev_was_space = false;
                     }
                 },
             }
+            i += 1;
         }
 
         return decoded_text.toOwnedSlice();
