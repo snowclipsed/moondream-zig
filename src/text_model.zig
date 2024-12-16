@@ -132,14 +132,12 @@ pub const TextModel = struct {
 
         const pos = if (layer_cache) |cache| cache.key.shape[1] else 0;
 
-        print("Attention block: layer {d}, pos {d}\n", .{ layer, pos });
+        // print("Attention block: layer {d}, pos {d}\n", .{ layer, pos });
 
         var layer_t_Wqkv_w = try self.weights.t_Wqkv_w.getDimensionSlice(0, layer);
         defer layer_t_Wqkv_w.deinit();
         var layer_t_Wqkv_b = try self.weights.t_Wqkv_b.getDimensionSlice(0, layer);
         defer layer_t_Wqkv_b.deinit();
-
-        print("\n PASS \n", .{});
 
         var qkv = try matmul.matmul(f32, input, layer_t_Wqkv_w, self.allocator);
         defer qkv.deinit();
@@ -221,7 +219,6 @@ pub const TextModel = struct {
         defer attn_output.deinit();
 
         // Linear layer
-        print("attn_output shape: {any}\n", .{attn_output.shape});
 
         var layer_out_proj_w = try self.weights.t_out_proj_w.getDimensionSlice(0, layer);
         defer layer_out_proj_w.deinit();
@@ -256,7 +253,7 @@ pub const TextModel = struct {
         return fc2;
     }
 
-    fn lm_head(self: Self, hidden: Tensor(f32)) !Tensor(f32) {
+    pub fn lm_head(self: Self, hidden: Tensor(f32)) !Tensor(f32) {
         if (hidden.shape.len != 2) {
             return error.InvalidInputShape;
         }
@@ -265,15 +262,17 @@ pub const TextModel = struct {
         // const hidden_dim = hidden.shape[1];
 
         // Get last hidden state using getDimensionSlice
-        const last_hidden = try hidden.getDimensionSlice(0, seq_len - 1);
+        var last_hidden = try hidden.getDimensionSlice(0, seq_len - 1);
         defer last_hidden.deinit();
 
-        const normalized = try ops.layerNorm(f32, last_hidden, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
+        var normalized = try ops.layerNorm(f32, last_hidden, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
         defer normalized.deinit();
 
-        const logits = try matmul.matmul(f32, normalized, self.weights.t_linear_w, self.allocator);
+        try normalized.reshape(&[_]usize{ 1, self.config.dim }); // TODO: Check correctness of this
 
-        try ops.broadcast_add(f32, logits, self.weights.t_linear_b);
+        var logits = try matmul.matmul(f32, normalized, self.weights.t_linear_w, self.allocator);
+
+        try ops.broadcast_add(f32, &logits, self.weights.t_linear_b);
 
         return logits;
     }
