@@ -69,16 +69,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
 
     for (test_targets) |test_target| {
-        const unit_tests = b.addTest(.{
+        const ops_tests = b.addTest(.{
             .root_source_file = b.path("ops_test.zig"),
             .target = b.resolveTargetQuery(test_target),
         });
+        ops_tests.linkSystemLibrary("openblas");
+        ops_tests.linkLibC();
 
-        unit_tests.linkSystemLibrary("openblas");
-        unit_tests.linkLibC();
-
-        const run_unit_tests = b.addRunArtifact(unit_tests);
-        test_step.dependOn(&run_unit_tests.step);
+        const run_tests = b.addRunArtifact(ops_tests);
+        test_step.dependOn(&run_tests.step);
     }
 
     const run_cmd = b.addRunArtifact(exe);
