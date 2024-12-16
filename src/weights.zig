@@ -447,13 +447,13 @@ pub const Weights = struct {
         const t_fc1_b = try allocator.dupe(usize, &[_]usize{ config.n_layers, config.hidden_dim });
         const t_fc2_w = try allocator.dupe(usize, &[_]usize{ config.n_layers, config.hidden_dim, config.dim });
         const t_fc2_b = try allocator.dupe(usize, &[_]usize{ config.n_layers, config.dim });
-        const t_linear_w = try allocator.dupe(usize, &[_]usize{ config.vocab, config.dim });
+        const t_linear_w = try allocator.dupe(usize, &[_]usize{ config.dim, config.vocab });
         const t_linear_b = try allocator.dupe(usize, &[_]usize{config.vocab});
         const t_ln_out_w = try allocator.dupe(usize, &[_]usize{config.dim});
         const t_ln_out_b = try allocator.dupe(usize, &[_]usize{config.dim});
 
         // Vision model shapes allocation
-        const v_patch_embedding_linear_w = try allocator.dupe(usize, &[_]usize{ config.vit_dim, config.patch_size * config.patch_size * config.img_channels });
+        const v_patch_embedding_linear_w = try allocator.dupe(usize, &[_]usize{ config.patch_size * config.patch_size * config.img_channels, config.vit_dim });
         const v_patch_embedding_linear_b = try allocator.dupe(usize, &[_]usize{config.vit_dim});
         const v_pos_embedding = try allocator.dupe(usize, &[_]usize{ 1, config.num_patches, config.vit_dim });
         const v_Wqkv_w = try allocator.dupe(usize, &[_]usize{ config.n_vit_layers, config.vit_dim, config.n_vit_heads * config.vit_head_dim * 3 });
@@ -472,9 +472,9 @@ pub const Weights = struct {
         const v_norm_out_b = try allocator.dupe(usize, &[_]usize{config.vit_dim});
 
         // Projection layer shapes allocation
-        const v_proj_fc1_w = try allocator.dupe(usize, &[_]usize{ config.hidden_dim, config.vit_head_dim * config.n_heads });
+        const v_proj_fc1_w = try allocator.dupe(usize, &[_]usize{ config.vit_head_dim * config.n_heads, config.hidden_dim });
         const v_proj_fc1_b = try allocator.dupe(usize, &[_]usize{config.hidden_dim});
-        const v_proj_fc2_w = try allocator.dupe(usize, &[_]usize{ config.dim, config.hidden_dim });
+        const v_proj_fc2_w = try allocator.dupe(usize, &[_]usize{ config.hidden_dim, config.dim });
         const v_proj_fc2_b = try allocator.dupe(usize, &[_]usize{config.dim});
 
         return .{
