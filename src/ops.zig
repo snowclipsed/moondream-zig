@@ -1244,3 +1244,28 @@ pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
         x.* = 0.5 * val * (1 + std.math.tanh(inner));
     }
 }
+
+pub fn argmax(comptime T: type, input: Tensor(T)) !usize {
+    if (input.data.len == 0 or input.shape.len == 0) {
+        return error.EmptyTensor;
+    }
+
+    // Get the last dimension size for vocab
+    const vocab_size = input.shape[input.shape.len - 1];
+
+    // For logits, we only care about the last value since we're doing token generation
+    const start_idx = input.data.len - vocab_size;
+
+    var max_value: T = input.data[start_idx];
+    var max_index: usize = 0;
+
+    // Find the maximum value and its index
+    for (start_idx..input.data.len) |i| {
+        if (input.data[i] > max_value) {
+            max_value = input.data[i];
+            max_index = i - start_idx;
+        }
+    }
+
+    return max_index;
+}

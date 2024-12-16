@@ -2490,3 +2490,56 @@ test "ops.gelu large values" {
     try testing.expectApproxEqAbs(tensor.data[1], 10.0, 0.1);
     try testing.expectApproxEqAbs(tensor.data[2], 100.0, 0.1);
 }
+
+test "argmax basic functionality" {
+    // const std = @import("std");
+    // const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Create a test tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{5});
+    defer tensor.deinit();
+
+    // Fill with test data
+    tensor.data[0] = 1.0;
+    tensor.data[1] = 3.0;
+    tensor.data[2] = 0.5;
+    tensor.data[3] = 2.0;
+    tensor.data[4] = 1.5;
+
+    const result = try ops.argmax(f32, tensor);
+    try testing.expectEqual(result, 1); // Index 1 has the highest value (3.0)
+}
+
+test "argmax with 2D tensor" {
+    // const std = @import("std");
+    // const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Create a 2D tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor.deinit();
+
+    // Fill with test data [[-1.0, 2.0, 1.0], [0.5, 3.0, -0.5]]
+    tensor.data[0] = -1.0;
+    tensor.data[1] = 2.0;
+    tensor.data[2] = 1.0;
+    tensor.data[3] = 0.5;
+    tensor.data[4] = 3.0;
+    tensor.data[5] = -0.5;
+
+    const result = try ops.argmax(f32, tensor);
+    try testing.expectEqual(result, 1); // Index 1 in the last dimension has the highest value
+}
+
+test "argmax with empty tensor" {
+    // const std = @import("std");
+    // const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Create an empty tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{0});
+    defer tensor.deinit();
+
+    try testing.expectError(error.EmptyTensor, ops.argmax(f32, tensor));
+}
