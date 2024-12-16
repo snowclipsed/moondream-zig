@@ -17,7 +17,12 @@ def write_tensor(f, name, tensor, transpose=False):
     if np_array.dtype != np.float32:
         np_array = np_array.astype(np.float32)
     
-    # Get sizes
+    if transpose:
+        original_shape = np_array.shape  # Get shape before transpose
+        np_array = np_array.T
+        print(f"Transposing {name} from {original_shape} to {np_array.shape}")
+        
+    # Get sizes AFTER potential transpose
     name_bytes = name.encode('utf-8')
     data_size = np.prod(np_array.shape)
     
@@ -37,7 +42,7 @@ def write_tensor(f, name, tensor, transpose=False):
     f.write(shape_bytes)
     
     # Write tensor data as float32
-    data_bytes = np_array.astype(np.float32).tobytes()
+    data_bytes = np_array.tobytes()
     f.write(data_bytes)
     
     # Debug info
