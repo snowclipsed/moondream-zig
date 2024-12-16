@@ -1132,16 +1132,21 @@ pub fn scaledDotProductAttention(
     const kv_len = key.shape[1];
     const head_dim = query.shape[2];
 
+    // Scale factor for attention scores
     const scale: T = 1.0 / @sqrt(@as(T, @floatFromInt(head_dim)));
 
+    // Initialize output tensor
     var out = try Tensor(T).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
     errdefer out.deinit();
 
+    // Prepare transposed key for all heads
     var key_transpose = try key.copy();
     defer key_transpose.deinit();
     try transposeAxes(T, &key_transpose, 1, 2);
 
+    // Process each attention head separately
     for (0..n_heads) |h| {
+        // Get the query, key, value slices for this head
         var query_head = try query.getDimensionSlice(0, h);
         defer query_head.deinit();
 
@@ -1151,31 +1156,41 @@ pub fn scaledDotProductAttention(
         var value_head = try value.getDimensionSlice(0, h);
         defer value_head.deinit();
 
+        // Calculate attention scores for this head
         var attn_weights_flat = try simdmatmul.matmul(T, query_head, key_head, allocator);
         defer attn_weights_flat.deinit();
 
+        // Apply scaling factor
         scalarMultiply(T, &attn_weights_flat, scale);
 
-        // Apply mask
+        // Apply attention mask - fixed version with proper 2D indexing
+        // The mask has shape [seq_len, pos + seq_len] where pos is the current position
         for (0..q_len) |q| {
             for (0..kv_len) |k| {
-                const head_offset = 0;
-                const mask_index = head_offset * (q_len * kv_len) + q * kv_len + k;
+                // Direct 2D indexing into the mask
+                const mask_index = q * (mask.shape[2]) + k;
                 const flat_index = q * kv_len + k;
+
+                // Apply negative infinity masking where mask is false
                 if (!mask.data[mask_index]) {
                     attn_weights_flat.data[flat_index] = -std.math.inf(T);
                 }
             }
         }
 
+        // Apply softmax to get attention probabilities
         try softmax(T, &attn_weights_flat, 1);
 
+        // Calculate weighted sum with values
         var out_flat = try simdmatmul.matmul(T, attn_weights_flat, value_head, allocator);
         defer out_flat.deinit();
 
+        // Copy results to output tensor for this head
         for (0..q_len) |q| {
             for (0..head_dim) |d| {
-                out.data[h * q_len * head_dim + q * head_dim + d] = out_flat.data[q * head_dim + d];
+                const out_idx = h * q_len * head_dim + q * head_dim + d;
+                const flat_idx = q * head_dim + d;
+                out.data[out_idx] = out_flat.data[flat_idx];
             }
         }
     }
