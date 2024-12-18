@@ -435,6 +435,8 @@ pub fn Tensor(comptime DataType: type) type {
                             4 => try writer.print("{d:.4}", .{value}),
                             5 => try writer.print("{d:.5}", .{value}),
                             6 => try writer.print("{d:.6}", .{value}),
+                            7 => try writer.print("{d:.7}", .{value}),
+                            8 => try writer.print("{d:.8}", .{value}),
                             else => try writer.print("{d:.4}", .{value}),
                         }
                     }
@@ -697,7 +699,7 @@ pub fn Tensor(comptime DataType: type) type {
 
 /// Helper struct to hold formatting options
 const PrintOptions = struct {
-    precision: u8 = 4,
+    precision: u8 = 8,
 };
 pub const StabilityError = error{
     HasNaN,
