@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const Weights = @import("weights.zig").Weights;
 const Config = @import("config.zig").Config;
 const Tensor = @import("tensor.zig").Tensor;
+const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
 const matmul = @import("matmul.zig");
 
@@ -131,6 +132,7 @@ pub const TextModel = struct {
         const n_heads = self.config.n_heads;
         const head_dim = self.config.head_dim;
         const seq_len = input.shape[0];
+        const rot_dim = self.config.head_dim / 2;
 
         const pos = if (layer_cache) |cache| cache.key.shape[1] else 0;
 
@@ -169,17 +171,33 @@ pub const TextModel = struct {
         try ops.transposeAxes(f32, &v, 0, 1);
 
         // 5. Apply rotary embeddings
-        var position_ids = try Tensor(f32).init(self.allocator, &[_]usize{seq_len});
+        var position_ids = try Tensor(usize).init(self.allocator, &[_]usize{seq_len});
         defer position_ids.deinit();
 
         for (0..seq_len) |i| {
-            position_ids.data[i] = @floatFromInt(pos + i);
+            position_ids.data[i] = pos + i;
         }
 
-        var qr = try ops.applyRotaryEmb(f32, q, self.freqs_cis, position_ids, n_heads, false, self.allocator);
+        var qr = try ops.applyRotaryEmb(
+            f32,
+            self.allocator,
+            q,
+            self.freqs_cis,
+            position_ids,
+            rot_dim,
+            false,
+        );
         defer qr.deinit();
-        var kr = try ops.applyRotaryEmb(f32, k, self.freqs_cis, position_ids, n_heads, true, self.allocator);
-
+        var kr = try ops.applyRotaryEmb(
+            f32,
+            self.allocator,
+            k,
+            self.freqs_cis,
+            position_ids,
+            rot_dim,
+            false,
+        );
+        // qr and kr are correct! and rotary embeddings are correct!
         // Handle KV cache
         var k_final: Tensor(f32) = undefined;
         var v_final: Tensor(f32) = undefined;
