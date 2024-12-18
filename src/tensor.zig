@@ -167,6 +167,41 @@ pub fn Tensor(comptime DataType: type) type {
             self.allocator.free(self.shape);
             self.shape = new_shape_copy;
         }
+
+        // Inside the Tensor struct definition:
+
+        /// Adds a dimension of size 1 at the specified position.
+        /// Negative dimensions are supported - they count from the end.
+        /// For example: -1 means insert at the end, -2 means insert at second to last position
+        pub fn unsqueeze(self: *Self, dim: isize) !void {
+            const positive_dim = if (dim >= 0)
+                @as(usize, @intCast(dim))
+            else blk: {
+                const n_dims: isize = @intCast(self.shape.len);
+                const adjusted_dim = n_dims + 1 + dim;
+                if (adjusted_dim < 0) return error.InvalidDimension;
+                break :blk @as(usize, @intCast(adjusted_dim));
+            };
+
+            // Verify dimension is valid
+            if (positive_dim > self.shape.len) return error.InvalidDimension;
+
+            // Create new shape with extra dimension
+            var new_shape = try self.allocator.alloc(usize, self.shape.len + 1);
+            errdefer self.allocator.free(new_shape);
+
+            // Copy shape values with new dimension of size 1
+            @memcpy(new_shape[0..positive_dim], self.shape[0..positive_dim]);
+            new_shape[positive_dim] = 1;
+            if (positive_dim < self.shape.len) {
+                @memcpy(new_shape[positive_dim + 1 ..], self.shape[positive_dim..]);
+            }
+
+            // Update tensor shape
+            self.allocator.free(self.shape);
+            self.shape = new_shape;
+        }
+
         pub fn getDimensionSlice(self: Self, dim: usize, index: usize) !Self {
             // Verify dimension is valid
             if (dim >= self.shape.len) {
@@ -266,6 +301,88 @@ pub fn Tensor(comptime DataType: type) type {
                         if (dst_coords[j] < result.shape[j]) break;
                         dst_coords[j] = 0;
                     }
+                }
+            }
+
+            return result;
+        }
+
+        // Extension to the Tensor type
+        pub fn getSliceRange(self: Self, slices: []const Slice) !Self {
+            if (slices.len > self.shape.len) {
+                return error.TooManySlices;
+            }
+
+            // Calculate new shape
+            var new_shape = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(new_shape);
+
+            // Calculate actual start and end indices for each dimension
+            var actual_starts = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(actual_starts);
+            var actual_ends = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(actual_ends);
+
+            // Initialize with full ranges for dimensions not specified
+            for (self.shape, 0..) |dim_size, i| {
+                if (i < slices.len) {
+                    const slice = slices[i];
+                    actual_starts[i] = slice.start orelse 0;
+                    actual_ends[i] = slice.end orelse dim_size;
+
+                    // Bounds checking
+                    if (actual_starts[i] > dim_size or actual_ends[i] > dim_size) {
+                        return error.SliceOutOfBounds;
+                    }
+                    if (actual_starts[i] > actual_ends[i]) {
+                        return error.InvalidSlice;
+                    }
+                } else {
+                    actual_starts[i] = 0;
+                    actual_ends[i] = dim_size;
+                }
+                new_shape[i] = actual_ends[i] - actual_starts[i];
+            }
+
+            // Create new tensor with calculated shape
+            var result = try Self.init(self.allocator, new_shape);
+            errdefer result.deinit();
+
+            // Calculate strides for the original tensor
+            var strides = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(strides);
+
+            strides[self.shape.len - 1] = 1;
+            var i = self.shape.len - 1;
+            while (i > 0) : (i -= 1) {
+                strides[i - 1] = strides[i] * self.shape[i];
+            }
+
+            // Copy data with proper indexing
+            var coords = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(coords);
+            @memset(coords, 0);
+
+            var result_idx: usize = 0;
+            while (true) {
+                // Calculate source index
+                var src_idx: usize = 0;
+                for (coords, 0..) |coord, dim| {
+                    src_idx += (coord + actual_starts[dim]) * strides[dim];
+                }
+
+                // Copy data
+                result.data[result_idx] = self.data[src_idx];
+                result_idx += 1;
+
+                // Update coordinates
+                var dim = self.shape.len;
+                while (dim > 0) {
+                    dim -= 1;
+                    coords[dim] += 1;
+                    if (coords[dim] < new_shape[dim]) break;
+                    coords[dim] = 0;
+                    if (dim == 0) return result;
                 }
             }
 
@@ -409,6 +526,150 @@ pub fn Tensor(comptime DataType: type) type {
         pub fn print(self: Self) void {
             std.debug.print("{}", .{self});
         }
+        /// Print a 2D tensor to stdout with truncated rows if necessary
+        pub fn print2D(self: Self) void {
+            if (self.shape.len != 2) {
+                std.debug.print("Error: Not a 2D tensor\n", .{});
+                return;
+            }
+
+            const rows = self.shape[0];
+            const cols = self.shape[1];
+            const options = PrintOptions{};
+
+            // Print shape information
+            std.debug.print("Tensor {d}x{d}:\n", .{ rows, cols });
+
+            for (0..rows) |i| {
+                std.debug.print("[ ", .{});
+
+                // Calculate how many items to show at start and end
+                const items_per_side = max_items_per_row / 2;
+                const show_ellipsis = cols > max_items_per_row;
+
+                // Print first few items
+                const start_items = @min(items_per_side, cols);
+                for (0..start_items) |j| {
+                    const idx = i * cols + j;
+                    formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                    std.debug.print(" ", .{});
+                }
+
+                // Print ellipsis if needed
+                if (show_ellipsis) {
+                    std.debug.print("... ", .{});
+
+                    // Print last few items
+                    const remaining_items = @min(items_per_side, cols - start_items);
+                    const start_idx = cols - remaining_items;
+                    for (start_idx..cols) |j| {
+                        const idx = i * cols + j;
+                        formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                        std.debug.print(" ", .{});
+                    }
+                }
+
+                std.debug.print("]\n", .{});
+            }
+        }
+
+        /// Print a 3D tensor to stdout with truncated rows and slices if necessary
+        pub fn print3D(self: Self) void {
+            if (self.shape.len != 3) {
+                std.debug.print("Error: Not a 3D tensor\n", .{});
+                return;
+            }
+
+            const depth = self.shape[0];
+            const rows = self.shape[1];
+            const cols = self.shape[2];
+            const options = PrintOptions{};
+
+            // Print shape information
+            std.debug.print("Tensor {d}x{d}x{d}:\n", .{ depth, rows, cols });
+
+            // Calculate how many slices to show
+            const max_slices = max_rows;
+            const show_slice_ellipsis = depth > max_slices;
+            const slices_to_show = @min(max_slices, depth);
+
+            for (0..slices_to_show) |d| {
+                std.debug.print("\nSlice [{d}]:\n", .{d});
+
+                for (0..rows) |i| {
+                    std.debug.print("[ ", .{});
+
+                    // Calculate how many items to show at start and end
+                    const items_per_side = max_items_per_row / 2;
+                    const show_ellipsis = cols > max_items_per_row;
+
+                    // Print first few items
+                    const start_items = @min(items_per_side, cols);
+                    for (0..start_items) |j| {
+                        const idx = (d * rows * cols) + (i * cols) + j;
+                        formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                        std.debug.print(" ", .{});
+                    }
+
+                    // Print ellipsis if needed
+                    if (show_ellipsis) {
+                        std.debug.print("... ", .{});
+
+                        // Print last few items
+                        const remaining_items = @min(items_per_side, cols - start_items);
+                        const start_idx = cols - remaining_items;
+                        for (start_idx..cols) |j| {
+                            const idx = (d * rows * cols) + (i * cols) + j;
+                            formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                            std.debug.print(" ", .{});
+                        }
+                    }
+
+                    std.debug.print("]\n", .{});
+                }
+            }
+
+            // Print ellipsis for slices if needed
+            if (show_slice_ellipsis) {
+                std.debug.print("\n...\n\n", .{});
+
+                // Print last slice
+                const last_slice = depth - 1;
+                std.debug.print("Slice [{d}]:\n", .{last_slice});
+
+                for (0..rows) |i| {
+                    std.debug.print("[ ", .{});
+
+                    // Calculate how many items to show at start and end
+                    const items_per_side = max_items_per_row / 2;
+                    const show_ellipsis = cols > max_items_per_row;
+
+                    // Print first few items
+                    const start_items = @min(items_per_side, cols);
+                    for (0..start_items) |j| {
+                        const idx = (last_slice * rows * cols) + (i * cols) + j;
+                        formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                        std.debug.print(" ", .{});
+                    }
+
+                    // Print ellipsis if needed
+                    if (show_ellipsis) {
+                        std.debug.print("... ", .{});
+
+                        // Print last few items
+                        const remaining_items = @min(items_per_side, cols - start_items);
+                        const start_idx = cols - remaining_items;
+                        for (start_idx..cols) |j| {
+                            const idx = (last_slice * rows * cols) + (i * cols) + j;
+                            formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                            std.debug.print(" ", .{});
+                        }
+                    }
+
+                    std.debug.print("]\n", .{});
+                }
+            }
+        }
 
         /// Convert tensor to string
         pub fn toString(self: Self, allocator: std.mem.Allocator) ![]const u8 {
@@ -443,4 +704,18 @@ pub const StabilityError = error{
     HasPositiveInfinity,
     HasNegativeInfinity,
     HasInfinity,
+};
+
+// Slice type to represent Python-style slice operations
+pub const Slice = struct {
+    start: ?usize,
+    end: ?usize,
+
+    pub fn full() Slice {
+        return .{ .start = null, .end = null };
+    }
+
+    pub fn from(start: ?usize, end: ?usize) Slice {
+        return .{ .start = start, .end = end };
+    }
 };
