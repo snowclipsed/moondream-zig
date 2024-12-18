@@ -147,8 +147,18 @@ pub fn main() !void {
 // TODO list
 // - Debug and Fix generation loop
 // - Try specifically with tokens : [ 50256,   198,   198, 24361,    25, 39373,  4892,   262,  2939,   198, 198, 33706,    25]
+// - Check correctness of tokenizer using the output tokens of the python version.
 // - Check correctness of lm head
 // - Check correctness of all weights
 // - add epsilon to config
 // - Add vision encoder
 // - Add proper tests for the generation loop
+// - Conver flatten to intrinsic op for tensor class
+// - Make precompute freqs cis a little simpler
+
+// verified list:
+// - layer norm
+// - qkv projection and transform
+// - position ids are correct
+// - precompute freqs cis looks good!
+// - rotary embedding looks like it's working
