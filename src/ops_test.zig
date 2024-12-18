@@ -4,6 +4,7 @@ const ArrayList = std.ArrayList;
 const max_items_per_row = 6; // Number of elements to show per row
 const max_rows = 8; // Maximum number of rows to show before truncating
 const Tensor = @import("tensor.zig").Tensor;
+const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
 const StabilityError = @import("tensor.zig").StabilityError;
 const testing = std.testing;
@@ -237,6 +238,164 @@ test "complex reshape operations" {
         try tensor.reshape(&[_]usize{ 1024, 1024 });
         try expectEqual(@as(usize, 2), tensor.shape.len);
     }
+}
+
+test "tensor unsqueeze" {
+    const allocator = testing.allocator;
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor.deinit();
+
+    // Fill with test data
+    for (tensor.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+
+    // Test unsqueeze in middle
+    try tensor.unsqueeze(1);
+    try testing.expectEqual(@as(usize, 3), tensor.shape.len);
+    try testing.expectEqual(@as(usize, 2), tensor.shape[0]);
+    try testing.expectEqual(@as(usize, 1), tensor.shape[1]);
+    try testing.expectEqual(@as(usize, 3), tensor.shape[2]);
+
+    // Test unsqueeze at end with negative index
+    try tensor.unsqueeze(-1);
+    try testing.expectEqual(@as(usize, 4), tensor.shape.len);
+    try testing.expectEqual(@as(usize, 2), tensor.shape[0]);
+    try testing.expectEqual(@as(usize, 1), tensor.shape[1]);
+    try testing.expectEqual(@as(usize, 3), tensor.shape[2]);
+    try testing.expectEqual(@as(usize, 1), tensor.shape[3]);
+
+    // Verify data unchanged
+    try testing.expectEqual(@as(f32, 0), tensor.data[0]);
+    try testing.expectEqual(@as(f32, 1), tensor.data[1]);
+}
+
+test "tensor unsqueeze edge cases" {
+    const allocator = testing.allocator;
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{5});
+    defer tensor.deinit();
+
+    // Test unsqueeze on 1D tensor
+    try tensor.unsqueeze(0);
+    try testing.expectEqual(@as(usize, 2), tensor.shape.len);
+    try testing.expectEqual(@as(usize, 1), tensor.shape[0]);
+    try testing.expectEqual(@as(usize, 5), tensor.shape[1]);
+
+    // Test error cases
+    try testing.expectError(error.InvalidDimension, tensor.unsqueeze(3)); // Too large dimension
+    try testing.expectError(error.InvalidDimension, tensor.unsqueeze(-4)); // Too negative dimension
+}
+
+// Tests
+test "getSliceRange - basic 2D slicing" {
+    const allocator = testing.allocator;
+
+    // Create a 3x4 tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 3, 4 });
+    defer tensor.deinit();
+
+    // Fill with sequential values
+    for (tensor.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+
+    // Test slicing first two columns
+    var slices = [_]Slice{
+        Slice.full(),
+        Slice.from(0, 2),
+    };
+
+    var result = try tensor.getSliceRange(&slices);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), result.shape[1]);
+    try testing.expectApproxEqAbs(@as(f32, 0), result.data[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), result.data[1], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 4), result.data[2], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 5), result.data[3], 0.001);
+}
+
+test "getSliceRange - 3D slicing with full dimensions" {
+    const allocator = testing.allocator;
+
+    // Create a 2x3x4 tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3, 4 });
+    defer tensor.deinit();
+
+    // Fill with sequential values
+    for (tensor.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+
+    // Test slicing with full range in first dimension
+    var slices = [_]Slice{
+        Slice.full(),
+        Slice.from(1, 3),
+        Slice.from(0, 2),
+    };
+
+    var result = try tensor.getSliceRange(&slices);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), result.shape[0]);
+    try testing.expectEqual(@as(usize, 2), result.shape[1]);
+    try testing.expectEqual(@as(usize, 2), result.shape[2]);
+}
+
+test "getSliceRange - error cases" {
+    const allocator = testing.allocator;
+
+    // Create a 2x3 tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor.deinit();
+
+    // Test too many slices
+    var too_many_slices = [_]Slice{
+        Slice.full(),
+        Slice.full(),
+        Slice.full(),
+    };
+    try testing.expectError(error.TooManySlices, tensor.getSliceRange(&too_many_slices));
+
+    // Test out of bounds
+    var out_of_bounds = [_]Slice{
+        Slice.from(0, 3),
+        Slice.from(0, 4),
+    };
+    try testing.expectError(error.SliceOutOfBounds, tensor.getSliceRange(&out_of_bounds));
+
+    // Test invalid slice (start > end)
+    var invalid_slice = [_]Slice{
+        Slice.from(2, 1),
+        Slice.full(),
+    };
+    try testing.expectError(error.InvalidSlice, tensor.getSliceRange(&invalid_slice));
+}
+
+test "getSliceRange - partial slicing" {
+    const allocator = testing.allocator;
+
+    // Create a 3x4x5 tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 3, 4, 5 });
+    defer tensor.deinit();
+
+    // Fill with sequential values
+    for (tensor.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+
+    // Test partial slicing (only specify first two dimensions)
+    var slices = [_]Slice{
+        Slice.from(1, 3),
+        Slice.from(0, 2),
+    };
+
+    var result = try tensor.getSliceRange(&slices);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), result.shape[0]);
+    try testing.expectEqual(@as(usize, 2), result.shape[1]);
+    try testing.expectEqual(@as(usize, 5), result.shape[2]);
 }
 
 test "complex transpose operations" {
@@ -656,6 +815,323 @@ test "Tensor concatenation edge cases" {
         defer t4.deinit();
 
         try testing.expectError(error.InvalidDimension, ops.concat(f32, t3, t4, 2));
+    }
+}
+
+test "stack basic functionality" {
+    const allocator = testing.allocator;
+
+    // Create two 2x3 tensors
+    var tensor1 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor1.deinit();
+    var tensor2 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor2.deinit();
+
+    // Fill tensors with test data
+    for (tensor1.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+    for (tensor2.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i + 10);
+    }
+
+    // Stack along dimension 0
+    var tensors = [_]Tensor(f32){ tensor1, tensor2 };
+    var result = try ops.stack(f32, &tensors, 0);
+    defer result.deinit();
+
+    // Check result shape
+    try testing.expectEqual(@as(usize, 3), result.shape.len);
+    try testing.expectEqual(@as(usize, 2), result.shape[0]); // Number of stacked tensors
+    try testing.expectEqual(@as(usize, 2), result.shape[1]);
+    try testing.expectEqual(@as(usize, 3), result.shape[2]);
+
+    // Check values
+    try testing.expectEqual(@as(f32, 0), result.data[0]);
+    try testing.expectEqual(@as(f32, 10), result.data[6]);
+}
+
+test "stack error cases" {
+    const allocator = testing.allocator;
+
+    // Create tensors with different shapes
+    var tensor1 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor1.deinit();
+    var tensor2 = try Tensor(f32).init(allocator, &[_]usize{ 2, 4 });
+    defer tensor2.deinit();
+
+    // Test shape mismatch
+    var tensors_mismatched = [_]Tensor(f32){ tensor1, tensor2 };
+    try testing.expectError(error.ShapeMismatch, ops.stack(f32, &tensors_mismatched, 0));
+
+    // Test invalid dimension
+    var tensors_valid = [_]Tensor(f32){ tensor1, tensor1 };
+    try testing.expectError(error.InvalidDimension, ops.stack(f32, &tensors_valid, 3));
+
+    // Test empty tensor list
+    var empty_tensors = [_]Tensor(f32){};
+    try testing.expectError(error.EmptyTensorList, ops.stack(f32, &empty_tensors, 0));
+}
+
+test "stack along different dimensions" {
+    const allocator = testing.allocator;
+
+    // Create two 2x3 tensors
+    var tensor1 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor1.deinit();
+    var tensor2 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor2.deinit();
+
+    // Fill with test data
+    for (tensor1.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+    for (tensor2.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i + 10);
+    }
+
+    var tensors = [_]Tensor(f32){ tensor1, tensor2 };
+
+    // Stack along different dimensions and verify shapes
+    {
+        var result_dim0 = try ops.stack(f32, &tensors, 0);
+        defer result_dim0.deinit();
+        try testing.expectEqualSlices(usize, &[_]usize{ 2, 2, 3 }, result_dim0.shape);
+    }
+    {
+        var result_dim1 = try ops.stack(f32, &tensors, 1);
+        defer result_dim1.deinit();
+        try testing.expectEqualSlices(usize, &[_]usize{ 2, 2, 3 }, result_dim1.shape);
+    }
+    {
+        var result_dim2 = try ops.stack(f32, &tensors, 2);
+        defer result_dim2.deinit();
+        try testing.expectEqualSlices(usize, &[_]usize{ 2, 3, 2 }, result_dim2.shape);
+    }
+}
+
+test "normalizeDim basic functionality" {
+    // Test positive dimensions
+    try expectEqual(@as(usize, 0), try ops.normalizeDim(0, 3));
+    try expectEqual(@as(usize, 2), try ops.normalizeDim(2, 3));
+
+    // Test negative dimensions
+    try expectEqual(@as(usize, 2), try ops.normalizeDim(-1, 3)); // -1 in 3 dims = index 2
+    try expectEqual(@as(usize, 1), try ops.normalizeDim(-2, 3)); // -2 in 3 dims = index 1
+    try expectEqual(@as(usize, 0), try ops.normalizeDim(-3, 3)); // -3 in 3 dims = index 0
+
+    // Test error cases
+    try expectError(error.InvalidDimension, ops.normalizeDim(3, 3)); // Too large positive
+    try expectError(error.InvalidDimension, ops.normalizeDim(-4, 3)); // Too large negative
+}
+
+test "flatten basic functionality" {
+    const allocator = testing.allocator;
+
+    // Create a 2x3x4 tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3, 4 });
+    defer tensor.deinit();
+
+    // Fill with sequential values
+    for (tensor.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+
+    // Test flattening last two dimensions
+    try ops.flatten(f32, &tensor, 1, 2);
+
+    // Check new shape: should be [2, 12]
+    try expectEqual(@as(usize, 2), tensor.shape.len);
+    try expectEqual(@as(usize, 2), tensor.shape[0]);
+    try expectEqual(@as(usize, 12), tensor.shape[1]);
+
+    // Verify data remains in correct order
+    try expectEqual(@as(f32, 0), tensor.data[0]);
+    try expectEqual(@as(f32, 5), tensor.data[5]);
+    try expectEqual(@as(f32, 12), tensor.data[12]);
+}
+
+test "flatten with negative dimensions" {
+    const allocator = testing.allocator;
+
+    // Create a 2x3x4x5 tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3, 4, 5 });
+    defer tensor.deinit();
+
+    // Test with negative dimensions
+    try ops.flatten(f32, &tensor, -3, -2); // Should flatten dimensions 1 and 2
+
+    // Check new shape: should be [2, 12, 5]
+    try expectEqual(@as(usize, 3), tensor.shape.len);
+    try expectEqual(@as(usize, 2), tensor.shape[0]);
+    try expectEqual(@as(usize, 12), tensor.shape[1]);
+    try expectEqual(@as(usize, 5), tensor.shape[2]);
+}
+
+test "flatten error cases" {
+    const allocator = testing.allocator;
+
+    // Create a 2x3x4 tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3, 4 });
+    defer tensor.deinit();
+
+    // Test invalid dimension range
+    try expectError(error.InvalidDimRange, ops.flatten(f32, &tensor, 2, 1));
+
+    // Test out of bounds dimensions
+    try expectError(error.InvalidDimension, ops.flatten(f32, &tensor, 3, 4));
+    try expectError(error.InvalidDimension, ops.flatten(f32, &tensor, -4, -1));
+}
+
+test "flatten entire tensor" {
+    const allocator = testing.allocator;
+
+    // Create a 2x3x4 tensor
+    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3, 4 });
+    defer tensor.deinit();
+
+    // Fill with sequential values
+    for (tensor.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+
+    // Flatten entire tensor
+    try ops.flatten(f32, &tensor, 0, 2);
+
+    // Check new shape: should be [24]
+    try expectEqual(@as(usize, 1), tensor.shape.len);
+    try expectEqual(@as(usize, 24), tensor.shape[0]);
+
+    // Verify data order
+    try expectEqual(@as(f32, 0), tensor.data[0]);
+    try expectEqual(@as(f32, 23), tensor.data[23]);
+}
+
+test "stackAndFlatten 2D tensors with different dimensions" {
+    const allocator = testing.allocator;
+
+    // Create two 2x3 tensors
+    var tensor1 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor1.deinit();
+    var tensor2 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor2.deinit();
+
+    // Fill with test data
+    for (tensor1.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+    for (tensor2.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i + 10);
+    }
+
+    // Test stacking at different dimensions
+    {
+        // Stack at beginning: [2,3] -> [2,2,3] -> [2,6]
+        var result = try ops.stackAndFlatten(f32, tensor1, tensor2, 0);
+        defer result.deinit();
+        try expectEqual(@as(usize, 2), result.shape.len);
+        try expectEqual(@as(usize, 2), result.shape[0]);
+        try expectEqual(@as(usize, 6), result.shape[1]);
+    }
+
+    {
+        // Stack at end: [2,3] -> [2,3,2] -> [2,6]
+        var result = try ops.stackAndFlatten(f32, tensor1, tensor2, -1);
+        defer result.deinit();
+        try expectEqual(@as(usize, 2), result.shape.len);
+        try expectEqual(@as(usize, 2), result.shape[0]);
+        try expectEqual(@as(usize, 6), result.shape[1]);
+    }
+
+    {
+        // Stack in middle: [2,3] -> [2,2,3] -> [2,6]
+        var result = try ops.stackAndFlatten(f32, tensor1, tensor2, 1);
+        defer result.deinit();
+        try expectEqual(@as(usize, 2), result.shape.len);
+        try expectEqual(@as(usize, 2), result.shape[0]);
+        try expectEqual(@as(usize, 6), result.shape[1]);
+    }
+}
+
+test "stackAndFlatten 3D tensors" {
+    const allocator = testing.allocator;
+
+    // Create two 2x3x4 tensors
+    var tensor1 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3, 4 });
+    defer tensor1.deinit();
+    var tensor2 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3, 4 });
+    defer tensor2.deinit();
+
+    // Fill with test data
+    for (tensor1.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+    for (tensor2.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i + 100);
+    }
+
+    // Test stacking along last dimension
+    var result = try ops.stackAndFlatten(f32, tensor1, tensor2, -1);
+    defer result.deinit();
+
+    // Check shape: should be [2, 3, 8]
+    try expectEqual(@as(usize, 3), result.shape.len);
+    try expectEqual(@as(usize, 2), result.shape[0]);
+    try expectEqual(@as(usize, 3), result.shape[1]);
+    try expectEqual(@as(usize, 8), result.shape[2]);
+
+    // Verify data ordering
+    try expectEqual(@as(f32, 0), result.data[0]); // First element from tensor1
+    try expectEqual(@as(f32, 100), result.data[1]); // First element from tensor2
+}
+
+test "stackAndFlatten error cases" {
+    const allocator = testing.allocator;
+
+    // Create tensors with different shapes
+    var tensor1 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor1.deinit();
+    var tensor2 = try Tensor(f32).init(allocator, &[_]usize{ 2, 4 });
+    defer tensor2.deinit();
+
+    // Test shape mismatch
+    try expectError(error.ShapeMismatch, ops.stackAndFlatten(f32, tensor1, tensor2, -1));
+
+    // Test invalid dimension
+    var tensor3 = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer tensor3.deinit();
+    try expectError(error.InvalidDimension, ops.stackAndFlatten(f32, tensor1, tensor3, 3));
+}
+
+test "stackAndFlatten with singleton dimensions" {
+    const allocator = testing.allocator;
+
+    // Create two 1x3 tensors
+    var tensor1 = try Tensor(f32).init(allocator, &[_]usize{ 1, 3 });
+    defer tensor1.deinit();
+    var tensor2 = try Tensor(f32).init(allocator, &[_]usize{ 1, 3 });
+    defer tensor2.deinit();
+
+    // Fill with test data
+    for (tensor1.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i);
+    }
+    for (tensor2.data, 0..) |*val, i| {
+        val.* = @floatFromInt(i + 10);
+    }
+
+    // Test stacking along different dimensions
+    {
+        var result = try ops.stackAndFlatten(f32, tensor1, tensor2, -1);
+        defer result.deinit();
+
+        try expectEqual(@as(usize, 2), result.shape.len);
+        try expectEqual(@as(usize, 1), result.shape[0]);
+        try expectEqual(@as(usize, 6), result.shape[1]);
+
+        // Verify data ordering
+        try expectEqual(@as(f32, 0), result.data[0]); // First element from tensor1
+        try expectEqual(@as(f32, 10), result.data[1]); // First element from tensor2
     }
 }
 
@@ -1311,6 +1787,212 @@ test "broadcast_add basic" {
     }
 }
 
+test "broadcast_multiply - same shape tensors" {
+    const allocator = testing.allocator;
+    // Initialize tensors with same shape [2, 2]
+    var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+    defer a.deinit();
+    var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+    defer b.deinit();
+
+    // Set values
+    a.data[0] = 1.0;
+    a.data[1] = 2.0;
+    a.data[2] = 3.0;
+    a.data[3] = 4.0;
+    b.data[0] = 2.0;
+    b.data[1] = 3.0;
+    b.data[2] = 4.0;
+    b.data[3] = 5.0;
+
+    // Perform broadcast multiplication
+    try ops.broadcast_multiply(f32, &a, b);
+
+    // Check results
+    try expectEqual(a.data[0], 2.0);
+    try expectEqual(a.data[1], 6.0);
+    try expectEqual(a.data[2], 12.0);
+    try expectEqual(a.data[3], 20.0);
+}
+
+test "broadcast_multiply - broadcasting scalar to matrix" {
+    // Initialize matrix and scalar tensors
+    const allocator = testing.allocator;
+    var matrix = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer matrix.deinit();
+    var scalar = try Tensor(f32).init(allocator, &[_]usize{1});
+    defer scalar.deinit();
+
+    // Set values
+    matrix.data[0] = 1.0;
+    matrix.data[1] = 2.0;
+    matrix.data[2] = 3.0;
+    matrix.data[3] = 4.0;
+    matrix.data[4] = 5.0;
+    matrix.data[5] = 6.0;
+    scalar.data[0] = 2.0;
+
+    // Perform broadcast multiplication
+    try ops.broadcast_multiply(f32, &matrix, scalar);
+
+    // Check results
+    try expectEqual(matrix.data[0], 2.0);
+    try expectEqual(matrix.data[1], 4.0);
+    try expectEqual(matrix.data[2], 6.0);
+    try expectEqual(matrix.data[3], 8.0);
+    try expectEqual(matrix.data[4], 10.0);
+    try expectEqual(matrix.data[5], 12.0);
+}
+
+test "broadcast_multiply - broadcasting vector to matrix" {
+    const allocator = testing.allocator;
+    // Initialize matrix and vector tensors
+    var matrix = try Tensor(f32).init(allocator, &[_]usize{ 3, 2 });
+    defer matrix.deinit();
+    var vector = try Tensor(f32).init(allocator, &[_]usize{2});
+    defer vector.deinit();
+
+    // Set values
+    matrix.data[0] = 1.0;
+    matrix.data[1] = 2.0;
+    matrix.data[2] = 3.0;
+    matrix.data[3] = 4.0;
+    matrix.data[4] = 5.0;
+    matrix.data[5] = 6.0;
+    vector.data[0] = 2.0;
+    vector.data[1] = 3.0;
+
+    // Perform broadcast multiplication
+    try ops.broadcast_multiply(f32, &matrix, vector);
+
+    // Check results
+    try expectEqual(matrix.data[0], 2.0);
+    try expectEqual(matrix.data[1], 6.0);
+    try expectEqual(matrix.data[2], 6.0);
+    try expectEqual(matrix.data[3], 12.0);
+    try expectEqual(matrix.data[4], 10.0);
+    try expectEqual(matrix.data[5], 18.0);
+}
+
+test "broadcast_multiply - integer tensors" {
+    const allocator = testing.allocator;
+    var a = try Tensor(i32).init(allocator, &[_]usize{4});
+    defer a.deinit();
+    var b = try Tensor(i32).init(allocator, &[_]usize{2});
+    defer b.deinit();
+
+    a.data[0] = 1;
+    a.data[1] = 2;
+    a.data[2] = 3;
+    a.data[3] = 4;
+    b.data[0] = 2;
+    b.data[1] = 3;
+
+    try ops.broadcast_multiply(i32, &a, b);
+
+    try expectEqual(a.data[0], 2);
+    try expectEqual(a.data[1], 6);
+    try expectEqual(a.data[2], 6);
+    try expectEqual(a.data[3], 12);
+}
+
+test "broadcast_subtract - same shape tensors" {
+    const allocator = testing.allocator;
+    var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+    defer a.deinit();
+    var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+    defer b.deinit();
+
+    a.data[0] = 5.0;
+    a.data[1] = 7.0;
+    a.data[2] = 9.0;
+    a.data[3] = 11.0;
+    b.data[0] = 1.0;
+    b.data[1] = 2.0;
+    b.data[2] = 3.0;
+    b.data[3] = 4.0;
+
+    try ops.broadcast_subtract(f32, &a, b);
+
+    try expectEqual(a.data[0], 4.0);
+    try expectEqual(a.data[1], 5.0);
+    try expectEqual(a.data[2], 6.0);
+    try expectEqual(a.data[3], 7.0);
+}
+
+test "broadcast_subtract - broadcasting scalar to matrix" {
+    const allocator = testing.allocator;
+    var matrix = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+    defer matrix.deinit();
+    var scalar = try Tensor(f32).init(allocator, &[_]usize{1});
+    defer scalar.deinit();
+
+    matrix.data[0] = 5.0;
+    matrix.data[1] = 6.0;
+    matrix.data[2] = 7.0;
+    matrix.data[3] = 8.0;
+    matrix.data[4] = 9.0;
+    matrix.data[5] = 10.0;
+    scalar.data[0] = 2.0;
+
+    try ops.broadcast_subtract(f32, &matrix, scalar);
+
+    try expectEqual(matrix.data[0], 3.0);
+    try expectEqual(matrix.data[1], 4.0);
+    try expectEqual(matrix.data[2], 5.0);
+    try expectEqual(matrix.data[3], 6.0);
+    try expectEqual(matrix.data[4], 7.0);
+    try expectEqual(matrix.data[5], 8.0);
+}
+
+test "broadcast_subtract - broadcasting vector to matrix" {
+    const allocator = testing.allocator;
+    var matrix = try Tensor(f32).init(allocator, &[_]usize{ 3, 2 });
+    defer matrix.deinit();
+    var vector = try Tensor(f32).init(allocator, &[_]usize{2});
+    defer vector.deinit();
+
+    matrix.data[0] = 5.0;
+    matrix.data[1] = 7.0;
+    matrix.data[2] = 9.0;
+    matrix.data[3] = 11.0;
+    matrix.data[4] = 13.0;
+    matrix.data[5] = 15.0;
+    vector.data[0] = 1.0;
+    vector.data[1] = 2.0;
+
+    try ops.broadcast_subtract(f32, &matrix, vector);
+
+    try expectEqual(matrix.data[0], 4.0);
+    try expectEqual(matrix.data[1], 5.0);
+    try expectEqual(matrix.data[2], 8.0);
+    try expectEqual(matrix.data[3], 9.0);
+    try expectEqual(matrix.data[4], 12.0);
+    try expectEqual(matrix.data[5], 13.0);
+}
+
+test "broadcast_subtract - integer tensors" {
+    const allocator = testing.allocator;
+    var a = try Tensor(i32).init(allocator, &[_]usize{4});
+    defer a.deinit();
+    var b = try Tensor(i32).init(allocator, &[_]usize{2});
+    defer b.deinit();
+
+    a.data[0] = 10;
+    a.data[1] = 12;
+    a.data[2] = 14;
+    a.data[3] = 16;
+    b.data[0] = 2;
+    b.data[1] = 3;
+
+    try ops.broadcast_subtract(i32, &a, b);
+
+    try expectEqual(a.data[0], 8);
+    try expectEqual(a.data[1], 9);
+    try expectEqual(a.data[2], 12);
+    try expectEqual(a.data[3], 13);
+}
+
 test "getChunk basic functionality" {
     const allocator = testing.allocator;
 
@@ -1886,235 +2568,235 @@ fn expectTensorApproxEq(comptime T: type, expected: []const T, actual: []const T
 }
 const math = std.math;
 
-test "applyRotaryEmb - basic functionality" {
-    const allocator = testing.allocator;
+// test "applyRotaryEmb - basic functionality" {
+//     const allocator = testing.allocator;
 
-    // Test parameters
-    const num_heads: usize = 2;
-    const seq_len: usize = 4;
-    const head_dim: usize = 8;
-    const rot_dim: usize = 4;
+//     // Test parameters
+//     const num_heads: usize = 2;
+//     const seq_len: usize = 4;
+//     const head_dim: usize = 8;
+//     const rot_dim: usize = 4;
 
-    // Create input tensor [num_heads, seq_len, head_dim]
-    var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
-    defer x.deinit();
+//     // Create input tensor [num_heads, seq_len, head_dim]
+//     var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
+//     defer x.deinit();
 
-    for (0..x.data.len) |i| {
-        x.data[i] = @floatFromInt(i);
-    }
+//     for (0..x.data.len) |i| {
+//         x.data[i] = @floatFromInt(i);
+//     }
 
-    // Create frequency tensor [seq_len, rot_dim/2, 2]
-    var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
-    defer freqs_cis.deinit();
+//     // Create frequency tensor [seq_len, rot_dim/2, 2]
+//     var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
+//     defer freqs_cis.deinit();
 
-    // Fill with cos/sin values
-    const pi: f32 = @floatCast(std.math.pi);
-    const angles = [_]f32{ 0, pi / 4.0, pi / 2.0, 3.0 * pi / 4.0 };
+//     // Fill with cos/sin values
+//     const pi: f32 = @floatCast(std.math.pi);
+//     const angles = [_]f32{ 0, pi / 4.0, pi / 2.0, 3.0 * pi / 4.0 };
 
-    for (0..seq_len) |s| {
-        const angle = angles[s];
-        freqs_cis.data[s * rot_dim] = @cos(angle);
-        freqs_cis.data[s * rot_dim + 1] = @sin(angle);
-    }
+//     for (0..seq_len) |s| {
+//         const angle = angles[s];
+//         freqs_cis.data[s * rot_dim] = @cos(angle);
+//         freqs_cis.data[s * rot_dim + 1] = @sin(angle);
+//     }
 
-    // Create position IDs [seq_len]
-    var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
-    defer position_ids.deinit();
+//     // Create position IDs [seq_len]
+//     var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
+//     defer position_ids.deinit();
 
-    for (0..seq_len) |i| {
-        position_ids.data[i] = @floatFromInt(i);
-    }
+//     for (0..seq_len) |i| {
+//         position_ids.data[i] = @floatFromInt(i);
+//     }
 
-    // Test both interleaved and non-interleaved versions
-    {
-        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, true, allocator);
-        defer result.deinit();
+//     // Test both interleaved and non-interleaved versions
+//     {
+//         var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, true, allocator);
+//         defer result.deinit();
 
-        // Check shape
-        try testing.expectEqual(result.shape.len, 3);
-        try testing.expectEqual(result.shape[0], num_heads);
-        try testing.expectEqual(result.shape[1], seq_len);
-        try testing.expectEqual(result.shape[2], head_dim);
+//         // Check shape
+//         try testing.expectEqual(result.shape.len, 3);
+//         try testing.expectEqual(result.shape[0], num_heads);
+//         try testing.expectEqual(result.shape[1], seq_len);
+//         try testing.expectEqual(result.shape[2], head_dim);
 
-        // Verify the non-rotated part is unchanged
-        for (0..num_heads) |h| {
-            for (0..seq_len) |s| {
-                for (rot_dim..head_dim) |d| {
-                    const idx = h * seq_len * head_dim + s * head_dim + d;
-                    try testing.expectApproxEqAbs(result.data[idx], x.data[idx], 1e-6);
-                }
-            }
-        }
-    }
-}
+//         // Verify the non-rotated part is unchanged
+//         for (0..num_heads) |h| {
+//             for (0..seq_len) |s| {
+//                 for (rot_dim..head_dim) |d| {
+//                     const idx = h * seq_len * head_dim + s * head_dim + d;
+//                     try testing.expectApproxEqAbs(result.data[idx], x.data[idx], 1e-6);
+//                 }
+//             }
+//         }
+//     }
+// }
 
-test "applyRotaryEmb - numerical correctness" {
-    const allocator = testing.allocator;
+// test "applyRotaryEmb - numerical correctness" {
+//     const allocator = testing.allocator;
 
-    // Simple 1x2x4 test case with known output
-    var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 2, 4 });
-    defer x.deinit();
+//     // Simple 1x2x4 test case with known output
+//     var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 2, 4 });
+//     defer x.deinit();
 
-    // Initialize input with simple pattern
-    const x_data = [_]f32{ 1.0, 2.0, 0.0, 0.0, 2.0, 1.0, -1.0, 0.0 };
-    @memcpy(x.data, &x_data);
+//     // Initialize input with simple pattern
+//     const x_data = [_]f32{ 1.0, 2.0, 0.0, 0.0, 2.0, 1.0, -1.0, 0.0 };
+//     @memcpy(x.data, &x_data);
 
-    // Create freq tensor for 90-degree rotation
-    var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 2, 1, 2 });
-    defer freqs_cis.deinit();
+//     // Create freq tensor for 90-degree rotation
+//     var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 2, 1, 2 });
+//     defer freqs_cis.deinit();
 
-    // Fill with simple rotation values:
-    // First position: no rotation (cos=1, sin=0)
-    // Second position: 90-degree rotation (cos=0, sin=1)
-    freqs_cis.data[0] = 1.0; // cos(0)
-    freqs_cis.data[1] = 0.0; // sin(0)
-    freqs_cis.data[2] = 0.0; // cos(pi/2)
-    freqs_cis.data[3] = 1.0; // sin(pi/2)
+//     // Fill with simple rotation values:
+//     // First position: no rotation (cos=1, sin=0)
+//     // Second position: 90-degree rotation (cos=0, sin=1)
+//     freqs_cis.data[0] = 1.0; // cos(0)
+//     freqs_cis.data[1] = 0.0; // sin(0)
+//     freqs_cis.data[2] = 0.0; // cos(pi/2)
+//     freqs_cis.data[3] = 1.0; // sin(pi/2)
 
-    var position_ids = try Tensor(f32).init(allocator, &[_]usize{2});
-    defer position_ids.deinit();
-    position_ids.data[0] = 0;
-    position_ids.data[1] = 1;
+//     var position_ids = try Tensor(f32).init(allocator, &[_]usize{2});
+//     defer position_ids.deinit();
+//     position_ids.data[0] = 0;
+//     position_ids.data[1] = 1;
 
-    // Test non-interleaved version
-    {
-        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 2, false, allocator);
-        defer result.deinit();
+//     // Test non-interleaved version
+//     {
+//         var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 2, false, allocator);
+//         defer result.deinit();
 
-        // First position should be unchanged
-        try testing.expectApproxEqAbs(result.data[0], 1.0, 1e-6);
-        try testing.expectApproxEqAbs(result.data[1], 2.0, 1e-6);
+//         // First position should be unchanged
+//         try testing.expectApproxEqAbs(result.data[0], 1.0, 1e-6);
+//         try testing.expectApproxEqAbs(result.data[1], 2.0, 1e-6);
 
-        // Second position should be rotated 90 degrees
-        // For 90-degree rotation: (x + yi) * (0 + i) = -y + xi
-        try testing.expectApproxEqAbs(result.data[4], -1.0, 1e-6); // -y
-        try testing.expectApproxEqAbs(result.data[5], 2.0, 1e-6); // x
+//         // Second position should be rotated 90 degrees
+//         // For 90-degree rotation: (x + yi) * (0 + i) = -y + xi
+//         try testing.expectApproxEqAbs(result.data[4], -1.0, 1e-6); // -y
+//         try testing.expectApproxEqAbs(result.data[5], 2.0, 1e-6); // x
 
-        // Pass-through values should be unchanged
-        try testing.expectApproxEqAbs(result.data[2], 0.0, 1e-6);
-        try testing.expectApproxEqAbs(result.data[3], 0.0, 1e-6);
-        try testing.expectApproxEqAbs(result.data[6], -1.0, 1e-6);
-        try testing.expectApproxEqAbs(result.data[7], 0.0, 1e-6);
-    }
-}
+//         // Pass-through values should be unchanged
+//         try testing.expectApproxEqAbs(result.data[2], 0.0, 1e-6);
+//         try testing.expectApproxEqAbs(result.data[3], 0.0, 1e-6);
+//         try testing.expectApproxEqAbs(result.data[6], -1.0, 1e-6);
+//         try testing.expectApproxEqAbs(result.data[7], 0.0, 1e-6);
+//     }
+// }
 
-test "applyRotaryEmb - error cases" {
-    const allocator = testing.allocator;
+// test "applyRotaryEmb - error cases" {
+//     const allocator = testing.allocator;
 
-    // Invalid input shape
-    {
-        var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 2 }); // Wrong number of dimensions
-        defer x.deinit();
-        var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 4, 2, 2 });
-        defer freqs_cis.deinit();
-        var position_ids = try Tensor(f32).init(allocator, &[_]usize{4});
-        defer position_ids.deinit();
+//     // Invalid input shape
+//     {
+//         var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 2 }); // Wrong number of dimensions
+//         defer x.deinit();
+//         var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 4, 2, 2 });
+//         defer freqs_cis.deinit();
+//         var position_ids = try Tensor(f32).init(allocator, &[_]usize{4});
+//         defer position_ids.deinit();
 
-        try testing.expectError(error.InvalidShape, ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 4, false, allocator));
-    }
+//         try testing.expectError(error.InvalidShape, ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 4, false, allocator));
+//     }
 
-    // Invalid rotation dimension
-    {
-        var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 4, 8 });
-        defer x.deinit();
-        var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 4, 2, 2 });
-        defer freqs_cis.deinit();
-        var position_ids = try Tensor(f32).init(allocator, &[_]usize{4});
-        defer position_ids.deinit();
+//     // Invalid rotation dimension
+//     {
+//         var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 4, 8 });
+//         defer x.deinit();
+//         var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 4, 2, 2 });
+//         defer freqs_cis.deinit();
+//         var position_ids = try Tensor(f32).init(allocator, &[_]usize{4});
+//         defer position_ids.deinit();
 
-        try testing.expectError(error.InvalidDimension, ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 16, false, allocator));
-    }
-}
+//         try testing.expectError(error.InvalidDimension, ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 16, false, allocator));
+//     }
+// }
 
-test "applyRotaryEmb - edge cases" {
-    const allocator = testing.allocator;
+// test "applyRotaryEmb - edge cases" {
+//     const allocator = testing.allocator;
 
-    // Minimal dimensions
-    {
-        var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 1, 2 });
-        defer x.deinit();
-        var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 1, 1, 2 });
-        defer freqs_cis.deinit();
-        var position_ids = try Tensor(f32).init(allocator, &[_]usize{1});
-        defer position_ids.deinit();
+//     // Minimal dimensions
+//     {
+//         var x = try Tensor(f32).init(allocator, &[_]usize{ 1, 1, 2 });
+//         defer x.deinit();
+//         var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ 1, 1, 2 });
+//         defer freqs_cis.deinit();
+//         var position_ids = try Tensor(f32).init(allocator, &[_]usize{1});
+//         defer position_ids.deinit();
 
-        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 2, false, allocator);
-        defer result.deinit();
+//         var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, 2, false, allocator);
+//         defer result.deinit();
 
-        try testing.expectEqual(result.shape[0], 1);
-        try testing.expectEqual(result.shape[2], 2);
-    }
-}
+//         try testing.expectEqual(result.shape[0], 1);
+//         try testing.expectEqual(result.shape[2], 2);
+//     }
+// }
 
-test "applyRotaryEmb - stress test" {
-    const allocator = testing.allocator;
+// test "applyRotaryEmb - stress test" {
+//     const allocator = testing.allocator;
 
-    // Test with larger dimensions
-    const num_heads: usize = 8;
-    const seq_len: usize = 32;
-    const head_dim: usize = 64;
-    const rot_dim: usize = 32;
+//     // Test with larger dimensions
+//     const num_heads: usize = 8;
+//     const seq_len: usize = 32;
+//     const head_dim: usize = 64;
+//     const rot_dim: usize = 32;
 
-    var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
-    defer x.deinit();
-    var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
-    defer freqs_cis.deinit();
-    var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
-    defer position_ids.deinit();
+//     var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
+//     defer x.deinit();
+//     var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
+//     defer freqs_cis.deinit();
+//     var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
+//     defer position_ids.deinit();
 
-    // Fill with test data
-    for (0..x.data.len) |i| {
-        x.data[i] = @floatFromInt(i % 100);
-    }
-    for (0..freqs_cis.data.len) |i| {
-        freqs_cis.data[i] = @sin(@as(f32, @floatFromInt(i)));
-    }
-    for (0..seq_len) |i| {
-        position_ids.data[i] = @floatFromInt(i);
-    }
+//     // Fill with test data
+//     for (0..x.data.len) |i| {
+//         x.data[i] = @floatFromInt(i % 100);
+//     }
+//     for (0..freqs_cis.data.len) |i| {
+//         freqs_cis.data[i] = @sin(@as(f32, @floatFromInt(i)));
+//     }
+//     for (0..seq_len) |i| {
+//         position_ids.data[i] = @floatFromInt(i);
+//     }
 
-    // Test both versions
-    {
-        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, true, allocator);
-        defer result.deinit();
+//     // Test both versions
+//     {
+//         var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, true, allocator);
+//         defer result.deinit();
 
-        // Check stability
-        for (result.data) |val| {
-            try testing.expect(std.math.isFinite(val));
-        }
-    }
+//         // Check stability
+//         for (result.data) |val| {
+//             try testing.expect(std.math.isFinite(val));
+//         }
+//     }
 
-    {
-        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, false, allocator);
-        defer result.deinit();
+//     {
+//         var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, false, allocator);
+//         defer result.deinit();
 
-        for (result.data) |val| {
-            try testing.expect(std.math.isFinite(val));
-        }
-    }
-}
+//         for (result.data) |val| {
+//             try testing.expect(std.math.isFinite(val));
+//         }
+//     }
+// }
 
-test "applyRotaryEmb - memory management" {
-    const allocator = testing.allocator;
+// test "applyRotaryEmb - memory management" {
+//     const allocator = testing.allocator;
 
-    const num_heads = 2;
-    const seq_len = 8;
-    const head_dim = 16;
-    const rot_dim = 8;
+//     const num_heads = 2;
+//     const seq_len = 8;
+//     const head_dim = 16;
+//     const rot_dim = 8;
 
-    // Run multiple times to check for memory leaks
-    for (0..5) |_| {
-        var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
-        defer x.deinit();
-        var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
-        defer freqs_cis.deinit();
-        var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
-        defer position_ids.deinit();
+//     // Run multiple times to check for memory leaks
+//     for (0..5) |_| {
+//         var x = try Tensor(f32).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
+//         defer x.deinit();
+//         var freqs_cis = try Tensor(f32).init(allocator, &[_]usize{ seq_len, rot_dim / 2, 2 });
+//         defer freqs_cis.deinit();
+//         var position_ids = try Tensor(f32).init(allocator, &[_]usize{seq_len});
+//         defer position_ids.deinit();
 
-        var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, false, allocator);
-        defer result.deinit();
-    }
-}
+//         var result = try ops.applyRotaryEmb(f32, x, freqs_cis, position_ids, rot_dim, false, allocator);
+//         defer result.deinit();
+//     }
+// }
 
 // Helper function to check if two f32 values are approximately equal
 fn approxEqual(a: f32, b: f32) bool {

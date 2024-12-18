@@ -6,6 +6,7 @@ const max_rows = 8; // Maximum number of rows to show before truncating
 const Tensor = @import("tensor.zig").Tensor;
 const StabilityError = @import("tensor.zig").StabilityError;
 const simdmatmul = @import("matmul.zig");
+const Slice = @import("tensor.zig").Slice;
 const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expectError = testing.expectError;
@@ -122,6 +123,7 @@ pub fn add(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
         std.debug.print("tensor shape: {d}\n", .{tensor.shape});
         std.debug.print("other shape: {d}\n", .{other.shape});
+        std.debug.print("Error during addition", .{});
         return error.ShapeMismatch;
     }
 
@@ -132,6 +134,9 @@ pub fn add(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
 
 pub fn subtract(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
+        std.debug.print("tensor shape: {d}\n", .{tensor.shape});
+        std.debug.print("other shape: {d}\n", .{other.shape});
+        std.debug.print("Error during subtraction", .{});
         return error.ShapeMismatch;
     }
 
@@ -142,6 +147,9 @@ pub fn subtract(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
 
 pub fn multiply(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
+        std.debug.print("tensor shape: {d}\n", .{tensor.shape});
+        std.debug.print("other shape: {d}\n", .{other.shape});
+        std.debug.print("Error during multiplication", .{});
         return error.ShapeMismatch;
     }
 
@@ -242,6 +250,42 @@ pub fn broadcast_add(comptime T: type, a: *Tensor(T), b: Tensor(T)) !void {
     }
 }
 
+// Helper function for broadcasting multiplication
+pub fn broadcast_multiply(comptime T: type, a: *Tensor(T), b: Tensor(T)) !void {
+    // Create a temporary tensor for the result
+    var result = try a.copy();
+    defer result.deinit();
+
+    // Perform broadcasted multiplication
+    const total_elements = a.data.len;
+    const b_elements = b.data.len;
+
+    for (0..total_elements) |i| {
+        // Calculate the broadcast index for b
+        const b_idx = i % b_elements;
+        result.data[i] = a.data[i] * b.data[b_idx];
+    }
+
+    // Copy result back to a
+    @memcpy(a.data, result.data);
+}
+
+// Helper function for broadcasting subtraction
+pub fn broadcast_subtract(comptime T: type, a: *Tensor(T), b: Tensor(T)) !void {
+    var result = try a.copy();
+    defer result.deinit();
+
+    const total_elements = a.data.len;
+    const b_elements = b.data.len;
+
+    for (0..total_elements) |i| {
+        const b_idx = i % b_elements;
+        result.data[i] = a.data[i] - b.data[b_idx];
+    }
+
+    @memcpy(a.data, result.data);
+}
+
 pub fn matmul(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !Tensor(T) {
     if (tensor.shape.len != 2 or other.shape.len != 2) {
         return error.UnsupportedDimension;
@@ -291,6 +335,9 @@ pub fn outer(comptime T: type, tensor: Tensor(T), other: Tensor(T)) !Tensor(T) {
 
 pub fn accumulate(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
+        std.debug.print("tensor shape: {d}\n", .{tensor.shape});
+        std.debug.print("other shape: {d}\n", .{other.shape});
+        std.debug.print("Error during accumulation", .{});
         return error.ShapeMismatch;
     }
 
@@ -624,6 +671,188 @@ fn verifyCompatibleForConcat(comptime T: type, tensor: Tensor(T), other: Tensor(
     }
 }
 
+pub fn stack(comptime T: type, tensors: []const Tensor(T), dim: usize) !Tensor(T) {
+    if (tensors.len == 0) {
+        return error.EmptyTensorList;
+    }
+
+    const ref_tensor = tensors[0];
+    const ref_shape = ref_tensor.shape;
+
+    // Validate all tensors have the same shape
+    for (tensors[1..]) |tensor| {
+        if (!std.mem.eql(usize, tensor.shape, ref_shape)) {
+            std.debug.print("Error during stacking", .{});
+            return error.ShapeMismatch;
+        }
+    }
+
+    // Validate dimension
+    if (dim > ref_shape.len) {
+        return error.InvalidDimension;
+    }
+
+    // Create new shape with extra dimension
+    var new_shape = try ref_tensor.allocator.alloc(usize, ref_shape.len + 1);
+    errdefer ref_tensor.allocator.free(new_shape);
+
+    // Copy shape and insert new dimension
+    var src_shape_idx: usize = 0;
+    var dst_shape_idx: usize = 0;
+    while (dst_shape_idx < new_shape.len) : (dst_shape_idx += 1) {
+        if (dst_shape_idx == dim) {
+            new_shape[dst_shape_idx] = tensors.len; // Size of new dimension
+        } else {
+            new_shape[dst_shape_idx] = ref_shape[src_shape_idx];
+            src_shape_idx += 1;
+        }
+    }
+
+    // Create result tensor
+    var result = try Tensor(T).init(ref_tensor.allocator, new_shape);
+    errdefer result.deinit();
+    ref_tensor.allocator.free(new_shape);
+
+    // Calculate strides for the result tensor
+    var strides = try ref_tensor.allocator.alloc(usize, result.shape.len);
+    defer ref_tensor.allocator.free(strides);
+
+    strides[strides.len - 1] = 1;
+    var i = strides.len - 1;
+    while (i > 0) : (i -= 1) {
+        strides[i - 1] = strides[i] * result.shape[i];
+    }
+
+    // Copy data from each input tensor
+    var coords = try ref_tensor.allocator.alloc(usize, result.shape.len);
+    defer ref_tensor.allocator.free(coords);
+    @memset(coords, 0);
+
+    const elements_per_tensor = calculateSize(ref_shape);
+
+    // For each input tensor
+    for (tensors, 0..) |tensor, tensor_idx| {
+        var element_idx: usize = 0;
+        while (element_idx < elements_per_tensor) : (element_idx += 1) {
+            // Calculate source coordinates (excluding stacked dimension)
+            var temp = element_idx;
+            var src_coords = try ref_tensor.allocator.alloc(usize, ref_shape.len);
+            defer ref_tensor.allocator.free(src_coords);
+
+            var j = ref_shape.len;
+            while (j > 0) : (j -= 1) {
+                src_coords[j - 1] = temp % ref_shape[j - 1];
+                temp /= ref_shape[j - 1];
+            }
+
+            // Calculate destination coordinates (including stacked dimension)
+            var final_dst_idx: usize = 0;
+            var coord_idx: usize = 0;
+            for (coords, 0..) |*c, idx| {
+                if (idx == dim) {
+                    c.* = tensor_idx;
+                } else {
+                    c.* = src_coords[coord_idx];
+                    coord_idx += 1;
+                }
+                final_dst_idx += c.* * strides[idx];
+            }
+
+            // Copy the value
+            result.data[final_dst_idx] = tensor.data[element_idx];
+
+            // Update coordinates for next iteration
+            var k = coords.len;
+            while (k > 0) {
+                k -= 1;
+                if (k == dim) continue; // Skip the stacked dimension
+                coords[k] += 1;
+                if (coords[k] < result.shape[k]) break;
+                coords[k] = 0;
+            }
+        }
+    }
+
+    return result;
+}
+
+/// Convert negative dimension index to positive
+pub fn normalizeDim(dim: isize, n_dims: usize) !usize {
+    const n_dims_i: isize = @intCast(n_dims);
+    if (dim >= 0) {
+        if (dim >= n_dims_i) return error.InvalidDimension;
+        return @intCast(dim);
+    } else {
+        const positive_dim = n_dims_i + dim; // -1 becomes n_dims-1
+        if (positive_dim < 0 or positive_dim >= n_dims_i) return error.InvalidDimension;
+        return @intCast(positive_dim);
+    }
+}
+
+/// Flattens dimensions from start_dim to end_dim (inclusive)
+/// TODO: Convert to tensor intrinsic
+pub fn flatten(comptime T: type, tensor: *Tensor(T), start_dim: isize, end_dim: isize) !void {
+    const positive_start = try normalizeDim(start_dim, tensor.shape.len);
+    const positive_end = try normalizeDim(end_dim, tensor.shape.len);
+
+    if (positive_start > positive_end) {
+        return error.InvalidDimRange;
+    }
+
+    // Calculate the size of the flattened dimension
+    var flat_size: usize = 1;
+    for (positive_start..positive_end + 1) |i| {
+        flat_size *= tensor.shape[i];
+    }
+
+    // Create new shape
+    const new_shape_len = tensor.shape.len - (positive_end - positive_start);
+    var new_shape = try tensor.allocator.alloc(usize, new_shape_len);
+    errdefer tensor.allocator.free(new_shape);
+
+    // Copy dimensions before flattened dimensions
+    @memcpy(new_shape[0..positive_start], tensor.shape[0..positive_start]);
+
+    // Add flattened dimension
+    new_shape[positive_start] = flat_size;
+
+    // Copy dimensions after flattened dimensions
+    if (positive_end + 1 < tensor.shape.len) {
+        @memcpy(
+            new_shape[positive_start + 1 ..],
+            tensor.shape[positive_end + 1 ..],
+        );
+    }
+
+    // Free old shape and update with new shape
+    tensor.allocator.free(tensor.shape);
+    tensor.shape = new_shape;
+}
+
+// Usage example:
+pub fn stackAndFlatten(comptime T: type, r: Tensor(T), i: Tensor(T), dim: isize) !Tensor(T) {
+    // Convert negative dimension to positive
+    const positive_dim = if (dim >= 0)
+        @as(usize, @intCast(dim))
+    else blk: {
+        const n_dims: isize = @intCast(r.shape.len);
+        // -1 means last dimension + 1 (where we'll insert)
+        const adjusted_dim = n_dims + 1 + dim;
+        if (adjusted_dim < 0) return error.InvalidDimension;
+        break :blk @as(usize, @intCast(adjusted_dim));
+    };
+
+    // Stack the tensors along specified dimension
+    var tensors = [_]Tensor(T){ r, i };
+    var result = try stack(T, &tensors, positive_dim);
+    errdefer result.deinit();
+
+    // Flatten the last two dimensions
+    try flatten(T, &result, @intCast(result.shape.len - 2), @intCast(result.shape.len - 1));
+
+    return result;
+}
+
 fn calculateSize(shape: []const usize) usize {
     var size: usize = 1;
     for (shape) |dim| {
@@ -814,9 +1043,9 @@ pub fn precomputeFreqsCis(
     const dim_float: T = @floatFromInt(dim);
     for (0..dim / 2) |i| {
         const idx_float: T = @floatFromInt(i * 2);
-        const power = idx_float / dim_float;
+        const power = idx_float / dim_float; // Removed negative sign to match Python
 
-        // Check for potential overflow in power calculation
+        // Check for potential overflow
         if (power < -1000 or power > 1000) {
             return error.ComputationOverflow;
         }
@@ -827,7 +1056,7 @@ pub fn precomputeFreqsCis(
             return error.NumericalInstability;
         }
 
-        freqs.data[i] = 1.0 / theta_power;
+        freqs.data[i] = 1.0 / theta_power; // Now matches Python's 1.0 / (theta ** x)
 
         // Check for numerical stability
         if (!std.math.isFinite(freqs.data[i])) {
@@ -835,7 +1064,7 @@ pub fn precomputeFreqsCis(
         }
     }
 
-    // 2. Create time tensor
+    // 2. Create time tensor [end, 1]
     var time_range = try Tensor(T).init(allocator, &[_]usize{ end, 1 });
     errdefer time_range.deinit();
 
@@ -846,11 +1075,11 @@ pub fn precomputeFreqsCis(
     // 3. Reshape freqs and prepare for multiplication
     try freqs.reshape(&[_]usize{ 1, dim / 2 });
 
-    // Initialize result tensor for the multiplication
+    // Initialize freq_matrix for the outer product
     var freq_matrix = try Tensor(T).init(allocator, &[_]usize{ end, dim / 2 });
     errdefer freq_matrix.deinit();
 
-    // Perform the outer product manually
+    // Perform the outer product (t * freqs)
     for (0..end) |i| {
         for (0..dim / 2) |j| {
             const product = time_range.data[i] * freqs.data[j];
@@ -861,11 +1090,11 @@ pub fn precomputeFreqsCis(
         }
     }
 
-    // 4. Calculate exp(i * freqs)
+    // 4. Calculate exp(i * freqs) -> [cos(x), sin(x)]
     var result = try Tensor(T).init(allocator, &[_]usize{ end, dim / 2, 2 });
     errdefer result.deinit();
 
-    // Calculate cos and sin values
+    // Calculate cos and sin values (equivalent to exp(i*x) = cos(x) + i*sin(x))
     for (0..end) |i| {
         for (0..dim / 2) |j| {
             const x = freq_matrix.data[i * (dim / 2) + j];
@@ -897,6 +1126,8 @@ const RotaryError = error{
     InvalidShape,
     ShapeMismatch,
     InvalidPositionIds,
+    DimensionMismatch, // Added for concat
+    IncompatibleShapes, // Added for concat
 } || FreqsError;
 
 /// Applies rotary position embeddings to the input tensor
@@ -912,182 +1143,169 @@ const RotaryError = error{
 ///   Tensor with rotary embeddings applied
 pub fn applyRotaryEmb(
     comptime T: type,
+    allocator: Allocator,
     x: Tensor(T),
     freqs_cis: Tensor(T),
-    position_ids: Tensor(T),
+    position_ids: Tensor(usize),
     rot_dim: usize,
     interleave: bool,
-    allocator: std.mem.Allocator,
-) RotaryError!Tensor(T) {
-    // Validate dimensions
-    if (x.shape.len != 3) return error.InvalidShape; // [num_heads, seq_len, head_dim]
-    if (freqs_cis.shape.len != 3) return error.InvalidShape;
-    if (position_ids.shape.len != 1) return error.InvalidShape;
-
-    const num_heads = x.shape[0];
-    const seq_len = x.shape[1];
-    const head_dim = x.shape[2];
-
-    if (rot_dim > head_dim) return error.InvalidDimension;
-    if (rot_dim != freqs_cis.shape[1] * 2) return error.InvalidDimension;
-
-    // Split x into rotated and pass-through parts
-    var x_rot = try Tensor(T).init(allocator, &[_]usize{ num_heads, seq_len, rot_dim });
-    defer x_rot.deinit();
-    var x_pass = try Tensor(T).init(allocator, &[_]usize{ num_heads, seq_len, head_dim - rot_dim });
-    defer x_pass.deinit();
-
-    // Copy data to split tensors
-    for (0..num_heads) |h| {
-        for (0..seq_len) |s| {
-            // Copy rotated part
-            for (0..rot_dim) |d| {
-                const src_idx = h * seq_len * head_dim +
-                    s * head_dim + d;
-                const dst_idx = h * seq_len * rot_dim +
-                    s * rot_dim + d;
-                x_rot.data[dst_idx] = x.data[src_idx];
-            }
-            // Copy pass-through part
-            for (0..head_dim - rot_dim) |d| {
-                const src_idx = h * seq_len * head_dim +
-                    s * head_dim + (d + rot_dim);
-                const dst_idx = h * seq_len * (head_dim - rot_dim) +
-                    s * (head_dim - rot_dim) + d;
-                x_pass.data[dst_idx] = x.data[src_idx];
-            }
-        }
+) !Tensor(T) {
+    // Validate input constraints
+    if (x.shape.len != 3) {
+        return error.InvalidInputDimensions;
+    }
+    if (rot_dim != freqs_cis.shape[freqs_cis.shape.len - 2] * 2) {
+        return error.InvalidRotationDimension;
     }
 
-    // Extract real and imaginary parts
+    const n_heads = x.shape[0]; // 32
+    const seq_len = x.shape[1]; // 13
+    const head_dim = x.shape[2]; // 16
+
+    // Split x into rotation and pass-through parts
+    var x_rot = try x.getSliceRange(&[_]Slice{
+        Slice.full(), // Head (32)
+        Slice.full(), // Sequence (13)
+        Slice.from(0, rot_dim), // First rot_dim features
+    });
+    defer x_rot.deinit();
+
+    var x_pass = if (rot_dim < head_dim) blk: {
+        const pass = try x.getSliceRange(&[_]Slice{
+            Slice.full(), // Head (32)
+            Slice.full(), // Sequence (13)
+            Slice.from(rot_dim, null), // Remaining features
+        });
+        break :blk pass;
+    } else Tensor(T).init(allocator, &[_]usize{ n_heads, seq_len, 0 }) catch unreachable;
+    defer x_pass.deinit();
+
+    // x_rot and x_pass are correct!
+
+    // Handle interleaved vs non-interleaved cases
     var xq_r: Tensor(T) = undefined;
     var xq_i: Tensor(T) = undefined;
 
     if (interleave) {
-        // Reshape for interleaved format
-        try x_rot.reshape(&[_]usize{ num_heads, seq_len, rot_dim / 2, 2 });
-        xq_r = try Tensor(T).init(allocator, &[_]usize{ num_heads, seq_len, rot_dim / 2 });
-        xq_i = try Tensor(T).init(allocator, &[_]usize{ num_heads, seq_len, rot_dim / 2 });
+        // Reshape x_rot to [n_heads, seq_len, rot_dim/2, 2]
+        var reshaped = try x_rot.copy();
+        defer reshaped.deinit();
+        try reshaped.reshape(&[_]usize{ n_heads, seq_len, rot_dim / 2, 2 });
 
-        // Extract components
-        for (0..num_heads * seq_len * (rot_dim / 2)) |i| {
-            xq_r.data[i] = x_rot.data[i * 2];
-            xq_i.data[i] = x_rot.data[i * 2 + 1];
-        }
+        // Extract real and imaginary parts (n_heads, seq_len, rot_dim/2)
+        xq_r = try reshaped.getSliceRange(&[_]Slice{
+            Slice.full(),
+            Slice.full(),
+            Slice.full(),
+            Slice.from(0, 1),
+        });
+        try xq_r.reshape(&[_]usize{ n_heads, seq_len, rot_dim / 2 });
+
+        xq_i = try reshaped.getSliceRange(&[_]Slice{
+            Slice.full(),
+            Slice.full(),
+            Slice.full(),
+            Slice.from(1, 2),
+        });
+        try xq_i.reshape(&[_]usize{ n_heads, seq_len, rot_dim / 2 });
     } else {
-        const half_dim = rot_dim / 2;
-        xq_r = try Tensor(T).init(allocator, &[_]usize{ num_heads, seq_len, half_dim });
-        xq_i = try Tensor(T).init(allocator, &[_]usize{ num_heads, seq_len, half_dim });
-
-        // Copy first and second halves
-        for (0..num_heads) |h| {
-            for (0..seq_len) |s| {
-                for (0..half_dim) |d| {
-                    const src_idx = h * seq_len * rot_dim +
-                        s * rot_dim;
-                    xq_r.data[
-                        h * seq_len * half_dim +
-                            s * half_dim + d
-                    ] = x_rot.data[src_idx + d];
-                    xq_i.data[
-                        h * seq_len * half_dim +
-                            s * half_dim + d
-                    ] = x_rot.data[src_idx + half_dim + d];
-                }
-            }
-        }
+        // Split last dimension in half
+        xq_r = try x_rot.getSliceRange(&[_]Slice{
+            Slice.full(),
+            Slice.full(),
+            Slice.from(0, rot_dim / 2),
+        });
+        xq_i = try x_rot.getSliceRange(&[_]Slice{
+            Slice.full(),
+            Slice.full(),
+            Slice.from(rot_dim / 2, null),
+        });
     }
+
+    // xq_r and xq_i are correct!
     defer xq_r.deinit();
     defer xq_i.deinit();
 
-    // Get cos and sin components for the specified positions
-    var freqs_cos = try Tensor(T).init(allocator, &[_]usize{ 1, seq_len, rot_dim / 2 });
+    // Get cos and sin from freqs_cis
+    var cos_part = try freqs_cis.getSliceRange(&[_]Slice{
+        Slice.full(),
+        Slice.full(),
+        Slice.from(0, 1),
+    });
+    defer cos_part.deinit();
+
+    var sin_part = try freqs_cis.getSliceRange(&[_]Slice{
+        Slice.full(),
+        Slice.full(),
+        Slice.from(1, 2),
+    });
+    defer sin_part.deinit();
+
+    // Create freqs_cos and freqs_sin with shape (1, seq_len, rot_dim/2)
+    var freqs_cos = try zeros(T, allocator, &[_]usize{
+        1,
+        seq_len,
+        rot_dim / 2,
+    });
     defer freqs_cos.deinit();
-    var freqs_sin = try Tensor(T).init(allocator, &[_]usize{ 1, seq_len, rot_dim / 2 });
+
+    var freqs_sin = try zeros(T, allocator, &[_]usize{
+        1,
+        seq_len,
+        rot_dim / 2,
+    });
     defer freqs_sin.deinit();
 
-    // Copy values based on position_ids
-    for (0..seq_len) |s| {
-        const pos = @as(usize, @intFromFloat(position_ids.data[s]));
-        if (pos >= freqs_cis.shape[0]) return error.InvalidPositionIds;
-
-        for (0..rot_dim / 2) |d| {
-            const src_idx = pos * (rot_dim / 2) * 2 + d * 2;
-            freqs_cos.data[s * (rot_dim / 2) + d] = freqs_cis.data[src_idx];
-            freqs_sin.data[s * (rot_dim / 2) + d] = freqs_cis.data[src_idx + 1];
-        }
+    // Fill freqs_cos and freqs_sin using position_ids
+    for (0..seq_len) |i| {
+        const pos_id = position_ids.data[i];
+        const offset = i * (rot_dim / 2);
+        @memcpy(freqs_cos.data[offset .. offset + rot_dim / 2], cos_part.data[pos_id * cos_part.shape[1] .. (pos_id + 1) * cos_part.shape[1]]);
+        @memcpy(freqs_sin.data[offset .. offset + rot_dim / 2], sin_part.data[pos_id * sin_part.shape[1] .. (pos_id + 1) * sin_part.shape[1]]);
     }
 
-    // Perform complex multiplication
-    var xq_out_r = try Tensor(T).init(allocator, xq_r.shape);
+    // freqs sin and cos are correct!
+
+    // Complex multiply with broadcasting across heads
+    // (a + bi)(c + di) = (ac - bd) + (ad + bc)i
+    var xq_out_r = try xq_r.copy(); // Will be (n_heads, seq_len, rot_dim/2)
     defer xq_out_r.deinit();
-    var xq_out_i = try Tensor(T).init(allocator, xq_r.shape);
+    try broadcast_multiply(T, &xq_out_r, freqs_cos);
+
+    var temp = try xq_i.copy();
+    defer temp.deinit();
+    try broadcast_multiply(T, &temp, freqs_sin);
+    try broadcast_subtract(T, &xq_out_r, temp);
+
+    var xq_out_i = try xq_r.copy(); // Will be (n_heads, seq_len, rot_dim/2)
     defer xq_out_i.deinit();
+    try broadcast_multiply(T, &xq_out_i, freqs_sin);
 
-    for (0..num_heads) |h| {
-        for (0..seq_len) |s| {
-            for (0..rot_dim / 2) |d| {
-                const idx = h * seq_len * (rot_dim / 2) +
-                    s * (rot_dim / 2) + d;
-                const cos = freqs_cos.data[s * (rot_dim / 2) + d];
-                const sin = freqs_sin.data[s * (rot_dim / 2) + d];
+    var temp2 = try xq_i.copy();
+    defer temp2.deinit();
+    try broadcast_multiply(T, &temp2, freqs_cos);
+    try broadcast_add(T, &xq_out_i, temp2);
 
-                xq_out_r.data[idx] = xq_r.data[idx] * cos - xq_i.data[idx] * sin;
-                xq_out_i.data[idx] = xq_r.data[idx] * sin + xq_i.data[idx] * cos;
-            }
-        }
-    }
+    // xq_out_r amd xq_out_i are correct!
 
-    // Combine real and imaginary parts
-    var xq_out = try Tensor(T).init(allocator, &[_]usize{ num_heads, seq_len, rot_dim });
-    defer xq_out.deinit();
+    // Stack real and imaginary parts -> (n_heads, seq_len, rot_dim)
+    var tensors = [_]Tensor(T){ xq_out_r, xq_out_i };
+    var stacked = try stack(T, &tensors, 3);
+    defer stacked.deinit();
 
-    if (interleave) {
-        for (0..num_heads * seq_len * (rot_dim / 2)) |i| {
-            xq_out.data[i * 2] = xq_out_r.data[i];
-            xq_out.data[i * 2 + 1] = xq_out_i.data[i];
-        }
+    try flatten(f32, &stacked, 2, 3);
+
+    // stacked.print3D();
+
+    // std.debug.print("stacked shape (xq_out) {any} \n", .{stacked.shape});
+    // std.debug.print("x_pass shape {any} \n", .{x_pass.shape});
+
+    // Concatenate with pass-through
+    if (x_pass.data.len > 0) {
+        return concat(T, stacked, x_pass, 2);
     } else {
-        const half_dim = rot_dim / 2;
-        for (0..num_heads) |h| {
-            for (0..seq_len) |s| {
-                for (0..half_dim) |d| {
-                    const src_idx = h * seq_len * half_dim +
-                        s * half_dim + d;
-                    const dst_idx = h * seq_len * rot_dim +
-                        s * rot_dim;
-                    xq_out.data[dst_idx + d] = xq_out_r.data[src_idx];
-                    xq_out.data[dst_idx + half_dim + d] = xq_out_i.data[src_idx];
-                }
-            }
-        }
+        return stacked.copy();
     }
-
-    // Concatenate rotated and pass-through parts
-    var result = try Tensor(T).init(allocator, &[_]usize{ num_heads, seq_len, head_dim });
-
-    for (0..num_heads) |h| {
-        for (0..seq_len) |s| {
-            // Copy rotated part
-            for (0..rot_dim) |d| {
-                const src_idx = h * seq_len * rot_dim +
-                    s * rot_dim + d;
-                const dst_idx = h * seq_len * head_dim +
-                    s * head_dim + d;
-                result.data[dst_idx] = xq_out.data[src_idx];
-            }
-            // Copy pass-through part
-            for (0..head_dim - rot_dim) |d| {
-                const src_idx = h * seq_len * (head_dim - rot_dim) +
-                    s * (head_dim - rot_dim) + d;
-                const dst_idx = h * seq_len * head_dim +
-                    s * head_dim + (d + rot_dim);
-                result.data[dst_idx] = x_pass.data[src_idx];
-            }
-        }
-    }
-
-    return result;
 }
 
 // Create attention mask for proper causal attention alignment
