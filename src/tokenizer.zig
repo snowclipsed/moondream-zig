@@ -279,84 +279,71 @@ pub const Tokenizer = struct {
         std.debug.print("vocab size: {}\n", .{self.tokens.count()});
         std.debug.print("merge list size: {}\n", .{self.merges.items.len});
     }
-
+    // TODO: Write Decode Function.
     pub fn decode(self: *const Tokenizer, tokens: std.ArrayList(u32)) ![]const u8 {
         var decoded_text = std.ArrayList(u8).init(self.allocator);
         errdefer decoded_text.deinit();
 
-        var i: usize = 0;
-        var prev_was_space = false;
-
-        while (i < tokens.items.len) {
-            const token_id = tokens.items[i];
-
-            // Handle special tokens first
+        for (tokens.items) |token_id| {
             if (token_id == self.bos_token or token_id == self.eos_token or token_id == self.pad_token) {
-                i += 1;
                 continue;
             }
 
-            switch (token_id) {
-                32 => { // Space token
-                    try decoded_text.append(' ');
-                    prev_was_space = true;
-                },
-                198 => { // Newline token
-                    try decoded_text.append('\n');
-                    prev_was_space = false;
-                },
-                else => {
-                    var token_found = false;
-                    var token_it = self.tokens.iterator();
-                    while (token_it.next()) |entry| {
-                        if (entry.value_ptr.* == token_id) {
-                            const token = entry.key_ptr.*;
+            var found = false;
+            var token_it = self.tokens.iterator();
+            while (token_it.next()) |entry| {
+                if (entry.value_ptr.* == token_id) {
+                    const token = entry.key_ptr.*;
 
-                            // Handle Ġ prefix tokens
-                            if (token.len >= 3 and std.mem.startsWith(u8, token, "Ġ")) {
-                                const content = token[3..];
-                                // Only add space if we're not at the start and not after another space
-                                if (!prev_was_space and decoded_text.items.len > 0) {
-                                    try decoded_text.append(' ');
-                                }
-                                try decoded_text.appendSlice(content);
-                            } else {
-                                // For non-Ġ tokens, just append directly
-                                try decoded_text.appendSlice(token);
-                            }
-                            token_found = true;
-                            prev_was_space = false;
-                            break;
-                        }
+                    // Handle single character tokens directly
+                    if (token.len == 1) {
+                        try decoded_text.appendSlice(token);
+                        found = true;
+                        break;
                     }
 
-                    if (!token_found) {
-                        // Handle byte tokens
-                        if (token_id < 256) {
-                            try decoded_text.append(@intCast(token_id));
-                            if (token_id >= 0x80) { // Part of UTF-8 sequence
-                                const remaining_bytes = std.unicode.utf8ByteSequenceLength(@intCast(token_id)) catch 1;
-                                // Try to collect the full UTF-8 sequence
-                                var bytes_collected: usize = 1;
-                                while (bytes_collected < remaining_bytes and i + 1 < tokens.items.len) {
-                                    const next_byte = tokens.items[i + 1];
-                                    if (next_byte < 256) {
-                                        try decoded_text.append(@intCast(next_byte));
-                                        i += 1;
-                                        bytes_collected += 1;
-                                    } else {
-                                        break;
-                                    }
+                    // Handle tokens with special prefixes
+                    if (token.len > 1) {
+                        switch (token[1]) {
+                            0xA0 => {
+                                // This is 'Ġ' (0xC4 0xA0 in UTF-8)
+                                try decoded_text.append(' ');
+                                try decoded_text.appendSlice(token[2..]);
+                            },
+                            0x82 => {
+                                // This is 'Ċ' (0xC4 0x82 in UTF-8)
+                                try decoded_text.append('\n');
+                                try decoded_text.appendSlice(token[2..]);
+                            },
+                            else => {
+                                if (token[0] == 0xC4) {
+                                    // Other UTF-8 prefixed tokens
+                                    try decoded_text.appendSlice(token[2..]);
+                                } else {
+                                    try decoded_text.appendSlice(token);
                                 }
-                            }
-                        } else {
-                            return error.TokenNotFound;
+                            },
                         }
-                        prev_was_space = false;
+                    } else {
+                        try decoded_text.appendSlice(token);
                     }
-                },
+                    found = true;
+                    break;
+                }
             }
-            i += 1;
+
+            if (!found) {
+                // Handle byte-level tokens
+                if (token_id < 256) {
+                    try decoded_text.append(@intCast(token_id));
+                    found = true;
+                }
+            }
+
+            if (!found) {
+                std.debug.print("Token not found: {}\n", .{token_id});
+                return error.TokenNotFound;
+            }
         }
 
         return decoded_text.toOwnedSlice();
