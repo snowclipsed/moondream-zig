@@ -1417,7 +1417,7 @@ pub fn scaledDotProductAttention(
 }
 
 // Softmax operation along specified dimension
-fn softmax(comptime T: type, tensor: *Tensor(T), dim: usize) !void {
+pub fn softmax(comptime T: type, tensor: *Tensor(T), dim: usize) !void {
     const dim_size = tensor.shape[dim];
 
     // Calculate stride for the specified dimension
@@ -1501,4 +1501,107 @@ pub fn argmax(comptime T: type, input: Tensor(T)) !usize {
     }
 
     return max_index;
+}
+
+// ---------- Sampling ---------- //
+
+pub fn sample_from_probs(comptime T: type, tensor: *Tensor(T), rng: std.rand.Random) !usize {
+    if (tensor.shape.len != 2 or tensor.shape[0] != 1) {
+        return error.InvalidInputShape;
+    }
+
+    var cumsum: T = 0;
+    const r = rng.float(T);
+
+    for (tensor.data, 0..) |p, i| {
+        cumsum += p;
+        if (r < cumsum) {
+            return i;
+        }
+    }
+
+    // If we somehow get here (floating point rounding), return last index
+    return tensor.data.len - 1;
+}
+
+pub fn top_k_sampling(comptime T: type, tensor: *Tensor(T), k: usize, rng: std.rand.Random, allocator: Allocator) !usize {
+    if (tensor.shape.len != 2 or tensor.shape[0] != 1) {
+        return error.InvalidInputShape;
+    }
+
+    const vocab_size = tensor.shape[1];
+    const k_actual = @min(k, vocab_size);
+
+    var indices = try std.ArrayList(usize).initCapacity(allocator, vocab_size);
+    defer indices.deinit();
+
+    for (0..vocab_size) |i| {
+        try indices.append(i);
+    }
+
+    // Use std.mem.sort instead of std.sort.sort
+    std.mem.sort(usize, indices.items, tensor, struct {
+        fn compare(context: *const Tensor(T), a: usize, b: usize) bool {
+            return context.data[a] > context.data[b];
+        }
+    }.compare);
+
+    // Rest of the function remains the same
+    const top_k_indices = indices.items[0..k_actual];
+
+    var sum: T = 0;
+    for (top_k_indices) |idx| {
+        sum += tensor.data[idx];
+    }
+
+    const r = rng.float(T) * sum;
+    var cumsum: T = 0;
+
+    for (top_k_indices) |idx| {
+        cumsum += tensor.data[idx];
+        if (r < cumsum) {
+            return idx;
+        }
+    }
+
+    return top_k_indices[k_actual - 1];
+}
+
+// Helper function to renormalize probabilities after top-k selection
+pub fn renormalize_probs(comptime T: type, tensor: *Tensor(T), indices: []const usize, allocator: Allocator) !void {
+    var sum: T = 0;
+
+    // Calculate sum of selected probabilities
+    for (indices) |idx| {
+        sum += tensor.data[idx];
+    }
+
+    // Normalize selected probabilities
+    if (sum > 0) {
+        const scale = 1.0 / sum;
+        for (indices) |idx| {
+            tensor.data[idx] *= scale;
+        }
+    }
+
+    // Zero out non-selected probabilities
+    var mask = try allocator.alloc(bool, tensor.data.len);
+    defer allocator.free(mask);
+    @memset(mask, false);
+
+    for (indices) |idx| {
+        mask[idx] = true;
+    }
+
+    for (tensor.data, 0..) |*val, i| {
+        if (!mask[i]) {
+            val.* = 0;
+        }
+    }
+}
+
+pub fn scale_logits(comptime T: type, tensor: *Tensor(T), scale_factor: T) !void {
+    for (tensor.data) |*value| {
+        value.* *= scale_factor;
+    }
 }

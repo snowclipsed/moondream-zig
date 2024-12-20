@@ -16,11 +16,18 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Initialize RNG
+    const seed: u64 = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var rng = std.rand.DefaultPrng.init(seed);
+    const random = rng.random();
+
     // Constants
     const bin_path: []const u8 = "../moondream_f32.bin";
     const config_path: []const u8 = "../model_config.json";
     const tokenizer_path: []const u8 = "../tokenizer.bin";
-    const max_tokens: usize = 2; // Equivalent to args.max_tokens
+    const max_tokens: usize = 100;
+    // const temperature: f32 = 0.8; // Add temperature parameter
+    const top_k: usize = 40; // Add top-k parameter
 
     // Load tokenizer
     var tokenizer = try Tokenizer.fromFile(tokenizer_path, allocator);
@@ -45,7 +52,7 @@ pub fn main() !void {
     var text_model = try TextModel.init(config, weights, allocator);
     defer text_model.deinit();
 
-    // Initialize prompt
+    // // Initialize prompt
     // const prompt = "\n\nQuestion?\n\nAnswer:";
     // var token_ids = try tokenizer.encode(prompt);
     // defer token_ids.deinit();
@@ -57,22 +64,24 @@ pub fn main() !void {
     var token_ids = std.ArrayList(u32).init(allocator);
     defer token_ids.deinit();
 
-    // Add specific tokens
-    try token_ids.appendSlice(&[_]u32{
-        50256, // EOS token
-        198,
-        198,
-        24361,
-        25,
-        39373,
-        4892,
-        262,
-        2939,
-        198,
-        198,
-        33706,
-        25,
-    });
+    // // Add specific tokens
+    // try token_ids.appendSlice(&[_]u32{
+    //     50256, // EOS token
+    //     198,
+    //     198,
+    //     24361,
+    //     25,
+    //     39373,
+    //     4892,
+    //     262,
+    //     2939,
+    //     198,
+    //     198,
+    //     33706,
+    //     25,
+    // });
+
+    try token_ids.appendSlice(&[_]u32{ 198, 198, 24361, 25, 1867, 318, 1016, 319, 287, 428, 2939, 30, 198, 198, 33706, 25 });
 
     // Convert token_ids to tensor
     var input_ids = try Tensor(f32).init(allocator, &[_]usize{token_ids.items.len});
@@ -101,14 +110,14 @@ pub fn main() !void {
         var result = try text_model.text_decoder(input_embeds, &kv_cache);
         defer {
             result.output.deinit();
-            result.cache.deinit(); // Assuming there's a cache field that needs cleanup
+            result.cache.deinit();
         }
 
-        var logits = try text_model.lm_head(result.output);
-        defer logits.deinit();
-
-        // Simple greedy sampling (equivalent to args.sampler == "greedy")
-        const next_token_id = try ops.argmax(f32, logits);
+        // Get logits with temperature sampling
+        var lm_result = try text_model.lm_head(result.output);
+        defer lm_result.deinit();
+        // Use top-k sampling instead of greedy
+        const next_token_id = try ops.top_k_sampling(f32, &lm_result, top_k, random, allocator);
 
         // Check for EOS token
         if (next_token_id == tokenizer.eos_token) {
@@ -137,7 +146,6 @@ pub fn main() !void {
         try output_buffer.appendSlice(decoded);
         try std.io.getStdOut().writer().writeAll(decoded);
 
-        // Update position counter
         pos += 1;
     }
 
@@ -162,3 +170,7 @@ pub fn main() !void {
 // - position ids are correct
 // - precompute freqs cis looks good!
 // - rotary embedding looks like it's working
+// - attn mask looks good
+// - attention looks good
+// - transpose looks good
+// - linear looks good
