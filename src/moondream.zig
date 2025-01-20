@@ -27,7 +27,7 @@ pub fn main() !void {
     const tokenizer_path: []const u8 = "../tokenizer.bin";
     const max_tokens: usize = 100;
     // const temperature: f32 = 0.8; // Add temperature parameter
-    const top_k: usize = 40; // Add top-k parameter
+    const top_k: usize = 1; // Add top-k parameter
 
     // Load tokenizer
     var tokenizer = try Tokenizer.fromFile(tokenizer_path, allocator);
@@ -64,24 +64,24 @@ pub fn main() !void {
     var token_ids = std.ArrayList(u32).init(allocator);
     defer token_ids.deinit();
 
-    // // Add specific tokens
-    // try token_ids.appendSlice(&[_]u32{
-    //     50256, // EOS token
-    //     198,
-    //     198,
-    //     24361,
-    //     25,
-    //     39373,
-    //     4892,
-    //     262,
-    //     2939,
-    //     198,
-    //     198,
-    //     33706,
-    //     25,
-    // });
+    // Add specific tokens
+    try token_ids.appendSlice(&[_]u32{
+        50256, // EOS token
+        198,
+        198,
+        24361,
+        25,
+        39373,
+        4892,
+        262,
+        2939,
+        198,
+        198,
+        33706,
+        25,
+    });
 
-    try token_ids.appendSlice(&[_]u32{ 198, 198, 24361, 25, 1867, 318, 1016, 319, 287, 428, 2939, 30, 198, 198, 33706, 25 });
+    // try token_ids.appendSlice(&[_]u32{ 198, 198, 24361, 25, 1867, 318, 1016, 319, 287, 428, 2939, 30, 198, 198, 33706, 25 });
 
     // Convert token_ids to tensor
     var input_ids = try Tensor(f32).init(allocator, &[_]usize{token_ids.items.len});

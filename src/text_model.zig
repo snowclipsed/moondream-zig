@@ -6,7 +6,7 @@ const Config = @import("config.zig").Config;
 const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
-const matmul = @import("matmul.zig");
+const matmul = @import("sgemm.zig");
 
 pub const TextModel = struct {
     const Self = @This();
