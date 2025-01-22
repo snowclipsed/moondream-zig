@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const exe = b.addExecutable(.{
         .name = "moondream",
-        .root_source_file = b.path("newmoon.zig"),
+        .root_source_file = b.path("moondream.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -70,7 +70,7 @@ pub fn build(b: *std.Build) void {
 
     for (test_targets) |test_target| {
         const ops_tests = b.addTest(.{
-            .root_source_file = b.path("sgemm.zig"),
+            .root_source_file = b.path("ops_test.zig"),
             .target = b.resolveTargetQuery(test_target),
         });
         ops_tests.linkSystemLibrary("openblas");
