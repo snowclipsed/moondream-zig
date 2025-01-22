@@ -10,6 +10,7 @@ const VisionModel = @import("vision_model.zig").VisionModel;
 const KVCache = @import("text_model.zig").KVCache;
 const LayerCache = @import("text_model.zig").LayerCache;
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
+const displayImage = @import("imagedisplay.zig").displayImage;
 const print = std.debug.print;
 const main_color = "\x1b[38;5;214m"; // Using 8-bit color code 214 for orange
 const reset_color = "\x1b[0m";
@@ -44,7 +45,8 @@ pub fn main() !void {
     const bin_path: []const u8 = "../moondream.bin";
     const config_path: []const u8 = "../model_config.json";
     const tokenizer_path: []const u8 = "../tokenizer.bin";
-    const max_tokens: usize = 10;
+    const image_path: []const u8 = "../images/demo-1.jpg";
+    const max_tokens: usize = 200;
     const sampling_config = ops.SamplingConfig{ .method = .greedy };
 
     // Load tokenizer
@@ -66,10 +68,14 @@ pub fn main() !void {
     // Load model weights
     const weights = try Weights.init(config, bin_path, allocator);
 
+    std.debug.print("\n\n", .{});
+    std.debug.print("Loading image, displaying at scale {d:3}x.\n", .{0.75});
+
+    try displayImage(allocator, image_path, 0.75);
     // Initialize vision model and encode image
     var vision_model = try VisionModel.init(config, weights, allocator);
     defer vision_model.deinit();
-    var image_tensor = try vision_model.encode_image("/home/snow/projects/moondream-zig/images/demo-1.jpg");
+    var image_tensor = try vision_model.encode_image(image_path);
     defer image_tensor.deinit();
 
     // Initialize text model
