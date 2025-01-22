@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const max_items_per_row = 6; // Number of elements to show per row
@@ -43,6 +44,7 @@ pub fn Tensor(comptime DataType: type) type {
                 }
             }
             const shape_copy = try allocator.alloc(usize, shape.len);
+            errdefer allocator.free(shape_copy);
             @memcpy(shape_copy, shape);
 
             // Now we know size fits in usize
@@ -60,7 +62,7 @@ pub fn Tensor(comptime DataType: type) type {
                 .data = data,
             };
 
-            // Assign unique ID
+            // // Assign unique ID
             // id_mutex.lock();
             // defer id_mutex.unlock();
             // self.id = next_id;
@@ -86,6 +88,123 @@ pub fn Tensor(comptime DataType: type) type {
             // std.debug.print("Destroying tensor {d} at {x} with shape {any}\n", .{ self.id, @returnAddress(), self.shape });
             self.allocator.free(self.shape);
             self.allocator.free(self.data);
+        }
+
+        /// Cast the tensor to a different data type.
+        /// This function handles conversion between different numeric types,
+        /// with checks for potential data loss.
+        pub fn castTo(self: Self, comptime TargetType: type) !Tensor(TargetType) {
+            // Create new tensor with same shape but target type
+            var result = try Tensor(TargetType).init(self.allocator, self.shape);
+            errdefer result.deinit();
+
+            // Handle the casting based on type combinations
+            for (self.data, 0..) |value, i| {
+                result.data[i] = switch (@TypeOf(value)) {
+                    // From floating point types
+                    f16, f32, f64, f128 => switch (TargetType) {
+                        // Float to float
+                        f16, f32, f64, f128 => @floatCast(value),
+                        // Float to signed int
+                        i8, i16, i32, i64, i128 => blk: {
+                            if (value != @trunc(value)) return error.LossyConversion;
+                            if (value > @as(@TypeOf(value), @floatFromInt(std.math.maxInt(TargetType))) or
+                                value < @as(@TypeOf(value), @floatFromInt(std.math.minInt(TargetType))))
+                            {
+                                return error.OutOfRange;
+                            }
+                            break :blk @intFromFloat(@trunc(value));
+                        },
+                        // Float to unsigned int
+                        u8, u16, u32, u64, u128 => blk: {
+                            if (value != @trunc(value)) return error.LossyConversion;
+                            if (value < 0 or
+                                value > @as(@TypeOf(value), @floatFromInt(std.math.maxInt(TargetType))))
+                            {
+                                return error.OutOfRange;
+                            }
+                            break :blk @intFromFloat(@trunc(value));
+                        },
+                        // Float to bool
+                        bool => value != 0,
+                        else => @compileError("Unsupported target type for float casting"),
+                    },
+
+                    // From signed integer types
+                    i8, i16, i32, i64, i128 => switch (TargetType) {
+                        // Signed int to float
+                        f16, f32, f64, f128 => @floatFromInt(value),
+                        // Signed int to signed int
+                        i8, i16, i32, i64, i128 => blk: {
+                            if (value > std.math.maxInt(TargetType) or
+                                value < std.math.minInt(TargetType))
+                            {
+                                return error.OutOfRange;
+                            }
+                            break :blk @intCast(value);
+                        },
+                        // Signed int to unsigned int
+                        u8, u16, u32, u64, u128 => blk: {
+                            if (value < 0 or
+                                value > std.math.maxInt(TargetType))
+                            {
+                                return error.OutOfRange;
+                            }
+                            break :blk @intCast(value);
+                        },
+                        // Signed int to bool
+                        bool => value != 0,
+                        else => @compileError("Unsupported target type for signed integer casting"),
+                    },
+
+                    // From unsigned integer types
+                    u8, u16, u32, u64, u128 => switch (TargetType) {
+                        // Unsigned int to float
+                        f16, f32, f64, f128 => @floatFromInt(value),
+                        // Unsigned int to signed int
+                        i8, i16, i32, i64, i128 => blk: {
+                            if (value > @as(u128, @intCast(std.math.maxInt(TargetType)))) {
+                                return error.OutOfRange;
+                            }
+                            break :blk @intCast(value);
+                        },
+                        // Unsigned int to unsigned int
+                        u8, u16, u32, u64, u128 => blk: {
+                            if (value > std.math.maxInt(TargetType)) {
+                                return error.OutOfRange;
+                            }
+                            break :blk @intCast(value);
+                        },
+                        // Unsigned int to bool
+                        bool => value != 0,
+                        else => @compileError("Unsupported target type for unsigned integer casting"),
+                    },
+
+                    // From boolean type
+                    bool => switch (TargetType) {
+                        // Bool to float
+                        f16, f32, f64, f128 => if (value) @as(TargetType, 1) else @as(TargetType, 0),
+                        // Bool to signed int
+                        i8, i16, i32, i64, i128 => if (value) @as(TargetType, 1) else @as(TargetType, 0),
+                        // Bool to unsigned int
+                        u8, u16, u32, u64, u128 => if (value) @as(TargetType, 1) else @as(TargetType, 0),
+                        // Bool to bool
+                        bool => value,
+                        else => @compileError("Unsupported target type for boolean casting"),
+                    },
+
+                    else => @compileError("Unsupported source type for casting"),
+                };
+            }
+
+            return result;
+        }
+
+        // CPU feature detection helper
+        inline fn hasAVX2() bool {
+            if (!builtin.cpu.arch.isX86()) return false;
+            return comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx2) and
+                std.Target.x86.featureSetHas(builtin.cpu.features, .f16c);
         }
 
         /// Returns a slice of the tensor's data.
@@ -416,6 +535,56 @@ pub fn Tensor(comptime DataType: type) type {
         }
 
         /// Format a single value with proper precision
+        pub fn printF16WithFullPrecision(self: Self) void {
+            if (DataType != f16) {
+                std.debug.print("Error: This function is only for f16 tensors\n", .{});
+                return;
+            }
+
+            std.debug.print("[\n", .{});
+            for (self.data) |value| {
+                const bits = @as(u16, @bitCast(value));
+                const sign_bit = bits >> 15;
+                const exp = @as(i32, @intCast((bits >> 10) & 0x1F)) - 15;
+                const frac = @as(f64, @floatFromInt(bits & 0x3FF)) / 1024.0;
+
+                var sign_mult: f64 = 1.0;
+                if (sign_bit == 1) {
+                    sign_mult = -1.0;
+                }
+
+                const value_f64 = sign_mult * (1.0 + frac) * std.math.pow(f64, 2.0, @floatFromInt(exp));
+
+                // Print with maximum precision
+                std.debug.print("{d:.16}", .{value_f64});
+                std.debug.print("\n", .{});
+            }
+            std.debug.print("]\n", .{});
+        }
+        pub fn debugF16(value: f16) void {
+            const bits = @as(u16, @bitCast(value));
+            const sign = (bits >> 15) & 1;
+            const exp = (bits >> 10) & 0x1F;
+            const frac = bits & 0x3FF;
+
+            std.debug.print(
+                \\f16 value analysis:
+                \\  Raw bits: 0x{X:0>4}
+                \\  Sign bit: {d}
+                \\  Exponent: {d} (raw: {d})
+                \\  Fraction: 0x{X:0>3}
+                \\  Value: {d}
+                \\
+            , .{
+                bits,
+                sign,
+                @as(i32, @intCast(exp)) - 15, // Biased exponent
+                exp,
+                frac,
+                @as(f64, @floatCast(value)),
+            });
+        }
+        /// Format a single value with proper precision
         fn formatValue(value: DataType, writer: anytype, options: PrintOptions) !void {
             switch (@typeInfo(DataType)) {
                 .Float => {
@@ -426,18 +595,55 @@ pub fn Tensor(comptime DataType: type) type {
                     } else if (std.math.isNegativeInf(value)) {
                         try writer.writeAll("-inf");
                     } else {
-                        const precision = options.precision;
-                        switch (precision) {
-                            0 => try writer.print("{d:.0}", .{value}),
-                            1 => try writer.print("{d:.1}", .{value}),
-                            2 => try writer.print("{d:.2}", .{value}),
-                            3 => try writer.print("{d:.3}", .{value}),
-                            4 => try writer.print("{d:.4}", .{value}),
-                            5 => try writer.print("{d:.5}", .{value}),
-                            6 => try writer.print("{d:.6}", .{value}),
-                            7 => try writer.print("{d:.7}", .{value}),
-                            8 => try writer.print("{d:.8}", .{value}),
-                            else => try writer.print("{d:.4}", .{value}),
+                        // For f16, we need special handling to maintain precision
+                        if (DataType == f16) {
+                            // Convert to f64 first to maintain precision during printing
+                            var value_f64: f64 = @floatCast(@as(f64, value));
+
+                            // For very small values near zero, use more precise conversion
+                            if (value_f64 != 0 and @abs(value_f64) < 1e-4) {
+                                const bits = @as(u16, @bitCast(value));
+                                const sign_bit = bits >> 15;
+                                const exp = @as(i32, @intCast((bits >> 10) & 0x1F)) - 15;
+                                const frac = @as(f64, @floatFromInt(bits & 0x3FF)) / 1024.0;
+
+                                var sign_mult: f64 = 1.0;
+                                if (sign_bit == 1) {
+                                    sign_mult = -1.0;
+                                }
+
+                                value_f64 = sign_mult * (1.0 + frac) * std.math.pow(f64, 2.0, @floatFromInt(exp));
+                            }
+
+                            // Print with scientific notation to show full precision
+                            const precision = options.precision;
+                            // Print with extended precision for f16
+                            switch (precision) {
+                                0...8 => try writer.print("{d:.8}", .{value_f64}),
+                                9 => try writer.print("{d:.9}", .{value_f64}),
+                                10 => try writer.print("{d:.10}", .{value_f64}),
+                                11 => try writer.print("{d:.11}", .{value_f64}),
+                                12 => try writer.print("{d:.12}", .{value_f64}),
+                                13 => try writer.print("{d:.13}", .{value_f64}),
+                                14 => try writer.print("{d:.14}", .{value_f64}),
+                                15 => try writer.print("{d:.15}", .{value_f64}),
+                                else => try writer.print("{d:.16}", .{value_f64}),
+                            }
+                        } else {
+                            // For other float types, use standard formatting
+                            const precision = options.precision;
+                            switch (precision) {
+                                0 => try writer.print("{d:.0}", .{value}),
+                                1 => try writer.print("{d:.1}", .{value}),
+                                2 => try writer.print("{d:.2}", .{value}),
+                                3 => try writer.print("{d:.3}", .{value}),
+                                4 => try writer.print("{d:.4}", .{value}),
+                                5 => try writer.print("{d:.5}", .{value}),
+                                6 => try writer.print("{d:.6}", .{value}),
+                                7 => try writer.print("{d:.7}", .{value}),
+                                8 => try writer.print("{d:.8}", .{value}),
+                                else => try writer.print("{d:.4}", .{value}),
+                            }
                         }
                     }
                 },
@@ -449,7 +655,6 @@ pub fn Tensor(comptime DataType: type) type {
                 },
             }
         }
-
         /// Calculate strides for each dimension
         fn calculateStrides(shape: []const usize, allocator: Allocator) ![]usize {
             var strides = try allocator.alloc(usize, shape.len);
@@ -673,6 +878,163 @@ pub fn Tensor(comptime DataType: type) type {
             }
         }
 
+        /// Print a 4D tensor to stdout with truncated dimensions if necessary
+        pub fn print4D(self: Self) void {
+            if (self.shape.len != 4) {
+                std.debug.print("Error: Not a 4D tensor\n", .{});
+                return;
+            }
+
+            const time = self.shape[0];
+            const depth = self.shape[1];
+            const rows = self.shape[2];
+            const cols = self.shape[3];
+            const options = PrintOptions{};
+
+            // Print shape information
+            std.debug.print("Tensor {d}x{d}x{d}x{d}:\n", .{ time, depth, rows, cols });
+
+            // Calculate how many time slices to show
+            const max_time_slices = max_rows;
+            const show_time_ellipsis = time > max_time_slices;
+            const time_slices_to_show = @min(max_time_slices, time);
+
+            // Calculate how many depth slices to show
+            const max_depth_slices = max_rows;
+            const show_depth_ellipsis = depth > max_depth_slices;
+            const depth_slices_to_show = @min(max_depth_slices, depth);
+
+            // For each time slice
+            for (0..time_slices_to_show) |t| {
+                std.debug.print("\nTime [{d}]:\n", .{t});
+
+                // For each depth slice
+                for (0..depth_slices_to_show) |d| {
+                    std.debug.print("\nDepth [{d}]:\n", .{d});
+
+                    // For each row
+                    for (0..rows) |i| {
+                        std.debug.print("[ ", .{});
+
+                        // Calculate how many items to show at start and end
+                        const items_per_side = max_items_per_row / 2;
+                        const show_ellipsis = cols > max_items_per_row;
+
+                        // Print first few items
+                        const start_items = @min(items_per_side, cols);
+                        for (0..start_items) |j| {
+                            const idx = (t * depth * rows * cols) + (d * rows * cols) + (i * cols) + j;
+                            formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                            std.debug.print(" ", .{});
+                        }
+
+                        // Print ellipsis if needed
+                        if (show_ellipsis) {
+                            std.debug.print("... ", .{});
+
+                            // Print last few items
+                            const remaining_items = @min(items_per_side, cols - start_items);
+                            const start_idx = cols - remaining_items;
+                            for (start_idx..cols) |j| {
+                                const idx = (t * depth * rows * cols) + (d * rows * cols) + (i * cols) + j;
+                                formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                                std.debug.print(" ", .{});
+                            }
+                        }
+
+                        std.debug.print("]\n", .{});
+                    }
+                }
+
+                // Print ellipsis for depth slices if needed
+                if (show_depth_ellipsis) {
+                    std.debug.print("\n...\n\n", .{});
+
+                    // Print last depth slice
+                    const last_depth = depth - 1;
+                    std.debug.print("Depth [{d}]:\n", .{last_depth});
+
+                    for (0..rows) |i| {
+                        std.debug.print("[ ", .{});
+
+                        // Calculate how many items to show at start and end
+                        const items_per_side = max_items_per_row / 2;
+                        const show_ellipsis = cols > max_items_per_row;
+
+                        // Print first few items
+                        const start_items = @min(items_per_side, cols);
+                        for (0..start_items) |j| {
+                            const idx = (t * depth * rows * cols) + (last_depth * rows * cols) + (i * cols) + j;
+                            formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                            std.debug.print(" ", .{});
+                        }
+
+                        // Print ellipsis if needed
+                        if (show_ellipsis) {
+                            std.debug.print("... ", .{});
+
+                            // Print last few items
+                            const remaining_items = @min(items_per_side, cols - start_items);
+                            const start_idx = cols - remaining_items;
+                            for (start_idx..cols) |j| {
+                                const idx = (t * depth * rows * cols) + (last_depth * rows * cols) + (i * cols) + j;
+                                formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                                std.debug.print(" ", .{});
+                            }
+                        }
+
+                        std.debug.print("]\n", .{});
+                    }
+                }
+            }
+
+            // Print ellipsis for time slices if needed
+            if (show_time_ellipsis) {
+                std.debug.print("\n...\n\n", .{});
+
+                // Print last time slice
+                const last_time = time - 1;
+                std.debug.print("Time [{d}]:\n", .{last_time});
+
+                // Print depth slices for the last time slice
+                for (0..depth_slices_to_show) |d| {
+                    std.debug.print("\nDepth [{d}]:\n", .{d});
+
+                    for (0..rows) |i| {
+                        std.debug.print("[ ", .{});
+
+                        // Calculate how many items to show at start and end
+                        const items_per_side = max_items_per_row / 2;
+                        const show_ellipsis = cols > max_items_per_row;
+
+                        // Print first few items
+                        const start_items = @min(items_per_side, cols);
+                        for (0..start_items) |j| {
+                            const idx = (last_time * depth * rows * cols) + (d * rows * cols) + (i * cols) + j;
+                            formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                            std.debug.print(" ", .{});
+                        }
+
+                        // Print ellipsis if needed
+                        if (show_ellipsis) {
+                            std.debug.print("... ", .{});
+
+                            // Print last few items
+                            const remaining_items = @min(items_per_side, cols - start_items);
+                            const start_idx = cols - remaining_items;
+                            for (start_idx..cols) |j| {
+                                const idx = (last_time * depth * rows * cols) + (d * rows * cols) + (i * cols) + j;
+                                formatValue(self.data[idx], std.io.getStdOut().writer(), options) catch {};
+                                std.debug.print(" ", .{});
+                            }
+                        }
+
+                        std.debug.print("]\n", .{});
+                    }
+                }
+            }
+        }
+
         /// Convert tensor to string
         pub fn toString(self: Self, allocator: std.mem.Allocator) ![]const u8 {
             var list = std.ArrayList(u8).init(allocator);
@@ -720,4 +1082,10 @@ pub const Slice = struct {
     pub fn from(start: ?usize, end: ?usize) Slice {
         return .{ .start = start, .end = end };
     }
+};
+
+// Error set for casting operations
+pub const CastError = error{
+    LossyConversion, // When precision would be lost (e.g., float to int with decimals)
+    OutOfRange, // When value is outside the target type's range
 };

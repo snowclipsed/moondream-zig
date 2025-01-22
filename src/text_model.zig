@@ -6,7 +6,8 @@ const Config = @import("config.zig").Config;
 const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
-const matmul = @import("sgemm.zig");
+const hgemm = @import("hgemm.zig");
+const sgemm = @import("sgemmnew.zig");
 
 pub const TextModel = struct {
     const Self = @This();
@@ -36,7 +37,8 @@ pub const TextModel = struct {
         self.* = undefined;
     }
 
-    pub fn text_encoder(self: Self, input_ids: Tensor(f32)) !Tensor(f32) {
+    // Change the input type to u32
+    pub fn text_encoder(self: Self, input_ids: Tensor(u32)) !Tensor(f16) {
         if (input_ids.shape.len != 1) {
             return error.InvalidInputShape;
         }
@@ -48,13 +50,12 @@ pub const TextModel = struct {
 
         const embedding_dim = self.weights.word_token_embedding.shape[1];
 
-        // Using ops.zeros instead of Tensor.zeros
-        var output = try ops.zeros(f32, self.allocator, &[_]usize{ seq_length, embedding_dim });
+        var output = try ops.zeros(f16, self.allocator, &[_]usize{ seq_length, embedding_dim });
         errdefer output.deinit();
 
-        // Rest of the function remains the same
         for (0..seq_length) |s| {
-            const token_id = @as(usize, @intFromFloat(input_ids.data[s]));
+            // Direct use of token_id without float conversion
+            const token_id = input_ids.data[s];
 
             if (token_id >= self.config.vocab) {
                 output.deinit();
@@ -70,7 +71,7 @@ pub const TextModel = struct {
         return output;
     }
 
-    pub fn text_decoder(self: Self, input_embeds: Tensor(f32), kv_cache: ?*KVCache) !struct { output: Tensor(f32), cache: KVCache } {
+    pub fn text_decoder(self: Self, input_embeds: Tensor(f16), kv_cache: ?*KVCache) !struct { output: Tensor(f16), cache: KVCache } {
         const eps = 1e-5; // TODO move to config
         var hidden = try input_embeds.copy();
         defer hidden.deinit();
@@ -91,7 +92,7 @@ pub const TextModel = struct {
             defer layer_ln_b.deinit();
 
             var ln_in = try ops.layerNorm(
-                f32,
+                f16,
                 hidden,
                 layer_ln_w,
                 layer_ln_b,
@@ -106,6 +107,7 @@ pub const TextModel = struct {
             var attn_out = try self.attention_block(ln_in, layer, layer_kv_cache);
             defer attn_out.deinit();
 
+            // attn_out.print2D();
             // MLP
 
             var mlp_out = try self.mlp(ln_in, layer);
@@ -113,9 +115,9 @@ pub const TextModel = struct {
 
             // Residual connection
 
-            try ops.add(f32, &attn_out, mlp_out);
+            try ops.add(f16, &attn_out, mlp_out);
 
-            try ops.add(f32, &hidden, attn_out);
+            try ops.add(f16, &hidden, attn_out);
 
             // frees
 
@@ -127,26 +129,27 @@ pub const TextModel = struct {
             .cache = new_cache,
         };
     }
-
-    fn attention_block(self: Self, input: Tensor(f32), layer: usize, layer_cache: ?*LayerCache) !Tensor(f32) {
+    fn attention_block(self: Self, input: Tensor(f16), layer: usize, layer_cache: ?*LayerCache) !Tensor(f16) {
         const n_heads = self.config.n_heads;
         const head_dim = self.config.head_dim;
         const seq_len = input.shape[0];
         const rot_dim = self.config.head_dim / 2;
 
-        const pos = if (layer_cache) |cache| cache.key.shape[1] else 0;
-
-        // print("Attention block: layer {d}, pos {d}\n", .{ layer, pos });
+        const pos = if (layer_cache) |cache| cache.current_len else 0;
 
         var layer_t_Wqkv_w = try self.weights.t_Wqkv_w.getDimensionSlice(0, layer);
         defer layer_t_Wqkv_w.deinit();
         var layer_t_Wqkv_b = try self.weights.t_Wqkv_b.getDimensionSlice(0, layer);
         defer layer_t_Wqkv_b.deinit();
 
-        var qkv = try matmul.matmul(f32, input, layer_t_Wqkv_w, self.allocator);
-        defer qkv.deinit();
+        var qkv_f32 = try Tensor(f32).init(self.allocator, &[_]usize{ seq_len, 3 * n_heads * head_dim });
+        defer qkv_f32.deinit();
+        try hgemm.matmul(self.allocator, input, layer_t_Wqkv_w, qkv_f32);
 
-        try ops.broadcast_add(f32, &qkv, layer_t_Wqkv_b); // change to broadcastadd
+        var qkv = try qkv_f32.castTo(f16);
+
+        try ops.broadcast_add(f16, &qkv, layer_t_Wqkv_b); // change to broadcastadd
+        defer qkv.deinit();
 
         // 2. Now we need to split this into Q, K, V
         // The qkv tensor has shape [seq_len, 3 * n_heads * head_dim]
@@ -154,11 +157,11 @@ pub const TextModel = struct {
 
         const num_chunks = 3;
 
-        var q = try ops.getChunk(f32, qkv, 1, 0, num_chunks);
+        var q = try ops.getChunk(f16, qkv, 1, 0, num_chunks);
         defer q.deinit();
-        var k = try ops.getChunk(f32, qkv, 1, 1, num_chunks);
+        var k = try ops.getChunk(f16, qkv, 1, 1, num_chunks);
         defer k.deinit();
-        var v = try ops.getChunk(f32, qkv, 1, 2, num_chunks);
+        var v = try ops.getChunk(f16, qkv, 1, 2, num_chunks);
 
         // 3. Reshape each tensor from [seq_len, n_heads * head_dim] to [seq_len, n_heads, head_dim]
         try q.reshape(&[_]usize{ seq_len, n_heads, head_dim });
@@ -166,9 +169,9 @@ pub const TextModel = struct {
         try v.reshape(&[_]usize{ seq_len, n_heads, head_dim });
 
         // // 4. Transpose from [seq_len, n_heads, head_dim] to [n_heads, seq_len, head_dim]
-        try ops.transposeAxes(f32, &q, 0, 1); // Swap seq_len and n_heads
-        try ops.transposeAxes(f32, &k, 0, 1);
-        try ops.transposeAxes(f32, &v, 0, 1);
+        try ops.transposeAxes(f16, &q, 0, 1); // Swap seq_len and n_heads
+        try ops.transposeAxes(f16, &k, 0, 1);
+        try ops.transposeAxes(f16, &v, 0, 1);
 
         // 5. Apply rotary embeddings
         var position_ids = try Tensor(usize).init(self.allocator, &[_]usize{seq_len});
@@ -179,7 +182,6 @@ pub const TextModel = struct {
         }
 
         var qr = try ops.applyRotaryEmb(
-            f32,
             self.allocator,
             q,
             self.freqs_cis,
@@ -188,8 +190,8 @@ pub const TextModel = struct {
             false,
         );
         defer qr.deinit();
+
         var kr = try ops.applyRotaryEmb(
-            f32,
             self.allocator,
             k,
             self.freqs_cis,
@@ -197,26 +199,49 @@ pub const TextModel = struct {
             rot_dim,
             false,
         );
-        // qr and kr are correct! and rotary embeddings are correct!
+
         // Handle KV cache
-        var k_final: Tensor(f32) = undefined;
-        var v_final: Tensor(f32) = undefined;
+        var k_final: Tensor(f16) = undefined;
+        var v_final: Tensor(f16) = undefined;
 
         if (layer_cache) |cache| {
-            // Concatenate with existing cache
-            k_final = try ops.concat(f32, cache.key, kr, 1);
-            v_final = try ops.concat(f32, cache.value, v, 1);
+            const new_len = cache.current_len + seq_len;
+            if (new_len > 2048) {
+                return error.SequenceTooLong;
+            }
 
-            // Update cache with new K and V
-            cache.key.deinit();
-            cache.value.deinit();
+            // Copy new values to the cache at the correct position
+            for (0..n_heads) |h| {
+                const k_src_start = h * seq_len * head_dim;
+                const k_dst_start = h * 2048 * head_dim + cache.current_len * head_dim;
+                const k_len = seq_len * head_dim;
 
-            // Transfer ownership
-            cache.key = kr; // kr ownership moved to cache
-            cache.value = v; // v ownership moved to cache
+                @memcpy(
+                    cache.key.data[k_dst_start .. k_dst_start + k_len],
+                    kr.data[k_src_start .. k_src_start + k_len],
+                );
 
-            // Remove the defers for kr and v since ownership is transferred
-            // (make sure no defer kr.deinit() or defer v.deinit() exist)
+                const v_src_start = h * seq_len * head_dim;
+                const v_dst_start = h * 2048 * head_dim + cache.current_len * head_dim;
+                const v_len = seq_len * head_dim;
+
+                @memcpy(
+                    cache.value.data[v_dst_start .. v_dst_start + v_len],
+                    v.data[v_src_start .. v_src_start + v_len],
+                );
+            }
+
+            // Update cache length
+            cache.current_len = new_len;
+
+            // Get active cache views
+            const active_cache = try cache.getActiveCache();
+            k_final = active_cache.key;
+            v_final = active_cache.value;
+
+            // Clean up original rotated tensors
+            kr.deinit();
+            v.deinit();
         } else {
             k_final = try kr.copy();
             v_final = try v.copy();
@@ -231,27 +256,29 @@ pub const TextModel = struct {
         defer attn_mask.deinit();
 
         // Perform masked attention
-        var attn_output = try ops.scaledDotProductAttention(f32, qr, k_final, v_final, attn_mask, self.allocator);
-
+        var attn_output = try ops.scaledDotProductAttention(qr, k_final, v_final, attn_mask, self.allocator);
         // Reshape output back
-        try ops.transposeAxes(f32, &attn_output, 0, 1);
+        try ops.transposeAxes(f16, &attn_output, 0, 1);
         try attn_output.reshape(&[_]usize{ seq_len, n_heads * head_dim });
         defer attn_output.deinit();
-
         // Linear layer
 
         var layer_out_proj_w = try self.weights.t_out_proj_w.getDimensionSlice(0, layer);
         defer layer_out_proj_w.deinit();
         var layer_out_proj_b = try self.weights.t_out_proj_bias.getDimensionSlice(0, layer);
         defer layer_out_proj_b.deinit();
-        var out_proj = try matmul.matmul(f32, attn_output, layer_out_proj_w, self.allocator);
 
-        try ops.broadcast_add(f32, &out_proj, layer_out_proj_b);
+        var out_proj_f32 = try Tensor(f32).init(self.allocator, &[_]usize{ seq_len, self.config.dim });
+        defer out_proj_f32.deinit();
+        try hgemm.matmul(self.allocator, attn_output, layer_out_proj_w, out_proj_f32);
 
+        var out_proj = try out_proj_f32.castTo(f16);
+
+        try ops.broadcast_add(f16, &out_proj, layer_out_proj_b);
         return out_proj;
     }
 
-    fn mlp(self: Self, input: Tensor(f32), layer: usize) !Tensor(f32) {
+    fn mlp(self: Self, input: Tensor(f16), layer: usize) !Tensor(f16) {
         var layer_t_fc1_w = try self.weights.t_fc1_w.getDimensionSlice(0, layer);
         defer layer_t_fc1_w.deinit();
         var layer_t_fc1_b = try self.weights.t_fc1_b.getDimensionSlice(0, layer);
@@ -261,57 +288,96 @@ pub const TextModel = struct {
         var layer_t_fc2_b = try self.weights.t_fc2_b.getDimensionSlice(0, layer);
         defer layer_t_fc2_b.deinit();
 
-        var fc1 = try matmul.matmul(f32, input, layer_t_fc1_w, self.allocator);
-        try ops.broadcast_add(f32, &fc1, layer_t_fc1_b);
+        var fc1_f32 = try Tensor(f32).init(self.allocator, &[_]usize{ input.shape[0], self.config.hidden_dim });
+        defer fc1_f32.deinit();
+        try hgemm.matmul(self.allocator, input, layer_t_fc1_w, fc1_f32);
 
-        try ops.gelu(f32, &fc1);
+        var fc1 = try fc1_f32.castTo(f16);
+        defer fc1.deinit();
 
-        var fc2 = try matmul.matmul(f32, fc1, layer_t_fc2_w, self.allocator);
-        try ops.broadcast_add(f32, &fc2, layer_t_fc2_b);
-        fc1.deinit();
+        try ops.broadcast_add(f16, &fc1, layer_t_fc1_b);
+
+        try ops.gelu(f16, &fc1);
+
+        var fc2_f32 = try Tensor(f32).init(self.allocator, &[_]usize{ input.shape[0], self.config.dim });
+        defer fc2_f32.deinit();
+        try hgemm.matmul(
+            self.allocator,
+            fc1,
+            layer_t_fc2_w,
+            fc2_f32,
+        );
+
+        var fc2 = try fc2_f32.castTo(f16);
+
+        try ops.broadcast_add(f16, &fc2, layer_t_fc2_b);
 
         return fc2;
     }
 
-    pub fn lm_head(self: Self, hidden: Tensor(f32)) !Tensor(f32) {
+    pub fn lm_head(self: Self, hidden: Tensor(f16)) !Tensor(f16) {
         if (hidden.shape.len != 2) {
             return error.InvalidInputShape;
         }
 
         const seq_len = hidden.shape[0];
-        // const hidden_dim = hidden.shape[1];
-
         // Get last hidden state using getDimensionSlice
         var last_hidden = try hidden.getDimensionSlice(0, seq_len - 1);
         defer last_hidden.deinit();
 
-        var normalized = try ops.layerNorm(f32, last_hidden, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
+        var normalized = try ops.layerNorm(f16, last_hidden, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
         defer normalized.deinit();
 
         try normalized.reshape(&[_]usize{ 1, self.config.dim }); // TODO: Check correctness of this
 
-        var logits = try matmul.matmul(f32, normalized, self.weights.t_linear_w, self.allocator);
+        var logits_f32 = try Tensor(f32).init(self.allocator, &[_]usize{ 1, self.config.vocab });
+        defer logits_f32.deinit();
 
-        try ops.broadcast_add(f32, &logits, self.weights.t_linear_b);
+        try hgemm.matmul(self.allocator, normalized, self.weights.t_linear_w, logits_f32);
+
+        var logits = try logits_f32.castTo(f16);
+
+        try ops.broadcast_add(f16, &logits, self.weights.t_linear_b);
 
         return logits;
     }
 };
 
 pub const LayerCache = struct {
-    key: Tensor(f32),
-    value: Tensor(f32),
+    key: Tensor(f16),
+    value: Tensor(f16),
+    current_len: usize,
 
     pub fn init(allocator: Allocator, n_heads: usize, head_dim: usize) !LayerCache {
+        const max_seq_len = 2048; // Match PyTorch's size
         return LayerCache{
-            .key = try Tensor(f32).init(allocator, &[_]usize{ n_heads, 0, head_dim }),
-            .value = try Tensor(f32).init(allocator, &[_]usize{ n_heads, 0, head_dim }),
+            .key = try Tensor(f16).init(allocator, &[_]usize{ n_heads, max_seq_len, head_dim }),
+            .value = try Tensor(f16).init(allocator, &[_]usize{ n_heads, max_seq_len, head_dim }),
+            .current_len = 0,
         };
     }
 
     pub fn deinit(self: *LayerCache) void {
         self.key.deinit();
         self.value.deinit();
+    }
+
+    pub fn getActiveCache(self: *LayerCache) !struct { key: Tensor(f16), value: Tensor(f16) } {
+        var key_slice = try self.key.getSliceRange(&[_]Slice{
+            Slice.full(),
+            Slice.from(0, self.current_len),
+            Slice.full(),
+        });
+        errdefer key_slice.deinit();
+
+        var value_slice = try self.value.getSliceRange(&[_]Slice{
+            Slice.full(),
+            Slice.from(0, self.current_len),
+            Slice.full(),
+        });
+        errdefer value_slice.deinit();
+
+        return .{ .key = key_slice, .value = value_slice };
     }
 };
 

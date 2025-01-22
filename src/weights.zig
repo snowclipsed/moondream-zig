@@ -7,50 +7,50 @@ pub const Weights = struct {
     const Self = @This();
 
     // Magic constants for format validation
-    const WEIGHTS_MAGIC = 0x4D4F4F4E; // "MOON" in ASCII
-    const WEIGHTS_VERSION = 2; // Incrementing version for tensor format
+    pub const WEIGHTS_MAGIC = 0x4D4F4F4E; // "MOON" in ASCII
+    pub const WEIGHTS_VERSION = 2; // Incrementing version for tensor format
 
     allocator: Allocator,
 
     // Text model weights
-    word_token_embedding: Tensor(f32),
-    t_ln_w: Tensor(f32),
-    t_ln_b: Tensor(f32),
-    t_Wqkv_w: Tensor(f32),
-    t_Wqkv_b: Tensor(f32),
-    t_out_proj_w: Tensor(f32),
-    t_out_proj_bias: Tensor(f32),
-    t_fc1_w: Tensor(f32),
-    t_fc1_b: Tensor(f32),
-    t_fc2_w: Tensor(f32),
-    t_fc2_b: Tensor(f32),
-    t_linear_w: Tensor(f32),
-    t_linear_b: Tensor(f32),
-    t_ln_out_w: Tensor(f32),
-    t_ln_out_b: Tensor(f32),
+    word_token_embedding: Tensor(f16),
+    t_ln_w: Tensor(f16),
+    t_ln_b: Tensor(f16),
+    t_Wqkv_w: Tensor(f16),
+    t_Wqkv_b: Tensor(f16),
+    t_out_proj_w: Tensor(f16),
+    t_out_proj_bias: Tensor(f16),
+    t_fc1_w: Tensor(f16),
+    t_fc1_b: Tensor(f16),
+    t_fc2_w: Tensor(f16),
+    t_fc2_b: Tensor(f16),
+    t_linear_w: Tensor(f16),
+    t_linear_b: Tensor(f16),
+    t_ln_out_w: Tensor(f16),
+    t_ln_out_b: Tensor(f16),
 
     // Vision model weights
-    v_patch_embedding_linear_w: Tensor(f32),
-    v_patch_embedding_linear_b: Tensor(f32),
-    v_pos_embedding: Tensor(f32),
-    v_Wqkv_w: Tensor(f32),
-    v_Wqkv_b: Tensor(f32),
-    v_out_proj_w: Tensor(f32),
-    v_out_proj_b: Tensor(f32),
-    v_fc1_w: Tensor(f32),
-    v_fc1_b: Tensor(f32),
-    v_fc2_w: Tensor(f32),
-    v_fc2_b: Tensor(f32),
-    v_norm1_w: Tensor(f32),
-    v_norm1_b: Tensor(f32),
-    v_norm2_w: Tensor(f32),
-    v_norm2_b: Tensor(f32),
-    v_norm_out_w: Tensor(f32),
-    v_norm_out_b: Tensor(f32),
-    v_proj_fc1_w: Tensor(f32),
-    v_proj_fc1_b: Tensor(f32),
-    v_proj_fc2_w: Tensor(f32),
-    v_proj_fc2_b: Tensor(f32),
+    v_patch_embedding_linear_w: Tensor(f16),
+    v_patch_embedding_linear_b: Tensor(f16),
+    v_pos_embedding: Tensor(f16),
+    v_Wqkv_w: Tensor(f16),
+    v_Wqkv_b: Tensor(f16),
+    v_out_proj_w: Tensor(f16),
+    v_out_proj_b: Tensor(f16),
+    v_fc1_w: Tensor(f16),
+    v_fc1_b: Tensor(f16),
+    v_fc2_w: Tensor(f16),
+    v_fc2_b: Tensor(f16),
+    v_norm1_w: Tensor(f16),
+    v_norm1_b: Tensor(f16),
+    v_norm2_w: Tensor(f16),
+    v_norm2_b: Tensor(f16),
+    v_norm_out_w: Tensor(f16),
+    v_norm_out_b: Tensor(f16),
+    v_proj_fc1_w: Tensor(f16),
+    v_proj_fc1_b: Tensor(f16),
+    v_proj_fc2_w: Tensor(f16),
+    v_proj_fc2_b: Tensor(f16),
 
     const WeightHeader = struct {
         name_length: u32,
@@ -59,14 +59,12 @@ pub const Weights = struct {
     };
 
     pub fn init(config: Config, filename: []const u8, allocator: Allocator) !Self {
-        // Open the weights file
         const file = try std.fs.cwd().openFile(filename, .{});
         defer file.close();
 
-        // Track file position
         var current_pos: u64 = 0;
 
-        // Read and verify magic number and version
+        // Magic number and version check remains the same
         var magic_buf: [@sizeOf(u32)]u8 = undefined;
         const magic_bytes = try file.read(&magic_buf);
         if (magic_bytes != @sizeOf(u32)) return error.InvalidRead;
@@ -85,16 +83,13 @@ pub const Weights = struct {
         }
         current_pos += @sizeOf(u32);
 
-        // Calculate expected shapes
         const expected_shapes = try calculateShapes(allocator, config);
-        std.debug.print("Expected shapes calculated\n", .{});
-
         defer {
-            // Free all allocated shapes
             inline for (@typeInfo(@TypeOf(expected_shapes)).Struct.fields) |field| {
                 allocator.free(@field(expected_shapes, field.name));
             }
         }
+
         // Initialize weights struct
         var self = Self{
             .allocator = allocator,
@@ -136,31 +131,24 @@ pub const Weights = struct {
             .v_proj_fc2_b = undefined,
         };
 
-        // Read tensors
         while (true) {
-
-            // Read header
             var header_buf: [@sizeOf(WeightHeader)]u8 = undefined;
             const header_bytes = try file.read(&header_buf);
-            if (header_bytes == 0) break; // End of file
+            if (header_bytes == 0) break;
             if (header_bytes != @sizeOf(WeightHeader)) return error.InvalidHeader;
 
-            // Parse header fields with proper alignment
             const name_length = std.mem.readInt(u32, header_buf[0..4], .little);
             const shape_length = std.mem.readInt(u32, header_buf[4..8], .little);
-            const data_length = std.mem.readInt(u32, header_buf[8..12], .little);
 
-            std.debug.print("\nTensor header at position {d}:\n", .{current_pos});
-            std.debug.print("  name_length: {d}\n", .{name_length});
-            std.debug.print("  shape_length: {d}\n", .{shape_length});
-            std.debug.print("  data_length: {d}\n", .{data_length});
-
-            if (name_length > 1000) return error.InvalidNameLength;
+            // Allow names up to 256 bytes - this is plenty for our tensor names
+            if (name_length > 256) {
+                std.debug.print("Invalid name length encountered: {d}\n", .{name_length});
+                return error.InvalidNameLength;
+            }
             if (shape_length > 4) return error.InvalidShapeLength;
 
             current_pos += @sizeOf(WeightHeader);
 
-            // Read name
             var name_buf = try allocator.alloc(u8, name_length);
             defer allocator.free(name_buf);
 
@@ -169,9 +157,8 @@ pub const Weights = struct {
             current_pos += name_length;
 
             const name = name_buf[0..name_length];
-            std.debug.print("Reading tensor: {s}\n", .{name});
+            // std.debug.print("Reading tensor: {s} (length: {d})\n", .{ name, name_length });
 
-            // Read shape dimensions
             var shape = try allocator.alloc(usize, shape_length);
             defer allocator.free(shape);
 
@@ -183,40 +170,53 @@ pub const Weights = struct {
                 const dim = std.mem.readInt(u64, &dim_bytes, .little);
                 shape[i] = @intCast(dim);
                 current_pos += 8;
-
-                std.debug.print("Shape dimension {d}: {d}\n", .{ i, shape[i] });
             }
 
-            // Validate shape
             const expected_shape = try getExpectedShape(name, expected_shapes);
             if (!std.mem.eql(usize, shape, expected_shape)) {
                 printShapeMismatchError(name, shape, expected_shape);
                 return error.ShapeMismatch;
             }
 
-            // Create tensor and read data
-            const tensor = try Tensor(f32).init(allocator, shape);
+            // Create f16 tensor and read data
+            const tensor = try Tensor(f16).init(allocator, shape);
+            // Calculate total data size in bytes, accounting for f16 size
+            const data_size_bytes = tensor.data.len * @sizeOf(f16);
+            // std.debug.print("Reading {d} bytes of data for tensor {s}\n\n", .{ data_size_bytes, name });
+
+            // Read raw bytes into the f16 tensor data buffer
             const data_bytes = try file.read(std.mem.sliceAsBytes(tensor.data));
-            if (data_bytes != tensor.data.len * @sizeOf(f32)) {
+            if (data_bytes != data_size_bytes) {
+                std.debug.print("Data read mismatch! Expected {d} bytes, got {d}\n", .{ data_size_bytes, data_bytes });
                 return error.InvalidRead;
             }
-            current_pos += tensor.data.len * @sizeOf(f32);
+            current_pos += data_size_bytes;
 
-            // Store tensor
-            try self.storeTensor(name, tensor);
-
-            std.debug.print("Successfully read tensor {s} at position {d}\n", .{ name, current_pos });
-
-            // Verify file position
+            // Verify our position tracking matches the file
             const actual_pos = try file.getPos();
             if (actual_pos != current_pos) {
-                std.debug.print("Position mismatch! Expected: {d}, Got: {d}\n", .{ current_pos, actual_pos });
+                std.debug.print("Position mismatch after tensor {s}!\n", .{name});
+                std.debug.print("Expected: {d}, Actual: {d}\n", .{ current_pos, actual_pos });
                 return error.InvalidPosition;
             }
+
+            try self.storeTensor(name, tensor);
         }
 
-        // Clear allocated tensors list since we've stored them all
         return self;
+    }
+    fn checkPrecision(tensor: Tensor(f16)) void {
+        const first_few = 5;
+        std.debug.print("First {d} values in binary format:\n", .{first_few});
+        for (tensor.data[0..first_few]) |value| {
+            // Get raw bits of f16
+            const bits = @as(u16, @bitCast(value));
+            const sign = (bits >> 15) & 1;
+            const exp = (bits >> 10) & 0x1F;
+            const frac = bits & 0x3FF;
+
+            std.debug.print("Value: {e:8}, Sign: {d}, Exp: {d}, Frac: 0x{X:3}\n", .{ value, sign, exp, frac });
+        }
     }
 
     fn printShapeMismatchError(name: []const u8, got: []const usize, expected: []const usize) void {
@@ -237,7 +237,7 @@ pub const Weights = struct {
     }
 
     /// Store a tensor in the appropriate field based on its name
-    fn storeTensor(self: *Self, name: []const u8, tensor: Tensor(f32)) !void {
+    fn storeTensor(self: *Self, name: []const u8, tensor: Tensor(f16)) !void {
         // Text model tensors
         if (std.mem.eql(u8, name, "word_token_embedding")) {
             self.word_token_embedding = tensor;
@@ -384,7 +384,7 @@ pub const Weights = struct {
                     return error.InvalidShapeType;
                 }
 
-                std.debug.print("Found shape for {s}: {any}\n", .{ name, shape_ptr });
+                // std.debug.print("Found shape for {s}: {any}\n", .{ name, shape_ptr });
                 return shape_ptr;
             }
         }

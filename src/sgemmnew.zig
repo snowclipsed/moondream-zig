@@ -6,8 +6,10 @@ const ArrayList = std.ArrayList;
 const testing = std.testing;
 
 // Tuning parameters
-const T: usize = 64; // Tile size
+const T: usize = 64; // Panel/block size
 const V: usize = 32; // Vector size
+const MR: usize = 4; // Micro-kernel rows
+const NR: usize = 8; // Micro-kernel columns
 
 const WorkItem = struct {
     i: usize,
@@ -25,6 +27,50 @@ const ThreadContext = struct {
     mutex: std.Thread.Mutex,
 };
 
+// Micro-kernel that maintains high precision through register reuse
+fn microKernel(
+    A: [*]const f32,
+    B: [*]const f32,
+    C: *[MR][NR]f32,
+    K: usize,
+    lda: usize,
+    ldb: usize,
+) void {
+    // Initialize accumulators in registers
+    var c: [MR][NR]f32 align(32) = undefined;
+    for (0..MR) |i| {
+        for (0..NR) |j| {
+            c[i][j] = C[i][j];
+        }
+    }
+
+    // Main computation loop preserving accuracy through register reuse
+    var k: usize = 0;
+    while (k < K) : (k += 1) {
+        const a_vec = [_]f32{
+            A[k * lda + 0],
+            A[k * lda + 1],
+            A[k * lda + 2],
+            A[k * lda + 3],
+        };
+
+        inline for (0..MR) |i| {
+            const a_val = a_vec[i];
+            inline for (0..NR) |j| {
+                // Accumulate in registers to maintain precision
+                c[i][j] += a_val * B[k * ldb + j];
+            }
+        }
+    }
+
+    // Write back results
+    for (0..MR) |i| {
+        for (0..NR) |j| {
+            C[i][j] = c[i][j];
+        }
+    }
+}
+
 fn tiledMultiplyKernel(
     A: []const f32,
     B: []const f32,
@@ -38,61 +84,83 @@ fn tiledMultiplyKernel(
     j_end: usize,
     k_end: usize,
 ) void {
-    var A_local: [T][T]f32 = undefined;
-    var B_local: [T][T]f32 = undefined;
+    var A_local: [T][T]f32 align(64) = undefined;
+    var B_local: [T][T]f32 align(64) = undefined;
 
-    // Load A and B into local buffers
-    for (0..T) |i| {
-        for (0..T) |k| {
-            if (i_start + i < i_end and k_start + k < k_end) {
-                A_local[i][k] = A[(i_start + i) * K + (k_start + k)];
+    // Load data with proper alignment and bounds checking
+    {
+        var i: usize = 0;
+        while (i < T) : (i += 1) {
+            if (i_start + i < i_end) {
+                const k_len = @min(T, k_end - k_start);
+                const src_idx = (i_start + i) * K + k_start;
+                for (0..k_len) |k| {
+                    A_local[i][k] = A[src_idx + k];
+                }
+                // Zero remaining elements if any
+                for (k_len..T) |k| {
+                    A_local[i][k] = 0;
+                }
             } else {
-                A_local[i][k] = 0;
+                @memset(&A_local[i], 0);
             }
         }
     }
 
-    for (0..T) |k| {
-        for (0..T) |j| {
-            if (k_start + k < k_end and j_start + j < j_end) {
-                B_local[k][j] = B[(k_start + k) * N + (j_start + j)];
+    {
+        var k: usize = 0;
+        while (k < T) : (k += 1) {
+            if (k_start + k < k_end) {
+                const j_len = @min(T, j_end - j_start);
+                const src_idx = (k_start + k) * N + j_start;
+                for (0..j_len) |j| {
+                    B_local[k][j] = B[src_idx + j];
+                }
+                // Zero remaining elements if any
+                for (j_len..T) |j| {
+                    B_local[k][j] = 0;
+                }
             } else {
-                B_local[k][j] = 0;
+                @memset(&B_local[k], 0);
             }
         }
     }
 
-    // Compute tile with vectorization
+    // Process blocks using micro-kernels
     var i: usize = 0;
-    while (i < T) : (i += 1) {
+    while (i < T and i_start + i < i_end) : (i += MR) {
         var j: usize = 0;
-        while (j < T) : (j += V) {
-            var vec_sum: @Vector(V, f32) = @splat(0);
-            var k: usize = 0;
-            while (k < T) : (k += 1) {
-                const a_val = A_local[i][k];
-                const a_vec = @as(@Vector(V, f32), @splat(a_val));
-                const b_vec = blk: {
-                    var temp: @Vector(V, f32) = undefined;
-                    for (0..V) |idx| {
-                        temp[idx] = B_local[k][j + idx];
-                    }
-                    break :blk temp;
-                };
-                vec_sum += a_vec * b_vec;
+        while (j < T and j_start + j < j_end) : (j += NR) {
+            var micro_c: [MR][NR]f32 align(32) = undefined;
+
+            // Calculate actual block sizes considering boundaries
+            const mi_end = @min(MR, i_end - (i_start + i));
+            const nj_end = @min(NR, j_end - (j_start + j));
+
+            // Initialize micro-kernel accumulator
+            for (0..mi_end) |mi| {
+                for (0..nj_end) |nj| {
+                    micro_c[mi][nj] = local_C[i + mi][j + nj];
+                }
             }
 
-            // Store results in local buffer
-            for (0..V) |idx| {
-                local_C[i][j + idx] += vec_sum[idx];
+            // Call micro-kernel
+            microKernel(@ptrCast(&A_local[i][0]), @ptrCast(&B_local[0][j]), &micro_c, T, T, T);
+
+            // Write back micro-kernel results
+            for (0..mi_end) |mi| {
+                for (0..nj_end) |nj| {
+                    local_C[i + mi][j + nj] = micro_c[mi][nj];
+                }
             }
         }
     }
 }
 
 fn workerThread(context: *ThreadContext) void {
+    var local_C: [T][T]f32 align(64) = undefined;
+
     while (true) {
-        // Get next work item
         context.mutex.lock();
         const work_item = if (context.work_queue.popOrNull()) |item| item else {
             context.mutex.unlock();
@@ -100,14 +168,17 @@ fn workerThread(context: *ThreadContext) void {
         };
         context.mutex.unlock();
 
-        // Process tile
         const i_start = work_item.i * T;
         const j_start = work_item.j * T;
         const i_end = @min(i_start + T, context.M);
         const j_end = @min(j_start + T, context.N);
 
-        var local_C: [T][T]f32 = [_][T]f32{[_]f32{0} ** T} ** T;
+        // Clear accumulator
+        for (&local_C) |*row| {
+            @memset(row, 0);
+        }
 
+        // Process panel-panel products
         var k: usize = 0;
         while (k < context.K) : (k += T) {
             const k_end = @min(k + T, context.K);
@@ -126,10 +197,13 @@ fn workerThread(context: *ThreadContext) void {
             );
         }
 
-        // Accumulate results to global C
-        for (i_start..i_end) |i| {
-            for (j_start..j_end) |j| {
-                context.c[i * context.N + j] += local_C[i - i_start][j - j_start];
+        // Accumulate results
+        for (0..T) |i| {
+            if (i_start + i >= i_end) break;
+            for (0..T) |j| {
+                if (j_start + j >= j_end) break;
+                const idx = (i_start + i) * context.N + (j_start + j);
+                context.c[idx] += local_C[i][j];
             }
         }
     }
@@ -151,31 +225,28 @@ pub fn matmul(comptime DataType: type, a: Tensor(DataType), b: Tensor(DataType),
     var result = try Tensor(DataType).init(allocator, &result_shape);
     errdefer result.deinit();
 
-    // Calculate number of tiles and create work items
+    @memset(result.getSlice(), 0);
+
     const tiles_M = (M + T - 1) / T;
     const tiles_N = (N + T - 1) / T;
 
-    // Initialize work queue
     var work_queue = ArrayList(WorkItem).init(allocator);
     defer work_queue.deinit();
 
-    // Populate work queue
+    // Organize work items for better cache usage
     for (0..tiles_M) |i| {
         for (0..tiles_N) |j| {
             try work_queue.append(.{ .i = i, .j = j });
         }
     }
 
-    // Shuffle work queue for better load balancing
-    var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-    rng.random().shuffle(WorkItem, work_queue.items);
+    const cpu_count = try std.Thread.getCpuCount();
+    const min_tiles_per_thread = 4;
+    const thread_count = @min(cpu_count, @max(1, (tiles_M * tiles_N + min_tiles_per_thread - 1) / min_tiles_per_thread));
 
-    // Initialize thread pool
-    const thread_count = try std.Thread.getCpuCount();
     var thread_pool = try ArrayList(std.Thread).initCapacity(allocator, thread_count);
     defer thread_pool.deinit();
 
-    // Create thread context
     var context = ThreadContext{
         .a = a.getSlice(),
         .b = b.getSlice(),
@@ -187,82 +258,16 @@ pub fn matmul(comptime DataType: type, a: Tensor(DataType), b: Tensor(DataType),
         .mutex = std.Thread.Mutex{},
     };
 
-    // Spawn worker threads
     for (0..thread_count) |_| {
         try thread_pool.append(try std.Thread.spawn(.{}, workerThread, .{&context}));
     }
 
-    // Wait for all threads to complete
     for (thread_pool.items) |thread| {
         thread.join();
     }
 
     return result;
 }
-
-// test "optimized matmul benchmark" {
-//     var arena = std.heap.ArenaAllocator.init(testing.allocator);
-//     defer arena.deinit();
-//     const allocator = arena.allocator();
-
-//     const sizes = [_]struct { m: usize, n: usize, k: usize }{
-//         .{ .m = 256, .n = 256, .k = 256 },
-//         .{ .m = 512, .n = 512, .k = 512 },
-//         .{ .m = 1024, .n = 1024, .k = 1024 },
-//         .{ .m = 1024, .n = 2048, .k = 1024 },
-//         .{ .m = 2048, .n = 2048, .k = 2048 },
-//     };
-//     const iterations = 5;
-
-//     std.debug.print("\nT = {d} \nV = {d}\n", .{ T, V });
-//     std.debug.print("Number of threads = {d}\n", .{try std.Thread.getCpuCount()});
-
-//     for (sizes) |size| {
-//         const shape_a = [_]usize{ size.m, size.k };
-//         const shape_b = [_]usize{ size.k, size.n };
-
-//         var a = try Tensor(f32).init(allocator, &shape_a);
-//         defer a.deinit();
-//         var b = try Tensor(f32).init(allocator, &shape_b);
-//         defer b.deinit();
-
-//         // Initialize with random data
-//         var prng = std.rand.DefaultPrng.init(0);
-//         var random = prng.random();
-//         for (a.data) |*val| val.* = random.float(f32);
-//         for (b.data) |*val| val.* = random.float(f32);
-
-//         // Warmup run
-//         {
-//             var warmup = try matmul(f32, a, b, allocator);
-//             defer warmup.deinit();
-//         }
-
-//         var gflops_array = try allocator.alloc(f64, iterations);
-//         defer allocator.free(gflops_array);
-
-//         for (0..iterations) |i| {
-//             var timer = try std.time.Timer.start();
-//             var result = try matmul(f32, a, b, allocator);
-//             defer result.deinit();
-//             const elapsed_ns = timer.read();
-
-//             const opers = 2.0 * @as(f64, @floatFromInt(size.m * size.n * size.k));
-//             const seconds = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
-//             gflops_array[i] = opers / seconds / 1e9;
-//         }
-
-//         // Calculate average GFLOPS
-//         var total_gflops: f64 = 0;
-//         for (gflops_array) |gflops| {
-//             total_gflops += gflops;
-//         }
-//         const avg_gflops = total_gflops / @as(f64, @floatFromInt(iterations));
-
-//         std.debug.print("Matrix size: {d}x{d}x{d}, GFLOPS: {d:.2}\n", .{ size.m, size.n, size.k, avg_gflops });
-//     }
-// }
-
 test "matmul basic functionality" {
     const allocator = testing.allocator;
 

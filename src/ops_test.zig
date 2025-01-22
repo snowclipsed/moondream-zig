@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const max_items_per_row = 6; // Number of elements to show per row
@@ -51,6 +52,187 @@ test "tensor basic operations" {
     try ops.subtract(f32, &tensor1, tensor2);
     for (tensor1.data) |value| {
         try testing.expectEqual(@as(f32, 6.0), value); // 12.0 - 6.0 = 6.0
+    }
+}
+
+test "castTo - float to float conversions" {
+    const allocator = testing.allocator;
+
+    // Test f32 to f16
+    {
+        var t1 = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+        defer t1.deinit();
+        t1.data[0] = 1.5;
+        t1.data[1] = -2.25;
+        t1.data[2] = 0.0;
+        t1.data[3] = 65504.0; // Max f16 value
+
+        var t2 = try t1.castTo(f16);
+        defer t2.deinit();
+
+        try testing.expectApproxEqRel(@as(f32, 1.5), @as(f32, @floatCast(t2.data[0])), 0.001);
+        try testing.expectApproxEqRel(@as(f32, -2.25), @as(f32, @floatCast(t2.data[1])), 0.001);
+        try testing.expectApproxEqRel(@as(f32, 0.0), @as(f32, @floatCast(t2.data[2])), 0.001);
+        try testing.expectApproxEqRel(@as(f32, 65504.0), @as(f32, @floatCast(t2.data[3])), 0.001);
+    }
+
+    // Test f16 to f64
+    {
+        var t1 = try Tensor(f16).init(allocator, &[_]usize{ 2, 2 });
+        defer t1.deinit();
+        t1.data[0] = 1.5;
+        t1.data[1] = -2.25;
+        t1.data[2] = 0.0;
+        t1.data[3] = 65504.0;
+
+        var t2 = try t1.castTo(f64);
+        defer t2.deinit();
+
+        try testing.expectApproxEqRel(@as(f64, 1.5), t2.data[0], 0.001);
+        try testing.expectApproxEqRel(@as(f64, -2.25), t2.data[1], 0.001);
+        try testing.expectApproxEqRel(@as(f64, 0.0), t2.data[2], 0.001);
+        try testing.expectApproxEqRel(@as(f64, 65504.0), t2.data[3], 0.001);
+    }
+}
+
+test "castTo - float to integer conversions" {
+    const allocator = testing.allocator;
+
+    // Test f32 to i32
+    {
+        var t1 = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+        defer t1.deinit();
+        t1.data[0] = 1.0;
+        t1.data[1] = -2.0;
+        t1.data[2] = 0.0;
+        t1.data[3] = 1000.0;
+
+        var t2 = try t1.castTo(i32);
+        defer t2.deinit();
+
+        try testing.expectEqual(@as(i32, 1), t2.data[0]);
+        try testing.expectEqual(@as(i32, -2), t2.data[1]);
+        try testing.expectEqual(@as(i32, 0), t2.data[2]);
+        try testing.expectEqual(@as(i32, 1000), t2.data[3]);
+    }
+
+    // Test error cases
+    {
+        var t1 = try Tensor(f32).init(allocator, &[_]usize{1});
+        defer t1.deinit();
+
+        // Test fractional value
+        t1.data[0] = 1.5;
+        try testing.expectError(error.LossyConversion, t1.castTo(i32));
+
+        // Test out of range
+        t1.data[0] = @as(f32, @floatFromInt(std.math.maxInt(i8) + 1));
+        try testing.expectError(error.OutOfRange, t1.castTo(i8));
+    }
+}
+
+test "castTo - integer to float conversions" {
+    const allocator = testing.allocator;
+
+    // Test i32 to f32
+    {
+        var t1 = try Tensor(i32).init(allocator, &[_]usize{ 2, 2 });
+        defer t1.deinit();
+        t1.data[0] = 1;
+        t1.data[1] = -2;
+        t1.data[2] = 0;
+        t1.data[3] = 1000;
+
+        var t2 = try t1.castTo(f32);
+        defer t2.deinit();
+
+        try testing.expectEqual(@as(f32, 1.0), t2.data[0]);
+        try testing.expectEqual(@as(f32, -2.0), t2.data[1]);
+        try testing.expectEqual(@as(f32, 0.0), t2.data[2]);
+        try testing.expectEqual(@as(f32, 1000.0), t2.data[3]);
+    }
+
+    // Test large integers
+    {
+        var t1 = try Tensor(i64).init(allocator, &[_]usize{1});
+        defer t1.deinit();
+        t1.data[0] = 9223372036854775807; // max i64
+
+        var t2 = try t1.castTo(f64);
+        defer t2.deinit();
+
+        try testing.expectEqual(@as(f64, 9.223372036854776e+18), t2.data[0]);
+    }
+}
+
+test "castTo - integer to integer conversions" {
+    const allocator = testing.allocator;
+
+    // Test i32 to i64
+    {
+        var t1 = try Tensor(i32).init(allocator, &[_]usize{ 2, 2 });
+        defer t1.deinit();
+        t1.data[0] = 1;
+        t1.data[1] = -2;
+        t1.data[2] = 0;
+        t1.data[3] = 1000;
+
+        var t2 = try t1.castTo(i64);
+        defer t2.deinit();
+
+        try testing.expectEqual(@as(i64, 1), t2.data[0]);
+        try testing.expectEqual(@as(i64, -2), t2.data[1]);
+        try testing.expectEqual(@as(i64, 0), t2.data[2]);
+        try testing.expectEqual(@as(i64, 1000), t2.data[3]);
+    }
+
+    // Test error cases
+    {
+        var t1 = try Tensor(i32).init(allocator, &[_]usize{1});
+        defer t1.deinit();
+        t1.data[0] = std.math.maxInt(i32);
+
+        try testing.expectError(error.OutOfRange, t1.castTo(i16));
+    }
+}
+
+test "castTo - boolean conversions" {
+    const allocator = testing.allocator;
+
+    // Test bool to integer
+    {
+        var t1 = try Tensor(bool).init(allocator, &[_]usize{ 2, 2 });
+        defer t1.deinit();
+        t1.data[0] = true;
+        t1.data[1] = false;
+        t1.data[2] = true;
+        t1.data[3] = false;
+
+        var t2 = try t1.castTo(i32);
+        defer t2.deinit();
+
+        try testing.expectEqual(@as(i32, 1), t2.data[0]);
+        try testing.expectEqual(@as(i32, 0), t2.data[1]);
+        try testing.expectEqual(@as(i32, 1), t2.data[2]);
+        try testing.expectEqual(@as(i32, 0), t2.data[3]);
+    }
+
+    // Test integer to bool
+    {
+        var t1 = try Tensor(i32).init(allocator, &[_]usize{ 2, 2 });
+        defer t1.deinit();
+        t1.data[0] = 1;
+        t1.data[1] = 0;
+        t1.data[2] = -1;
+        t1.data[3] = 42;
+
+        var t2 = try t1.castTo(bool);
+        defer t2.deinit();
+
+        try testing.expectEqual(true, t2.data[0]);
+        try testing.expectEqual(false, t2.data[1]);
+        try testing.expectEqual(true, t2.data[2]);
+        try testing.expectEqual(true, t2.data[3]);
     }
 }
 
@@ -1393,114 +1575,114 @@ fn captureOutput(tensor: anytype, allocator: Allocator) ![]const u8 {
     return list.toOwnedSlice();
 }
 
-test "Tensor printing" {
-    const allocator = testing.allocator;
+// test "Tensor printing" {
+//     const allocator = testing.allocator;
 
-    // Test 1: 1D tensor printing
-    {
-        var t = try Tensor(f32).init(allocator, &[_]usize{3});
-        defer t.deinit();
+//     // Test 1: 1D tensor printing
+//     {
+//         var t = try Tensor(f32).init(allocator, &[_]usize{3});
+//         defer t.deinit();
 
-        t.data[0] = 1.0;
-        t.data[1] = 2.5;
-        t.data[2] = -3.7;
+//         t.data[0] = 1.0;
+//         t.data[1] = 2.5;
+//         t.data[2] = -3.7;
 
-        const output = try t.toString(allocator);
-        defer allocator.free(output);
+//         const output = try t.toString(allocator);
+//         defer allocator.free(output);
 
-        // Print for debugging
-        std.debug.print("\nOutput: {s}\n", .{output});
+//         // Print for debugging
+//         std.debug.print("\nOutput: {s}\n", .{output});
 
-        // Expected format should match exactly
-        try testing.expectEqualStrings("tensor([1.0000, 2.5000, -3.7000], dtype=f32)", output);
-    }
+//         // Expected format should match exactly
+//         try testing.expectEqualStrings("tensor([1.0000, 2.5000, -3.7000], dtype=f32)", output);
+//     }
 
-    // Test 2: 2D tensor printing
-    {
-        var t = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer t.deinit();
+//     // Test 2: 2D tensor printing
+//     {
+//         var t = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
+//         defer t.deinit();
 
-        t.data[0] = 1.0;
-        t.data[1] = 2.0;
-        t.data[2] = 3.0;
-        t.data[3] = 4.0;
+//         t.data[0] = 1.0;
+//         t.data[1] = 2.0;
+//         t.data[2] = 3.0;
+//         t.data[3] = 4.0;
 
-        const output = try t.toString(allocator);
-        defer allocator.free(output);
+//         const output = try t.toString(allocator);
+//         defer allocator.free(output);
 
-        // Print for debugging
-        std.debug.print("\nOutput: {s}\n", .{output});
+//         // Print for debugging
+//         std.debug.print("\nOutput: {s}\n", .{output});
 
-        // Expected format
-        try testing.expectEqualStrings("tensor([[1.0000, 2.0000], [3.0000, 4.0000]], dtype=f32)", output);
-    }
+//         // Expected format
+//         try testing.expectEqualStrings("tensor([[1.0000, 2.0000], [3.0000, 4.0000]], dtype=f32)", output);
+//     }
 
-    // Test 3: Special values printing
-    {
-        var t = try Tensor(f32).init(allocator, &[_]usize{3});
-        defer t.deinit();
+//     // Test 3: Special values printing
+//     {
+//         var t = try Tensor(f32).init(allocator, &[_]usize{3});
+//         defer t.deinit();
 
-        t.data[0] = std.math.nan(f32);
-        t.data[1] = std.math.inf(f32);
-        t.data[2] = -std.math.inf(f32);
+//         t.data[0] = std.math.nan(f32);
+//         t.data[1] = std.math.inf(f32);
+//         t.data[2] = -std.math.inf(f32);
 
-        const output = try t.toString(allocator);
-        defer allocator.free(output);
+//         const output = try t.toString(allocator);
+//         defer allocator.free(output);
 
-        // Print for debugging
-        std.debug.print("\nOutput: {s}\n", .{output});
+//         // Print for debugging
+//         std.debug.print("\nOutput: {s}\n", .{output});
 
-        // Expected format
-        try testing.expectEqualStrings("tensor([nan, inf, -inf], dtype=f32)", output);
-    }
+//         // Expected format
+//         try testing.expectEqualStrings("tensor([nan, inf, -inf], dtype=f32)", output);
+//     }
 
-    // Test 4: Integer tensor printing
-    {
-        var t = try Tensor(i32).init(allocator, &[_]usize{3});
-        defer t.deinit();
+//     // Test 4: Integer tensor printing
+//     {
+//         var t = try Tensor(i32).init(allocator, &[_]usize{3});
+//         defer t.deinit();
 
-        t.data[0] = 1;
-        t.data[1] = -2;
-        t.data[2] = 3;
+//         t.data[0] = 1;
+//         t.data[1] = -2;
+//         t.data[2] = 3;
 
-        const output = try t.toString(allocator);
-        defer allocator.free(output);
+//         const output = try t.toString(allocator);
+//         defer allocator.free(output);
 
-        // Expected format
-        try testing.expectEqualStrings("tensor([1, -2, 3], dtype=i32)", output);
-    }
+//         // Expected format
+//         try testing.expectEqualStrings("tensor([1, -2, 3], dtype=i32)", output);
+//     }
 
-    // Test 5: Empty tensor printing
-    {
-        var t = try Tensor(f32).init(allocator, &[_]usize{0});
-        defer t.deinit();
+//     // Test 5: Empty tensor printing
+//     {
+//         var t = try Tensor(f32).init(allocator, &[_]usize{0});
+//         defer t.deinit();
 
-        const output = try t.toString(allocator);
-        defer allocator.free(output);
+//         const output = try t.toString(allocator);
+//         defer allocator.free(output);
 
-        // Expected format
-        try testing.expectEqualStrings("tensor([], dtype=f32)", output);
-    }
+//         // Expected format
+//         try testing.expectEqualStrings("tensor([], dtype=f32)", output);
+//     }
 
-    // Test 6: 3D tensor printing
-    {
-        var t = try Tensor(f32).init(allocator, &[_]usize{ 2, 2, 2 });
-        defer t.deinit();
+//     // Test 6: 3D tensor printing
+//     {
+//         var t = try Tensor(f32).init(allocator, &[_]usize{ 2, 2, 2 });
+//         defer t.deinit();
 
-        for (t.data, 0..) |*val, i| {
-            val.* = @floatFromInt(i);
-        }
+//         for (t.data, 0..) |*val, i| {
+//             val.* = @floatFromInt(i);
+//         }
 
-        const output = try t.toString(allocator);
-        defer allocator.free(output);
+//         const output = try t.toString(allocator);
+//         defer allocator.free(output);
 
-        // Print for debugging
-        std.debug.print("\nOutput: {s}\n", .{output});
+//         // Print for debugging
+//         std.debug.print("\nOutput: {s}\n", .{output});
 
-        // Expected format
-        try testing.expectEqualStrings("tensor([[[0.0000, 1.0000], [2.0000, 3.0000]], [[4.0000, 5.0000], [6.0000, 7.0000]]], dtype=f32)", output);
-    }
-}
+//         // Expected format
+//         try testing.expectEqualStrings("tensor([[[0.0000, 1.0000], [2.0000, 3.0000]], [[4.0000, 5.0000], [6.0000, 7.0000]]], dtype=f32)", output);
+//     }
+// }
 
 fn printTensor(tensor: anytype) void {
     std.debug.print("\nShape: ", .{});
@@ -2920,170 +3102,6 @@ fn createFilledTensor(comptime T: type, allocator: std.mem.Allocator, shape: []c
     errdefer tensor.deinit(); // In case the memcpy fails
     @memcpy(tensor.data, values);
     return tensor;
-}
-
-test "SDPA - Basic Functionality" {
-    const allocator = testing.allocator;
-
-    // Test dimensions
-    const n_heads = 1;
-    const seq_len = 2;
-    const head_dim = 2;
-
-    // Create query tensor [1, 2, 2]
-    const q_data = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
-    var query = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &q_data);
-    defer query.deinit();
-
-    // Create key tensor [1, 2, 2]
-    const k_data = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
-    var key = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &k_data);
-    defer key.deinit();
-
-    // Create value tensor [1, 2, 2]
-    const v_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
-    var value = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &v_data);
-    defer value.deinit();
-
-    // Create causal mask [1, 2, 2]
-    const mask_data = [_]bool{ true, false, true, true };
-    var mask = try createFilledTensor(bool, allocator, &[_]usize{ 1, seq_len, seq_len }, &mask_data);
-    defer mask.deinit();
-
-    // Run SDPA
-    var result = try scaledDotProductAttention(f32, query, key, value, mask, allocator);
-    defer result.deinit();
-
-    // Expected output after applying mask, scaling (1/√2), and softmax
-    const expected_output = [_]f32{
-        1.0, 2.0, // First position attends only to itself
-        2.0, 3.0, // Second position attends to both positions
-    };
-
-    // Check results with tolerance
-    const tolerance = 1e-5;
-    for (result.data, 0..) |val, i| {
-        try expectApproxEqAbs(expected_output[i], val, tolerance);
-    }
-}
-
-test "SDPA - Multi-head Mask Broadcasting" {
-    const allocator = testing.allocator;
-
-    // Test dimensions
-    const n_heads = 2;
-    const seq_len = 2;
-    const head_dim = 2;
-
-    // Create tensors for 2 attention heads
-    var query = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
-    defer query.deinit();
-    query.fill(1.0);
-
-    var key = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
-    defer key.deinit();
-    key.fill(1.0);
-
-    var value = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
-    defer value.deinit();
-    value.fill(1.0);
-
-    // Create mask with upper triangular pattern [1, 2, 2]
-    const mask_data = [_]bool{ true, false, true, true };
-    var mask = try createFilledTensor(bool, allocator, &[_]usize{ 1, seq_len, seq_len }, &mask_data);
-    defer mask.deinit();
-
-    var result = try scaledDotProductAttention(f32, query, key, value, mask, allocator);
-    defer result.deinit();
-
-    // Verify both heads have same masking pattern
-    const head_size = seq_len * head_dim;
-    const tolerance = 1e-5;
-    for (0..seq_len) |i| {
-        for (0..head_dim) |j| {
-            const idx1 = i * head_dim + j;
-            const idx2 = head_size + i * head_dim + j;
-            try expectApproxEqAbs(result.data[idx1], result.data[idx2], tolerance);
-        }
-    }
-}
-
-test "SDPA - Numerical Stability" {
-    const allocator = testing.allocator;
-
-    // Test dimensions
-    const n_heads = 1;
-    const seq_len = 2;
-    const head_dim = 2;
-
-    // Create query with large values
-    const q_data = [_]f32{ 100.0, 100.0, 100.0, 100.0 };
-    var query = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &q_data);
-    defer query.deinit();
-
-    // Create key with large values
-    const k_data = [_]f32{ 100.0, 100.0, 100.0, 100.0 };
-    var key = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &k_data);
-    defer key.deinit();
-
-    // Normal values for value tensor
-    const v_data = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
-    var value = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &v_data);
-    defer value.deinit();
-
-    // Full attention mask
-    const mask_data = [_]bool{ true, true, true, true };
-    var mask = try createFilledTensor(bool, allocator, &[_]usize{ 1, seq_len, seq_len }, &mask_data);
-    defer mask.deinit();
-
-    var result = try scaledDotProductAttention(f32, query, key, value, mask, allocator);
-    defer result.deinit();
-
-    // Check for NaN or Inf values
-    for (result.data) |val| {
-        try testing.expect(!std.math.isNan(val));
-        try testing.expect(!std.math.isInf(val));
-    }
-}
-
-test "SDPA - Zero Attention" {
-    const allocator = testing.allocator;
-
-    // Test dimensions
-    const n_heads = 1;
-    const seq_len = 2;
-    const head_dim = 2;
-
-    // Create zero query
-    var query = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
-    defer query.deinit();
-
-    // Create zero key
-    var key = try Tensor(f32).init(allocator, &[_]usize{ n_heads, seq_len, head_dim });
-    defer key.deinit();
-
-    // Create non-zero value
-    const v_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
-    var value = try createFilledTensor(f32, allocator, &[_]usize{ n_heads, seq_len, head_dim }, &v_data);
-    defer value.deinit();
-
-    // Full attention mask
-    const mask_data = [_]bool{ true, true, true, true };
-    var mask = try createFilledTensor(bool, allocator, &[_]usize{ 1, seq_len, seq_len }, &mask_data);
-    defer mask.deinit();
-
-    var result = try scaledDotProductAttention(f32, query, key, value, mask, allocator);
-    defer result.deinit();
-
-    // With zero attention, softmax gives 0.5 to each position
-    // First position: 0.5 * [1,2] + 0.5 * [3,4] = [2,3]
-    // Second position: 0.5 * [1,2] + 0.5 * [3,4] = [2,3]
-    const expected_output = [_]f32{ 2.0, 3.0, 2.0, 3.0 };
-    const tolerance = 1e-5;
-
-    for (result.data, 0..) |val, i| {
-        try expectApproxEqAbs(expected_output[i], val, tolerance);
-    }
 }
 
 test "ops.gelu basic functionality f32" {

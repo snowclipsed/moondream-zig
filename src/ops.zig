@@ -5,7 +5,8 @@ const max_items_per_row = 6; // Number of elements to show per row
 const max_rows = 8; // Maximum number of rows to show before truncating
 const Tensor = @import("tensor.zig").Tensor;
 const StabilityError = @import("tensor.zig").StabilityError;
-const simdmatmul = @import("sgemm.zig");
+const sgemm = @import("sgemm.zig");
+const hgemm = @import("hgemm.zig");
 const Slice = @import("tensor.zig").Slice;
 const testing = std.testing;
 const expectEqual = testing.expectEqual;
@@ -933,44 +934,58 @@ pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Te
     var output = try input.copy();
     errdefer output.deinit();
 
-    // Compute mean and variance for each feature vector
+    // Compute mean and variance for each feature vector using Welford's online algorithm
+    // Use f32 for intermediate computations regardless of input type
     var i: usize = 0;
     while (i < leading_dims) : (i += 1) {
         const start_idx = i * last_dim;
         const end_idx = start_idx + last_dim;
 
-        // Calculate mean
-        var mean: T = 0;
-        for (start_idx..end_idx) |j| {
-            mean += input.data[j];
-        }
-        mean /= @as(T, @floatFromInt(last_dim));
+        // Initialize Welford's algorithm variables
+        var mean: f32 = 0;
+        var m2: f32 = 0; // Second moment
+        var count: f32 = 0;
 
-        // Calculate variance
-        var variance: T = 0;
+        // First pass: Compute mean and M2 (sum of squared differences)
         for (start_idx..end_idx) |j| {
-            const diff = input.data[j] - mean;
-            variance += diff * diff;
+            count += 1;
+            // Cast input to f32 for higher precision intermediate calculations
+            const x: f32 = @floatCast(input.data[j]);
+            const delta = x - mean;
+            mean += delta / count;
+            const delta2 = x - mean;
+            m2 += delta * delta2;
         }
-        variance /= @as(T, @floatFromInt(last_dim));
 
-        // Check for numerical stability in variance
+        // Calculate variance from M2
+        const variance = m2 / count;
+
+        // Check for numerical stability
         if (variance < -eps) {
             return error.NegativeVariance;
         }
 
-        // Add stability checks for the normalization process
-        const std_dev = @sqrt(variance + eps);
+        // Calculate standard deviation with epsilon for numerical stability
+        // Keep in f32 for better precision
+        const std_dev = @sqrt(variance + @as(f32, @floatCast(eps)));
         if (std_dev == 0) {
             return error.ZeroStandardDeviation;
         }
 
         // Normalize and apply scale and bias
+        // Do computations in f32 and cast back to T at the end
         for (start_idx..end_idx) |j| {
             const feature_idx = j - start_idx;
-            const normalized = (input.data[j] - mean) / std_dev;
-            const scaled = normalized * weight.data[feature_idx];
-            const final_value = scaled + bias.data[feature_idx];
+
+            // Cast all values to f32 for intermediate calculations
+            const input_val: f32 = @floatCast(input.data[j]);
+            const weight_val: f32 = @floatCast(weight.data[feature_idx]);
+            const bias_val: f32 = @floatCast(bias.data[feature_idx]);
+
+            // Perform normalization in f32
+            const normalized = (input_val - mean) / std_dev;
+            const scaled = normalized * weight_val;
+            const final_value = scaled + bias_val;
 
             // Check for stability of computed value
             if (std.math.isNan(final_value)) {
@@ -980,7 +995,8 @@ pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Te
                 return error.ComputedInfinity;
             }
 
-            output.data[j] = final_value;
+            // Cast back to original type T only at the end
+            output.data[j] = @floatCast(final_value);
         }
     }
 
@@ -1142,14 +1158,13 @@ const RotaryError = error{
 /// Returns:
 ///   Tensor with rotary embeddings applied
 pub fn applyRotaryEmb(
-    comptime T: type,
     allocator: Allocator,
-    x: Tensor(T),
-    freqs_cis: Tensor(T),
+    x: Tensor(f16),
+    freqs_cis: Tensor(f32),
     position_ids: Tensor(usize),
     rot_dim: usize,
     interleave: bool,
-) !Tensor(T) {
+) !Tensor(f16) {
     // Validate input constraints
     if (x.shape.len != 3) {
         return error.InvalidInputDimensions;
@@ -1177,14 +1192,14 @@ pub fn applyRotaryEmb(
             Slice.from(rot_dim, null), // Remaining features
         });
         break :blk pass;
-    } else Tensor(T).init(allocator, &[_]usize{ n_heads, seq_len, 0 }) catch unreachable;
+    } else Tensor(f16).init(allocator, &[_]usize{ n_heads, seq_len, 0 }) catch unreachable;
     defer x_pass.deinit();
 
     // x_rot and x_pass are correct!
 
     // Handle interleaved vs non-interleaved cases
-    var xq_r: Tensor(T) = undefined;
-    var xq_i: Tensor(T) = undefined;
+    var xq_r: Tensor(f16) = undefined;
+    var xq_i: Tensor(f16) = undefined;
 
     if (interleave) {
         // Reshape x_rot to [n_heads, seq_len, rot_dim/2, 2]
@@ -1242,14 +1257,14 @@ pub fn applyRotaryEmb(
     defer sin_part.deinit();
 
     // Create freqs_cos and freqs_sin with shape (1, seq_len, rot_dim/2)
-    var freqs_cos = try zeros(T, allocator, &[_]usize{
+    var freqs_cos = try zeros(f32, allocator, &[_]usize{
         1,
         seq_len,
         rot_dim / 2,
     });
     defer freqs_cos.deinit();
 
-    var freqs_sin = try zeros(T, allocator, &[_]usize{
+    var freqs_sin = try zeros(f32, allocator, &[_]usize{
         1,
         seq_len,
         rot_dim / 2,
@@ -1268,29 +1283,29 @@ pub fn applyRotaryEmb(
 
     // Complex multiply with broadcasting across heads
     // (a + bi)(c + di) = (ac - bd) + (ad + bc)i
-    var xq_out_r = try xq_r.copy(); // Will be (n_heads, seq_len, rot_dim/2)
+    var xq_out_r = try xq_r.castTo(f32); // Will be (n_heads, seq_len, rot_dim/2)
     defer xq_out_r.deinit();
-    try broadcast_multiply(T, &xq_out_r, freqs_cos);
+    try broadcast_multiply(f32, &xq_out_r, freqs_cos);
 
-    var temp = try xq_i.copy();
+    var temp = try xq_i.castTo(f32);
     defer temp.deinit();
-    try broadcast_multiply(T, &temp, freqs_sin);
-    try broadcast_subtract(T, &xq_out_r, temp);
+    try broadcast_multiply(f32, &temp, freqs_sin);
+    try broadcast_subtract(f32, &xq_out_r, temp);
 
-    var xq_out_i = try xq_r.copy(); // Will be (n_heads, seq_len, rot_dim/2)
+    var xq_out_i = try xq_r.castTo(f32); // Will be (n_heads, seq_len, rot_dim/2)
     defer xq_out_i.deinit();
-    try broadcast_multiply(T, &xq_out_i, freqs_sin);
+    try broadcast_multiply(f32, &xq_out_i, freqs_sin);
 
-    var temp2 = try xq_i.copy();
+    var temp2 = try xq_i.castTo(f32);
     defer temp2.deinit();
-    try broadcast_multiply(T, &temp2, freqs_cos);
-    try broadcast_add(T, &xq_out_i, temp2);
+    try broadcast_multiply(f32, &temp2, freqs_cos);
+    try broadcast_add(f32, &xq_out_i, temp2);
 
     // xq_out_r amd xq_out_i are correct!
 
     // Stack real and imaginary parts -> (n_heads, seq_len, rot_dim)
-    var tensors = [_]Tensor(T){ xq_out_r, xq_out_i };
-    var stacked = try stack(T, &tensors, 3);
+    var tensors = [_]Tensor(f32){ xq_out_r, xq_out_i };
+    var stacked = try stack(f32, &tensors, 3);
     defer stacked.deinit();
 
     try flatten(f32, &stacked, 2, 3);
@@ -1300,14 +1315,20 @@ pub fn applyRotaryEmb(
     // std.debug.print("stacked shape (xq_out) {any} \n", .{stacked.shape});
     // std.debug.print("x_pass shape {any} \n", .{x_pass.shape});
 
-    // Concatenate with pass-through
     if (x_pass.data.len > 0) {
-        return concat(T, stacked, x_pass, 2);
+        var x_pass_f32 = try x_pass.castTo(f32);
+        defer x_pass_f32.deinit();
+        var result = try concat(f32, stacked, x_pass_f32, 2);
+        defer result.deinit();
+        const final_result = try result.castTo(f16);
+        return final_result;
     } else {
-        return stacked.copy();
+        var result = try stacked.copy();
+        defer result.deinit();
+        const final_result = try result.castTo(f16);
+        return final_result;
     }
 }
-
 // Create attention mask for proper causal attention alignment
 pub fn createAttentionMask(allocator: Allocator, pos: usize, seq_len: usize) !Tensor(bool) {
     // First create the base mask of shape [seq_len, pos + seq_len]
@@ -1338,29 +1359,28 @@ pub fn createAttentionMask(allocator: Allocator, pos: usize, seq_len: usize) !Te
 
 // Scaled Dot Product Attention with mask
 pub fn scaledDotProductAttention(
-    comptime T: type,
-    query: Tensor(T),
-    key: Tensor(T),
-    value: Tensor(T),
+    query: Tensor(f16),
+    key: Tensor(f16),
+    value: Tensor(f16),
     mask: Tensor(bool),
     allocator: Allocator,
-) !Tensor(T) {
+) !Tensor(f16) {
     const n_heads = query.shape[0];
     const q_len = query.shape[1];
     const kv_len = key.shape[1];
     const head_dim = query.shape[2];
 
-    // Scale factor for attention scores
-    const scale: T = 1.0 / @sqrt(@as(T, @floatFromInt(head_dim)));
+    // Scale factor
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
     // Initialize output tensor
-    var out = try Tensor(T).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
+    var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
     errdefer out.deinit();
 
     // Prepare transposed key for all heads
     var key_transpose = try key.copy();
     defer key_transpose.deinit();
-    try transposeAxes(T, &key_transpose, 1, 2);
+    try transposeAxes(f16, &key_transpose, 1, 2);
 
     // Process each attention head separately
     for (0..n_heads) |h| {
@@ -1374,41 +1394,126 @@ pub fn scaledDotProductAttention(
         var value_head = try value.getDimensionSlice(0, h);
         defer value_head.deinit();
 
-        // Calculate attention scores for this head
-        var attn_weights_flat = try simdmatmul.matmul(T, query_head, key_head, allocator);
-        defer attn_weights_flat.deinit();
+        // Initialize attention bias tensor in f32
+        var attn_bias = try Tensor(f32).init(allocator, &[_]usize{ q_len, kv_len });
+        defer attn_bias.deinit();
+        @memset(attn_bias.data, 0);
 
-        // Apply scaling factor
-        scalarMultiply(T, &attn_weights_flat, scale);
-
-        // Apply attention mask - fixed version with proper 2D indexing
-        // The mask has shape [seq_len, pos + seq_len] where pos is the current position
-        for (0..q_len) |q| {
-            for (0..kv_len) |k| {
-                // Direct 2D indexing into the mask
-                const mask_index = q * (mask.shape[2]) + k;
-                const flat_index = q * kv_len + k;
-
-                // Apply negative infinity masking where mask is false
-                if (!mask.data[mask_index]) {
-                    attn_weights_flat.data[flat_index] = -std.math.inf(T);
+        // Apply mask to attention bias
+        for (0..q_len) |i| {
+            for (0..kv_len) |j| {
+                const mask_idx = i * mask.shape[2] + j;
+                const bias_idx = i * kv_len + j;
+                if (!mask.data[mask_idx]) {
+                    attn_bias.data[bias_idx] = -std.math.inf(f32);
                 }
             }
         }
 
-        // Apply softmax to get attention probabilities
-        try softmax(T, &attn_weights_flat, 1);
+        // Calculate QK^T and scale in one step using f32 accumulation
+        var attn_weights = try Tensor(f32).init(allocator, &[_]usize{ q_len, kv_len });
+        defer attn_weights.deinit();
+        try hgemm.matmul(allocator, query_head, key_head, attn_weights);
 
-        // Calculate weighted sum with values
-        var out_flat = try simdmatmul.matmul(T, attn_weights_flat, value_head, allocator);
-        defer out_flat.deinit();
+        // Apply scaling
+        for (attn_weights.data) |*w| {
+            w.* *= scale;
+        }
 
-        // Copy results to output tensor for this head
+        // Add attention bias
+        for (0..attn_weights.data.len) |i| {
+            attn_weights.data[i] += attn_bias.data[i];
+        }
+
+        // Apply softmax in f32 precision
+        try softmax(&attn_weights, 1, allocator);
+
+        // Calculate attention output with f32 accumulation
+        var out_head = try Tensor(f32).init(allocator, &[_]usize{ q_len, head_dim });
+        defer out_head.deinit();
+
+        // Convert attention weights to f16 for HGEMM
+        var attn_weights_f16 = try attn_weights.castTo(f16);
+        defer attn_weights_f16.deinit();
+
+        // Compute attention output
+        try hgemm.matmul(allocator, attn_weights_f16, value_head, out_head);
+
+        // Copy to output tensor with conversion to f16
         for (0..q_len) |q| {
             for (0..head_dim) |d| {
                 const out_idx = h * q_len * head_dim + q * head_dim + d;
-                const flat_idx = q * head_dim + d;
-                out.data[out_idx] = out_flat.data[flat_idx];
+                const head_idx = q * head_dim + d;
+                out.data[out_idx] = @floatCast(out_head.data[head_idx]);
+            }
+        }
+    }
+
+    return out;
+}
+
+pub fn masklessDotProductAttention(
+    query: Tensor(f16),
+    key: Tensor(f16),
+    value: Tensor(f16),
+    allocator: Allocator,
+) !Tensor(f16) {
+    const n_heads = query.shape[0];
+    const q_len = query.shape[1];
+    const kv_len = key.shape[1];
+    const head_dim = query.shape[2];
+
+    // Scale factor
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    // Initialize output tensor
+    var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
+    errdefer out.deinit();
+
+    // Prepare transposed key for all heads
+    var key_transpose = try key.copy();
+    defer key_transpose.deinit();
+    try transposeAxes(f16, &key_transpose, 1, 2);
+
+    // Process each attention head separately
+    for (0..n_heads) |h| {
+        // Get the query, key, value slices for this head
+        var query_head = try query.getDimensionSlice(0, h);
+        defer query_head.deinit();
+
+        var key_head = try key_transpose.getDimensionSlice(0, h);
+        defer key_head.deinit();
+
+        var value_head = try value.getDimensionSlice(0, h);
+        defer value_head.deinit();
+
+        // Calculate QK^T and scale in one step using f32 accumulation
+        var attn_weights = try Tensor(f32).init(allocator, &[_]usize{ q_len, kv_len });
+        defer attn_weights.deinit();
+        try hgemm.matmul(allocator, query_head, key_head, attn_weights);
+
+        // Apply scaling
+        for (attn_weights.data) |*w| {
+            w.* *= scale;
+        }
+
+        // Apply softmax in f32 precision
+        try softmax(&attn_weights, 1, allocator);
+
+        // Convert value_head to f32 for SGEMM
+        var value_head_f32 = try value_head.castTo(f32);
+        defer value_head_f32.deinit();
+
+        // Compute attention output
+
+        const out_head = try sgemm.matmul(f32, attn_weights, value_head_f32, allocator);
+
+        // Copy to output tensor with conversion to f16
+        for (0..q_len) |q| {
+            for (0..head_dim) |d| {
+                const out_idx = h * q_len * head_dim + q * head_dim + d;
+                const head_idx = q * head_dim + d;
+                out.data[out_idx] = @floatCast(out_head.data[head_idx]);
             }
         }
     }
@@ -1417,7 +1522,7 @@ pub fn scaledDotProductAttention(
 }
 
 // Softmax operation along specified dimension
-pub fn softmax(comptime T: type, tensor: *Tensor(T), dim: usize) !void {
+pub fn softmax(tensor: *Tensor(f32), dim: usize, allocator: Allocator) !void {
     const dim_size = tensor.shape[dim];
 
     // Calculate stride for the specified dimension
@@ -1432,30 +1537,36 @@ pub fn softmax(comptime T: type, tensor: *Tensor(T), dim: usize) !void {
         num_vectors *= tensor.shape[i];
     }
 
+    // Allocate temporary storage for exp values
+    var temp_exp = try allocator.alloc(f32, dim_size);
+    defer allocator.free(temp_exp);
+
     // Process each vector
     for (0..num_vectors) |i| {
         const base_idx = i * dim_size * stride;
 
-        // Find max for numerical stability
-        var max: T = -std.math.inf(T);
+        // Find max for numerical stability (in f32)
+        var max: f32 = -std.math.inf(f32);
         for (0..dim_size) |j| {
             const val = tensor.data[base_idx + j * stride];
             if (val > max) max = val;
         }
 
-        // Calculate exp and sum
-        var sum: T = 0;
+        // Calculate exp and sum (in f32)
+        var sum: f32 = 0;
         for (0..dim_size) |j| {
             const idx = base_idx + j * stride;
-            tensor.data[idx] = @exp(tensor.data[idx] - max);
-            sum += tensor.data[idx];
+            const val = tensor.data[idx] - max;
+            temp_exp[j] = if (val > -88.0) @exp(val) else 0;
+            sum += temp_exp[j];
         }
 
         // Normalize
         if (sum > 0) {
+            const inv_sum = 1.0 / sum;
             for (0..dim_size) |j| {
                 const idx = base_idx + j * stride;
-                tensor.data[idx] /= sum;
+                tensor.data[idx] = temp_exp[j] * inv_sum;
             }
         }
     }
@@ -1474,33 +1585,9 @@ pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
         const val = x.*;
         const x_cubed = val * val * val;
         const inner = sqrt_2_div_pi * (val + alpha * x_cubed);
-        x.* = 0.5 * val * (1 + std.math.tanh(inner));
+        // Convert result back to type T after tanh operation
+        x.* = @floatCast(0.5 * @as(f32, @floatCast(val)) * (1.0 + std.math.tanh(@as(f32, @floatCast(inner)))));
     }
-}
-
-pub fn argmax(comptime T: type, input: Tensor(T)) !usize {
-    if (input.data.len == 0 or input.shape.len == 0) {
-        return error.EmptyTensor;
-    }
-
-    // Get the last dimension size for vocab
-    const vocab_size = input.shape[input.shape.len - 1];
-
-    // For logits, we only care about the last value since we're doing token generation
-    const start_idx = input.data.len - vocab_size;
-
-    var max_value: T = input.data[start_idx];
-    var max_index: usize = 0;
-
-    // Find the maximum value and its index
-    for (start_idx..input.data.len) |i| {
-        if (input.data[i] > max_value) {
-            max_value = input.data[i];
-            max_index = i - start_idx;
-        }
-    }
-
-    return max_index;
 }
 
 // ---------- Sampling ---------- //
@@ -1523,8 +1610,65 @@ pub fn sample_from_probs(comptime T: type, tensor: *Tensor(T), rng: std.rand.Ran
     // If we somehow get here (floating point rounding), return last index
     return tensor.data.len - 1;
 }
+/// Defines different sampling methods available for token selection
+pub const SamplingMethod = enum {
+    greedy, // Always select highest probability token (argmax)
+    multinomial, // Sample from full distribution
+    top_k, // Sample from top k tokens only
+};
 
-pub fn top_k_sampling(comptime T: type, tensor: *Tensor(T), k: usize, rng: std.rand.Random, allocator: Allocator) !usize {
+/// Configuration for sampling parameters
+pub const SamplingConfig = struct {
+    method: SamplingMethod,
+    temperature: f32 = 1.0, // Temperature for softmax
+    top_k: ?usize = null, // Number of top tokens to consider (only for top_k)
+};
+
+/// Returns the index of the maximum value in the tensor
+fn argmax(comptime T: type, tensor: *const Tensor(T)) !usize {
+    if (tensor.data.len == 0) {
+        return error.EmptyTensor;
+    }
+
+    var max_idx: usize = 0;
+    var max_val = tensor.data[0];
+
+    for (tensor.data, 0..) |val, i| {
+        if (val > max_val) {
+            max_val = val;
+            max_idx = i;
+        }
+    }
+
+    return max_idx;
+}
+
+/// Performs multinomial sampling on a tensor of probabilities
+fn multinomial_sampling(comptime T: type, tensor: *const Tensor(T), rng: std.rand.Random) !usize {
+    if (tensor.shape.len != 2 or tensor.shape[0] != 1) {
+        return error.InvalidInputShape;
+    }
+
+    var sum: T = 0;
+    for (tensor.data) |val| {
+        sum += val;
+    }
+
+    const r: T = @floatCast(rng.float(f32) * sum);
+    var cumsum: T = 0;
+
+    for (tensor.data, 0..) |val, i| {
+        cumsum += val;
+        if (r < cumsum) {
+            return i;
+        }
+    }
+
+    return tensor.data.len - 1;
+}
+
+/// Performs top-k sampling on a tensor of probabilities
+fn top_k_sampling(comptime T: type, tensor: *const Tensor(T), k: usize, rng: std.rand.Random, allocator: Allocator) !usize {
     if (tensor.shape.len != 2 or tensor.shape[0] != 1) {
         return error.InvalidInputShape;
     }
@@ -1539,14 +1683,12 @@ pub fn top_k_sampling(comptime T: type, tensor: *Tensor(T), k: usize, rng: std.r
         try indices.append(i);
     }
 
-    // Use std.mem.sort instead of std.sort.sort
     std.mem.sort(usize, indices.items, tensor, struct {
         fn compare(context: *const Tensor(T), a: usize, b: usize) bool {
             return context.data[a] > context.data[b];
         }
     }.compare);
 
-    // Rest of the function remains the same
     const top_k_indices = indices.items[0..k_actual];
 
     var sum: T = 0;
@@ -1554,7 +1696,7 @@ pub fn top_k_sampling(comptime T: type, tensor: *Tensor(T), k: usize, rng: std.r
         sum += tensor.data[idx];
     }
 
-    const r = rng.float(T) * sum;
+    const r: T = @floatCast(rng.float(f32) * sum);
     var cumsum: T = 0;
 
     for (top_k_indices) |idx| {
@@ -1565,6 +1707,50 @@ pub fn top_k_sampling(comptime T: type, tensor: *Tensor(T), k: usize, rng: std.r
     }
 
     return top_k_indices[k_actual - 1];
+}
+
+/// Apply temperature to logits
+fn apply_temperature(comptime T: type, tensor: *Tensor(T), temperature: f32) !void {
+    if (temperature <= 0) {
+        return error.InvalidTemperature;
+    }
+
+    const temp = @as(T, @floatCast(temperature));
+    for (tensor.data) |*val| {
+        val.* = val.* / temp;
+    }
+}
+
+/// Main sampling function that handles all sampling methods
+pub fn sample(
+    comptime T: type,
+    tensor: *Tensor(T),
+    config: SamplingConfig,
+    rng: std.rand.Random,
+    allocator: Allocator,
+) !usize {
+    var working_tensor = try tensor.copy();
+    defer working_tensor.deinit();
+
+    // Apply temperature scaling if not using greedy sampling
+    if (config.method != .greedy and config.temperature != 1.0) {
+        try apply_temperature(T, &working_tensor, config.temperature);
+    }
+
+    // Apply softmax if not using greedy sampling
+    if (config.method != .greedy) {
+        // TODO: Implement softmax function
+        // try softmax(T, &working_tensor);
+    }
+
+    return switch (config.method) {
+        .greedy => argmax(T, &working_tensor),
+        .multinomial => multinomial_sampling(T, &working_tensor, rng),
+        .top_k => if (config.top_k) |k|
+            top_k_sampling(T, &working_tensor, k, rng, allocator)
+        else
+            error.MissingTopKValue,
+    };
 }
 
 // Helper function to renormalize probabilities after top-k selection
@@ -1606,4 +1792,162 @@ pub fn scale_logits(comptime T: type, tensor: *Tensor(T), scale_factor: T) !void
     }
 }
 
-// ----------- SIMD Operations ----------- //
+// ----------- Vision Operations ----------- //
+
+pub fn rearrangeBCHWtoBTC(allocator: std.mem.Allocator, input: Tensor(f16), patch_size: usize) !Tensor(f16) {
+    // Input shape: [batch, channels, height, width]
+    if (input.shape.len != 4) return error.InvalidInputShape;
+
+    const batch = input.shape[0];
+    const channels = input.shape[1];
+    const height = input.shape[2];
+    const width = input.shape[3];
+
+    // Verify dimensions are divisible by patch size
+    if (height % patch_size != 0 or width % patch_size != 0) {
+        return error.InvalidPatchSize;
+    }
+
+    const h_patches = height / patch_size;
+    const w_patches = width / patch_size;
+    const num_patches = h_patches * w_patches;
+    const patch_dim = channels * patch_size * patch_size;
+
+    // Output shape: [batch, h_patches * w_patches, channels * patch_size * patch_size]
+    var output = try Tensor(f16).init(allocator, &[_]usize{ batch, num_patches, patch_dim });
+    errdefer output.deinit();
+
+    // For each batch
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        // For each patch position
+        var h: usize = 0;
+        while (h < h_patches) : (h += 1) {
+            var w: usize = 0;
+            while (w < w_patches) : (w += 1) {
+                const patch_idx = h * w_patches + w;
+
+                // For each pixel in the patch
+                var ph: usize = 0;
+                while (ph < patch_size) : (ph += 1) {
+                    var pw: usize = 0;
+                    while (pw < patch_size) : (pw += 1) {
+                        // For each channel
+                        var c: usize = 0;
+                        while (c < channels) : (c += 1) {
+                            const input_h = h * patch_size + ph;
+                            const input_w = w * patch_size + pw;
+
+                            // Input index: [b, c, h, w]
+                            const input_idx = ((b * channels + c) * height + input_h) * width + input_w;
+
+                            // Output index: [b, patch_idx, (c * patch_size + ph) * patch_size + pw]
+                            const output_idx = ((b * num_patches + patch_idx) * patch_dim) +
+                                ((c * patch_size + ph) * patch_size + pw);
+
+                            output.data[output_idx] = input.data[input_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return output;
+}
+
+pub fn normalize_patch(allocator: Allocator, input: Tensor(f16), mean: Tensor(f16), stdev: Tensor(f16)) !Tensor(f16) {
+    var result = try Tensor(f16).init(allocator, input.shape);
+    errdefer result.deinit();
+
+    // Now using BCHW layout
+    const batch = input.shape[0];
+    const channels = input.shape[1];
+    const height = input.shape[2];
+    const width = input.shape[3];
+
+    // // Debug prints
+    // std.debug.print("Input shape (BCHW): [{}, {}, {}, {}]\n", .{ batch, channels, height, width });
+    // std.debug.print("First 10 raw input values: ", .{});
+    // for (input.data[0..10]) |val| {
+    //     std.debug.print("{d:.6} ", .{val});
+    // }
+    // std.debug.print("\n", .{});
+
+    // Process each channel first for debug info
+    // for (0..channels) |c| {
+    //     const c_mean = mean.data[c];
+    //     const c_std = stdev.data[c];
+    // std.debug.print("Channel {}: mean={d:.6}, std={d:.6}\n", .{ c, c_mean, c_std });
+
+    // Print debug info for first channel
+    // if (c == 0) {
+    //     std.debug.print("First 10 values in channel 0: ", .{});
+    //     for (input.data[0..10]) |val| {
+    //         std.debug.print("{d:.6} ", .{val});
+    //     }
+    //     std.debug.print("\n", .{});
+
+    //     std.debug.print("First 10 normalized values in channel 0: ", .{});
+    //     for (0..10) |i| {
+    //         const normalized = (input.data[i] - c_mean) / c_std;
+    //         std.debug.print("{d:.6} ", .{normalized});
+    //     }
+    //     std.debug.print("\n", .{});
+    // }
+    // }
+
+    // Perform normalization in BCHW format
+    for (0..batch) |b| {
+        for (0..channels) |c| {
+            const c_mean = mean.data[c];
+            const c_std = stdev.data[c];
+
+            const channel_size = height * width;
+            const batch_offset = b * channels * channel_size;
+            const channel_offset = c * channel_size;
+            const start_idx = batch_offset + channel_offset;
+            const end_idx = start_idx + channel_size;
+
+            var i = start_idx;
+            while (i < end_idx) : (i += 1) {
+                result.data[i] = (input.data[i] - c_mean) / c_std;
+            }
+        }
+    }
+
+    return result;
+}
+
+pub fn convert_bhwc_to_bchw(allocator: Allocator, input: Tensor(f16)) !Tensor(f16) {
+    const batch = input.shape[0];
+    const height = input.shape[1];
+    const width = input.shape[2];
+    const channels = input.shape[3];
+
+    var output = try Tensor(f16).init(allocator, &[_]usize{ batch, channels, height, width });
+    errdefer output.deinit();
+
+    // Transform from BHWC to BCHW
+    for (0..batch) |b| {
+        for (0..height) |h| {
+            for (0..width) |w| {
+                for (0..channels) |c| {
+                    const src_idx = b * (height * width * channels) +
+                        h * (width * channels) +
+                        w * channels +
+                        c;
+
+                    const dst_idx = b * (channels * height * width) +
+                        c * (height * width) +
+                        h * width +
+                        w;
+
+                    output.data[dst_idx] = input.data[src_idx];
+                }
+            }
+        }
+    }
+
+    return output;
+}
