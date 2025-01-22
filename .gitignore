@@ -72,3 +72,5 @@ OpenBLAS
 weightorder.txt
 .vscode/settings.json
 exportdebug.txt
+src/tensor_log.py
+src/color
