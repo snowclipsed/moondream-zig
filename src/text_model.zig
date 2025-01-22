@@ -98,7 +98,7 @@ pub const TextModel = struct {
                 layer_ln_b,
                 eps,
             );
-
+            defer ln_in.deinit();
             //layernorm is probably okay!
 
             // Get layer cache if it exists
@@ -106,9 +106,6 @@ pub const TextModel = struct {
 
             var attn_out = try self.attention_block(ln_in, layer, layer_kv_cache);
             defer attn_out.deinit();
-
-            // attn_out.print2D();
-            // MLP
 
             var mlp_out = try self.mlp(ln_in, layer);
             defer mlp_out.deinit();
@@ -118,10 +115,6 @@ pub const TextModel = struct {
             try ops.add(f16, &attn_out, mlp_out);
 
             try ops.add(f16, &hidden, attn_out);
-
-            // frees
-
-            defer ln_in.deinit(); // this needs to be here.
         }
 
         return .{
@@ -147,9 +140,9 @@ pub const TextModel = struct {
         try hgemm.matmul(self.allocator, input, layer_t_Wqkv_w, qkv_f32);
 
         var qkv = try qkv_f32.castTo(f16);
+        defer qkv.deinit();
 
         try ops.broadcast_add(f16, &qkv, layer_t_Wqkv_b); // change to broadcastadd
-        defer qkv.deinit();
 
         // 2. Now we need to split this into Q, K, V
         // The qkv tensor has shape [seq_len, 3 * n_heads * head_dim]
@@ -257,10 +250,11 @@ pub const TextModel = struct {
 
         // Perform masked attention
         var attn_output = try ops.scaledDotProductAttention(qr, k_final, v_final, attn_mask, self.allocator);
+        defer attn_output.deinit();
         // Reshape output back
         try ops.transposeAxes(f16, &attn_output, 0, 1);
         try attn_output.reshape(&[_]usize{ seq_len, n_heads * head_dim });
-        defer attn_output.deinit();
+
         // Linear layer
 
         var layer_out_proj_w = try self.weights.t_out_proj_w.getDimensionSlice(0, layer);
@@ -273,6 +267,7 @@ pub const TextModel = struct {
         try hgemm.matmul(self.allocator, attn_output, layer_out_proj_w, out_proj_f32);
 
         var out_proj = try out_proj_f32.castTo(f16);
+        errdefer out_proj.deinit();
 
         try ops.broadcast_add(f16, &out_proj, layer_out_proj_b);
         return out_proj;
@@ -309,6 +304,7 @@ pub const TextModel = struct {
         );
 
         var fc2 = try fc2_f32.castTo(f16);
+        errdefer fc2.deinit();
 
         try ops.broadcast_add(f16, &fc2, layer_t_fc2_b);
 
@@ -336,6 +332,7 @@ pub const TextModel = struct {
         try hgemm.matmul(self.allocator, normalized, self.weights.t_linear_w, logits_f32);
 
         var logits = try logits_f32.castTo(f16);
+        errdefer logits.deinit();
 
         try ops.broadcast_add(f16, &logits, self.weights.t_linear_b);
 

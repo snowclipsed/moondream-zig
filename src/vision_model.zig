@@ -213,89 +213,74 @@ pub const VisionModel = struct {
         try x.reshape(&[_]usize{ B * M, N });
 
         // Linear projection - already in 2D format [(B*M), N]
-        var current_f32 = try Tensor(f32).init(self.allocator, &[_]usize{ B * M, self.config.vit_dim });
-        defer current_f32.deinit();
+        var projected_f32 = try Tensor(f32).init(self.allocator, &[_]usize{ B * M, self.config.vit_dim });
+        defer projected_f32.deinit();
 
-        try hgemm.matmul(self.allocator, x, self.weights.v_patch_embedding_linear_w, current_f32);
+        try hgemm.matmul(self.allocator, x, self.weights.v_patch_embedding_linear_w, projected_f32);
 
-        var current = try current_f32.castTo(f16);
-        defer current.deinit();
+        var x_curr = try projected_f32.castTo(f16);
+        defer x_curr.deinit();
 
         // Bias add needs 2D shape
-        try ops.broadcast_add(f16, &current, self.weights.v_patch_embedding_linear_b);
+        try ops.broadcast_add(f16, &x_curr, self.weights.v_patch_embedding_linear_b);
 
-        current.print2D();
+        // Reshape to [B, M, N] for positional embedding addition
+        try x_curr.reshape(&[_]usize{ B, M, self.config.vit_dim });
 
-        // Current is already in [(B*M), N] shape from previous operations
-        // Position embeddings need to be replicated B times since we're working with flattened batches
-        var pos_embedding = try self.weights.v_pos_embedding.getDimensionSlice(0, 0); // Gets [M, N]
-        defer pos_embedding.deinit();
-
-        // Create a tensor to hold the repeated position embeddings
-        var repeated_pos = try Tensor(f16).init(self.allocator, &[_]usize{ B * M, self.config.vit_dim });
-        defer repeated_pos.deinit();
-
-        // Copy the position embeddings B times
-        var i: usize = 0;
-        while (i < B) : (i += 1) {
-            const start_idx = i * M * self.config.vit_dim;
-            const end_idx = start_idx + (M * self.config.vit_dim);
-            @memcpy(repeated_pos.data[start_idx..end_idx], pos_embedding.data);
-        }
-
-        // Now we can add the repeated position embeddings to our current tensor
-        // Both are shape [(B*M), N]
-        try ops.add(f16, &current, repeated_pos);
+        // Add positional embeddings (which should already be in shape [1, M, N])
+        try ops.broadcast_add(f16, &x_curr, self.weights.v_pos_embedding);
 
         // Process transformer blocks
         for (0..self.config.n_vit_layers) |block| {
-            // Layer norm expects 2D input
-            try current.reshape(&[_]usize{ B * M, self.config.vit_dim });
+            // Reshape for 2D operations
+            try x_curr.reshape(&[_]usize{ B * M, self.config.vit_dim });
+
+            // Store original input for residual connection
+            var x_orig = try x_curr.copy();
+            defer x_orig.deinit();
+
+            // Layer norm
             var ln1_w = try self.weights.v_norm1_w.getDimensionSlice(0, block);
             defer ln1_w.deinit();
             var ln1_b = try self.weights.v_norm1_b.getDimensionSlice(0, block);
             defer ln1_b.deinit();
 
-            var ln1_out = try ops.layerNorm(f16, current, ln1_w, ln1_b, eps);
+            var ln1_out = try ops.layerNorm(f16, x_curr, ln1_w, ln1_b, eps);
             defer ln1_out.deinit();
 
-            // Attention block expects 2D input (already in correct shape)
+            // Attention block
             var attn_out = try self.attention_block(ln1_out, block);
             defer attn_out.deinit();
 
-            // Reshape both tensors to 3D for addition
-            try ln1_out.reshape(&[_]usize{ B, M, self.config.vit_dim });
-            try attn_out.reshape(&[_]usize{ B, M, self.config.vit_dim });
+            // Add attention output to original input (first residual connection)
+            try ops.add(f16, &x_orig, attn_out);
+            @memcpy(x_curr.data, x_orig.data);
 
-            // x = ln1_out + attn_out
-            try ops.add(f16, &ln1_out, attn_out);
+            // Store pre-MLP state for second residual
+            var pre_mlp = try x_curr.copy();
+            defer pre_mlp.deinit();
 
-            // Back to 2D for layer norm
-            try ln1_out.reshape(&[_]usize{ B * M, self.config.vit_dim });
-
+            // Second layer norm
             var ln2_w = try self.weights.v_norm2_w.getDimensionSlice(0, block);
             defer ln2_w.deinit();
             var ln2_b = try self.weights.v_norm2_b.getDimensionSlice(0, block);
             defer ln2_b.deinit();
 
-            var ln2_out = try ops.layerNorm(f16, ln1_out, ln2_w, ln2_b, eps);
+            var ln2_out = try ops.layerNorm(f16, x_curr, ln2_w, ln2_b, eps);
             defer ln2_out.deinit();
 
-            // MLP expects 2D input (already in correct shape)
+            // MLP block
             var mlp_out = try self.mlp(ln2_out, block);
             defer mlp_out.deinit();
 
-            // Reshape both to 3D for addition
-            try ln2_out.reshape(&[_]usize{ B, M, self.config.vit_dim });
-            try mlp_out.reshape(&[_]usize{ B, M, self.config.vit_dim });
-            try ops.add(f16, &ln2_out, mlp_out);
-            try ln2_out.reshape(&[_]usize{ B * M, self.config.vit_dim });
-            @memcpy(current.data, ln2_out.data);
+            // Add MLP output to pre-MLP state (second residual connection)
+            try ops.add(f16, &pre_mlp, mlp_out);
+            @memcpy(x_curr.data, pre_mlp.data);
         }
 
         // Final layer norm needs 2D input
-
-        var final_out = try ops.layerNorm(f16, current, self.weights.v_norm_out_w, self.weights.v_norm_out_b, eps);
+        try x_curr.reshape(&[_]usize{ B * M, self.config.vit_dim });
+        var final_out = try ops.layerNorm(f16, x_curr, self.weights.v_norm_out_w, self.weights.v_norm_out_b, eps);
         errdefer final_out.deinit();
 
         // Reshape result back to 3D [B, M, N]
@@ -367,6 +352,7 @@ pub const VisionModel = struct {
         try hgemm.matmul(self.allocator, attn_out, layer_v_out_proj_w, out_f32);
 
         var out = try out_f32.castTo(f16);
+        errdefer out.deinit();
 
         try ops.broadcast_add(f16, &out, layer_v_out_proj_b);
         return out;

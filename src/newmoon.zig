@@ -69,7 +69,7 @@ pub fn main() !void {
     // Initialize vision model and encode image
     var vision_model = try VisionModel.init(config, weights, allocator);
     defer vision_model.deinit();
-    var image_tensor = try vision_model.encode_image("/home/snow/projects/moondream-zig/images/catmonitor.png");
+    var image_tensor = try vision_model.encode_image("/home/snow/projects/moondream-zig/images/demo-1.jpg");
     defer image_tensor.deinit();
 
     // Initialize text model

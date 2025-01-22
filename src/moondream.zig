@@ -44,7 +44,7 @@ pub fn main() !void {
     const bin_path: []const u8 = "../moondream.bin";
     const config_path: []const u8 = "../model_config.json";
     const tokenizer_path: []const u8 = "../tokenizer.bin";
-    const max_tokens: usize = 50;
+    const max_tokens: usize = 10;
     const sampling_config = ops.SamplingConfig{ .method = .greedy };
 
     // Load tokenizer
@@ -69,7 +69,7 @@ pub fn main() !void {
     // Initialize vision model and encode image
     var vision_model = try VisionModel.init(config, weights, allocator);
     defer vision_model.deinit();
-    var image_tensor = try vision_model.encode_image("/home/snow/projects/moondream-zig/images/catmonitor.png");
+    var image_tensor = try vision_model.encode_image("/home/snow/projects/moondream-zig/images/demo-1.jpg");
     defer image_tensor.deinit();
 
     // Initialize text model
