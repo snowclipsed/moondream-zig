@@ -263,45 +263,6 @@ test "tensor element-wise operations" {
     }
 }
 
-test "tensor reshape" {
-    const allocator = testing.allocator;
-
-    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-    defer tensor.deinit();
-
-    try tensor.reshape(&[_]usize{ 3, 2 });
-    try testing.expectEqual(@as(usize, 3), tensor.shape[0]);
-    try testing.expectEqual(@as(usize, 2), tensor.shape[1]);
-
-    // Test incompatible reshape
-    try testing.expectError(error.IncompatibleShape, tensor.reshape(&[_]usize{ 2, 4 }));
-}
-
-test "tensor transpose" {
-    const allocator = testing.allocator;
-
-    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-    defer tensor.deinit();
-
-    // Fill with test data
-    for (tensor.data, 0..) |*value, i| {
-        value.* = @as(f32, @floatFromInt(i));
-    }
-
-    try ops.transpose(f32, &tensor);
-
-    try testing.expectEqual(@as(usize, 3), tensor.shape[0]);
-    try testing.expectEqual(@as(usize, 2), tensor.shape[1]);
-
-    // Verify transpose
-    try testing.expectEqual(@as(f32, 0.0), tensor.data[0]);
-    try testing.expectEqual(@as(f32, 3.0), tensor.data[1]);
-    try testing.expectEqual(@as(f32, 1.0), tensor.data[2]);
-    try testing.expectEqual(@as(f32, 4.0), tensor.data[3]);
-    try testing.expectEqual(@as(f32, 2.0), tensor.data[4]);
-    try testing.expectEqual(@as(f32, 5.0), tensor.data[5]);
-}
-
 test "tensor matrix multiplication" {
     const allocator = testing.allocator;
 

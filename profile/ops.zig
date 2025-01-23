@@ -434,7 +434,6 @@ pub fn getChunk(comptime T: type, tensor: Tensor(T), dim: usize, chunk_idx: usiz
 
     return result;
 }
-
 // Calculate index in flattened array from n-dimensional coordinates
 pub fn calculateIndex(shape: []const usize, coords: []const usize) usize {
     var index: usize = 0;

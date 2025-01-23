@@ -12,27 +12,42 @@ pub fn Tensor(comptime DataType: type) type {
         allocator: Allocator,
         shape: []usize,
         data: []align(32) DataType,
-        strides: []usize, // New: stride for each dimension
+        // id: usize = undefined,
 
-        // Modified init to include strides
+        // var id_mutex = std.Thread.Mutex{};
+        // var next_id: usize = 0;
+
+        // Original functions...
+        /// Initializes a tensor with the given shape and allocates memory for its data.
+        ///
+        /// This function calculates the total size of the tensor by multiplying the dimensions
+        /// provided in the `shape` array. It then allocates memory for the shape and data of the tensor
+        /// using the provided allocator. The data memory is zero-initialized.
+        ///
+        /// Parameters:
+        /// - `allocator`: The allocator to use for memory allocation.
+        /// - `shape`: An array of dimensions specifying the shape of the tensor.
+        ///
+        /// Returns:
+        /// - `Self`: A new instance of the tensor with allocated and zero-initialized data.
+        ///
+        /// Errors:
+        /// - Returns an error if memory allocation for the shape or data fails.
         pub fn init(allocator: Allocator, shape: []const usize) !Self {
             var size: u128 = 1;
             for (shape) |dim| {
                 size = size * dim;
+                // Check if we would overflow usize
                 if (size > std.math.maxInt(usize)) {
+                    std.debug.print("size entered = {any}", .{size});
                     return error.TensorTooLarge;
                 }
             }
-
-            // Allocate shape and strides
             const shape_copy = try allocator.alloc(usize, shape.len);
             errdefer allocator.free(shape_copy);
             @memcpy(shape_copy, shape);
 
-            // Fix: Correct argument order for calculateStrides
-            const strides = try calculateStrides(shape, allocator);
-            errdefer allocator.free(strides);
-
+            // Now we know size fits in usize
             const final_size: usize = @intCast(size);
             const data = try allocator.alignedAlloc(DataType, 32, final_size);
             if (DataType == bool) {
@@ -41,20 +56,40 @@ pub fn Tensor(comptime DataType: type) type {
                 @memset(data, 0);
             }
 
-            return Self{
+            const self = Tensor(DataType){
                 .allocator = allocator,
                 .shape = shape_copy,
                 .data = data,
-                .strides = strides,
             };
+
+            // // Assign unique ID
+            // id_mutex.lock();
+            // defer id_mutex.unlock();
+            // self.id = next_id;
+            // next_id += 1;
+
+            // std.debug.print("Created tensor {d} at {x} with shape {any}\n", .{ self.id, @returnAddress(), shape });
+
+            return self;
         }
 
-        // Modified deinit to free strides
+        /// Deinitializes the tensor by freeing its allocated memory for shape and data.
+        ///
+        /// This function should be called when the tensor is no longer needed to
+        /// release the memory allocated for its shape and data arrays.
+        ///
+        /// Parameters:
+        /// - `self`: A pointer to the tensor instance to be deinitialized.
+        ///
+        /// Note:
+        /// Ensure that the allocator used for allocating the shape and data is the same
+        /// allocator used for freeing them to avoid undefined behavior.
         pub fn deinit(self: *Self) void {
+            // std.debug.print("Destroying tensor {d} at {x} with shape {any}\n", .{ self.id, @returnAddress(), self.shape });
             self.allocator.free(self.shape);
-            self.allocator.free(self.strides);
             self.allocator.free(self.data);
         }
+
         /// Cast the tensor to a different data type.
         /// This function handles conversion between different numeric types,
         /// with checks for potential data loss.
@@ -180,15 +215,11 @@ pub fn Tensor(comptime DataType: type) type {
             const data = try self.allocator.alignedAlloc(TargetType, 32, size);
             errdefer self.allocator.free(data);
 
-            const strides = try calculateStrides(shape_copy, self.allocator);
-            errdefer self.allocator.free(strides);
-
             // Create result tensor
             const result = Tensor(TargetType){
                 .allocator = self.allocator,
                 .shape = shape_copy,
                 .data = data,
-                .strides = strides,
             };
 
             if (hasAVX2() and self.data.len >= 8) {
@@ -652,6 +683,19 @@ pub fn Tensor(comptime DataType: type) type {
             return new_tensor;
         }
 
+        fn calculateStrides(shape: []const usize, allocator: Allocator) ![]usize {
+            var strides = try allocator.alloc(usize, shape.len);
+            errdefer allocator.free(strides);
+
+            if (shape.len == 0) return strides;
+
+            strides[shape.len - 1] = 1;
+            var i = shape.len - 1;
+            while (i > 0) : (i -= 1) {
+                strides[i - 1] = strides[i] * shape[i];
+            }
+            return strides;
+        }
         /// Format a single value with proper precision
         pub fn printF16WithFullPrecision(self: Self) void {
             if (DataType != f16) {
@@ -774,146 +818,7 @@ pub fn Tensor(comptime DataType: type) type {
             }
         }
         // Calculate strides for each dimension - using original implementation
-        fn calculateStrides(shape: []const usize, allocator: Allocator) ![]usize {
-            var strides = try allocator.alloc(usize, shape.len);
-            errdefer allocator.free(strides);
 
-            if (shape.len == 0) return strides;
-
-            strides[shape.len - 1] = 1;
-            var i = shape.len - 1;
-            while (i > 0) : (i -= 1) {
-                strides[i - 1] = strides[i] * shape[i];
-            }
-            return strides;
-        }
-
-        // Convert n-dimensional coordinates to flat index using strides
-        pub fn getIndex(self: Self, coords: []const usize) !usize {
-            if (coords.len != self.shape.len) {
-                return error.DimensionMismatch;
-            }
-
-            var index: usize = 0;
-            for (coords, 0..) |coord, i| {
-                if (coord >= self.shape[i]) {
-                    return error.IndexOutOfBounds;
-                }
-                index += coord * self.strides[i];
-            }
-            return index;
-        }
-
-        // Get element at coordinates
-        pub fn get(self: Self, coords: []const usize) !DataType {
-            const idx = try self.getIndex(coords);
-            return self.data[idx];
-        }
-
-        // Set element at coordinates
-        pub fn set(self: *Self, coords: []const usize, value: DataType) !void {
-            const idx = try self.getIndex(coords);
-            self.data[idx] = value;
-        }
-
-        // Virtual transpose implementation
-        pub fn transposeAxes(self: *Self, axis1: usize, axis2: usize) !void {
-            if (axis1 >= self.shape.len or axis2 >= self.shape.len) {
-                return error.InvalidAxis;
-            }
-
-            // Swap shape dimensions
-            const temp_shape = self.shape[axis1];
-            self.shape[axis1] = self.shape[axis2];
-            self.shape[axis2] = temp_shape;
-
-            // Swap strides
-            const temp_stride = self.strides[axis1];
-            self.strides[axis1] = self.strides[axis2];
-            self.strides[axis2] = temp_stride;
-        }
-
-        // Create a physical copy with contiguous data
-        pub fn copyContiguous(self: Self) !Self {
-            var result = try Self.init(self.allocator, self.shape);
-            errdefer result.deinit();
-
-            // Create coordinate array
-            var coords = try self.allocator.alloc(usize, self.shape.len);
-            defer self.allocator.free(coords);
-            @memset(coords, 0);
-
-            // Copy data in order
-            var i: usize = 0;
-            const total_size = calculateSize(self.shape);
-            while (i < total_size) : (i += 1) {
-                const src_idx = try self.getIndex(coords);
-                result.data[i] = self.data[src_idx];
-
-                // Update coordinates
-                var dim = self.shape.len;
-                while (dim > 0) {
-                    dim -= 1;
-                    coords[dim] += 1;
-                    if (coords[dim] < self.shape[dim]) break;
-                    coords[dim] = 0;
-                }
-            }
-
-            return result;
-        }
-        // Check if tensor data is contiguous in memory
-        pub fn isContiguous(self: Self) bool {
-            var expected_stride: usize = 1;
-            var i: usize = self.shape.len;
-            while (i > 0) {
-                i -= 1;
-                if (self.strides[i] != expected_stride) {
-                    return false;
-                }
-                expected_stride *= self.shape[i];
-            }
-            return true;
-        }
-
-        // Optional: Helper to create views (if needed)
-        pub fn view(self: Self, start: []const usize, end: []const usize) !Self {
-            if (start.len != self.shape.len or end.len != self.shape.len) {
-                return error.DimensionMismatch;
-            }
-
-            // Verify bounds
-            for (start, 0..) |s, i| {
-                if (s >= self.shape[i] or end[i] > self.shape[i] or s > end[i]) {
-                    return error.IndexOutOfBounds;
-                }
-            }
-
-            // Calculate new shape
-            var new_shape = try self.allocator.alloc(usize, self.shape.len);
-            errdefer self.allocator.free(new_shape);
-
-            for (start, end, 0..) |s, e, i| {
-                new_shape[i] = e - s;
-            }
-
-            // Create view with same strides but different starting point
-            var offset: usize = 0;
-            for (start, 0..) |s, i| {
-                offset += s * self.strides[i];
-            }
-
-            const new_strides = try self.allocator.alloc(usize, self.strides.len);
-            errdefer self.allocator.free(new_strides);
-            @memcpy(new_strides, self.strides);
-
-            return Self{
-                .allocator = self.allocator,
-                .shape = new_shape,
-                .data = self.data[offset..],
-                .strides = new_strides,
-            };
-        }
         /// Format tensor recursively
         fn formatRecursive(
             self: Self,
