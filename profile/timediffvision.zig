@@ -13,7 +13,7 @@ pub fn printTimeDiff(timer: *Timer, start_time: i128, step_name: []const u8) !vo
     const end_time = timer.read();
     const diff_ns = end_time - start_time;
     const diff_ms = @as(f64, @floatFromInt(diff_ns)) / 1_000_000.0;
-    try stdout.print("\x1b[92m[TEXT PROFILE] {s}: {d:.2}ms\x1b[0m\n", .{
+    try stdout.print("\x1b[96m[VISION PROFILE] {s}: {d:.2}ms\x1b[0m\n", .{
         step_name, diff_ms,
     });
 }
