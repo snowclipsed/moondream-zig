@@ -14,7 +14,7 @@ const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expectError = testing.expectError;
 const Timer = std.time.Timer;
-const printTimeDiff = @import("timediff.zig").printTimeDiff;
+const printTimeDiff = @import("timediffvision.zig").printTimeDiff;
 
 // Tensor Operations
 pub fn transpose(comptime T: type, tensor: *Tensor(T)) !void {
