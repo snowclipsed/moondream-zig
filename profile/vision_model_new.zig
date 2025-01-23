@@ -9,8 +9,8 @@ const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
 const hgemm = @import("hgemmnew.zig");
 const sgemm = @import("sgemm.zig");
-const printTimeDiff = @import("timediff.zig").printTimeDiff;
-const getAndPrintTimeDiff = @import("timediff.zig").getAndPrintTimeDiff;
+const printTimeDiff = @import("timediffvision.zig").printTimeDiff;
+const getAndPrintTimeDiff = @import("timediffvision.zig").getAndPrintTimeDiff;
 const c = @cImport({
     @cInclude("stb_image.h");
     @cInclude("stb_image_resize2.h");
@@ -155,30 +155,30 @@ pub const VisionModel = struct {
     }
 
     pub fn encode_image(self: Self, image_path: []const u8) !Tensor(f16) {
-        // var timer = try Timer.start();
-        // const total_start = timer.read();
+        var timer = try Timer.start();
+        const total_start = timer.read();
 
         // Create patches (currently in BHWC)
-        // const patches_start = timer.read();
+        const patches_start = timer.read();
         var patches = try self.createPatches(image_path);
         defer patches.deinit();
-        // try printTimeDiff(&timer, patches_start, "Create Patches");
+        try printTimeDiff(&timer, patches_start, "Create Patches");
 
         // Convert to BCHW format
-        // const convert_start = timer.read();
+        const convert_start = timer.read();
         var bchw_patches = try ops.convert_bhwc_to_bchw(self.allocator, patches);
         defer bchw_patches.deinit();
-        // try printTimeDiff(&timer, convert_start, "Convert BHWC to BCHW");
+        try printTimeDiff(&timer, convert_start, "Convert BHWC to BCHW");
 
         // Scale to 0-1 range
-        // const scale_start = timer.read();
+        const scale_start = timer.read();
         for (bchw_patches.data) |*val| {
             val.* /= @as(f16, 255.0);
         }
-        // try printTimeDiff(&timer, scale_start, "Scale to 0-1");
+        try printTimeDiff(&timer, scale_start, "Scale to 0-1");
 
         // Create and initialize mean and std tensors
-        // const norm_init_start = timer.read();
+        const norm_init_start = timer.read();
         var mean = try Tensor(f16).init(self.allocator, &[_]usize{3});
         defer mean.deinit();
         mean.data[0] = 0.5;
@@ -190,51 +190,51 @@ pub const VisionModel = struct {
         stdev.data[0] = 0.5;
         stdev.data[1] = 0.5;
         stdev.data[2] = 0.5;
-        // try printTimeDiff(&timer, norm_init_start, "Initialize Normalization Tensors");
+        try printTimeDiff(&timer, norm_init_start, "Initialize Normalization Tensors");
 
         // Normalize
-        // const normalize_start = timer.read();
+        const normalize_start = timer.read();
         var normalized = try ops.normalize_patch(self.allocator, bchw_patches, mean, stdev);
         defer normalized.deinit();
-        // try printTimeDiff(&timer, normalize_start, "Normalize Patches");
+        try printTimeDiff(&timer, normalize_start, "Normalize Patches");
 
         // Run through vision encoder
-        // const encoder_start = timer.read();
+        const encoder_start = timer.read();
         var encoder_output = try self.vision_encoder(normalized);
         defer encoder_output.deinit();
-        // try printTimeDiff(&timer, encoder_start, "Vision Encoder");
+        try printTimeDiff(&timer, encoder_start, "Vision Encoder");
 
         // Get slices for each batch
-        // const slice_start = timer.read();
+        const slice_start = timer.read();
         var output_0 = try encoder_output.getDimensionSlice(0, 0);
         defer output_0.deinit();
         var output_1 = try encoder_output.getDimensionSlice(0, 1);
         defer output_1.deinit();
-        // try printTimeDiff(&timer, slice_start, "Get Dimension Slices");
+        try printTimeDiff(&timer, slice_start, "Get Dimension Slices");
 
         // Concatenate outputs
-        // const concat_start = timer.read();
+        const concat_start = timer.read();
         var concat_output = try ops.concat(f16, output_0, output_1, output_0.shape.len - 1);
         defer concat_output.deinit();
-        // try printTimeDiff(&timer, concat_start, "Concatenate Outputs");
+        try printTimeDiff(&timer, concat_start, "Concatenate Outputs");
 
         // Final MLP
-        // const mlp_start = timer.read();
+        const mlp_start = timer.read();
         var final_output = try self.encode_mlp(concat_output);
         errdefer final_output.deinit();
-        // try printTimeDiff(&timer, mlp_start, "Final MLP");
+        try printTimeDiff(&timer, mlp_start, "Final MLP");
 
         // Print total execution time
-        // try printTimeDiff(&timer, total_start, "Total Image Encoding");
+        try printTimeDiff(&timer, total_start, "Total Image Encoding");
 
         return final_output;
     }
 
     pub fn vision_encoder(self: Self, input: Tensor(f16)) !Tensor(f16) {
         var timer = try Timer.start();
-        // const total_start = timer.read();
+        const total_start = timer.read();
 
-        // var block_label_buf: [64]u8 = undefined;
+        var block_label_buf: [64]u8 = undefined;
         const batch = input.shape[0];
         const eps = 1e-5;
 
@@ -245,33 +245,33 @@ pub const VisionModel = struct {
         }
 
         // Rearrange input from BCHW to BTC format
-        // const rearrange_start = timer.read();
+        const rearrange_start = timer.read();
         var x = try ops.rearrangeBCHWtoBTC(self.allocator, input, self.config.patch_size);
         defer x.deinit();
-        // try printTimeDiff(&timer, rearrange_start, "BCHW to BTC Rearrange");
+        try printTimeDiff(&timer, rearrange_start, "BCHW to BTC Rearrange");
 
         const B = x.shape[0];
         const M = x.shape[1];
         const N = x.shape[2];
 
         // Initial reshape and linear projection
-        // const proj_start = timer.read();
+        const proj_start = timer.read();
         try x.reshape(&[_]usize{ B * M, N });
         var projected = try hgemm.matmul(x, self.weights.v_patch_embedding_linear_w, self.allocator);
         defer projected.deinit();
-        // try printTimeDiff(&timer, proj_start, "Linear Projection");
+        try printTimeDiff(&timer, proj_start, "Linear Projection");
 
         // Cast and bias add
-        // const bias_start = timer.read();
+        const bias_start = timer.read();
 
         try ops.broadcast_add_simd(&projected, self.weights.v_patch_embedding_linear_b);
-        // try printTimeDiff(&timer, bias_start, "Bias Add");
+        try printTimeDiff(&timer, bias_start, "Bias Add");
 
         // Positional embedding
-        // const pos_start = timer.read();
+        const pos_start = timer.read();
         try projected.reshape(&[_]usize{ B, M, self.config.vit_dim });
         try ops.broadcast_add_simd(&projected, self.weights.v_pos_embedding);
-        // try printTimeDiff(&timer, pos_start, "Positional Embedding");
+        try printTimeDiff(&timer, pos_start, "Positional Embedding");
 
         // Process transformer blocks
         var total_ln1_time: i128 = 0;
@@ -280,9 +280,9 @@ pub const VisionModel = struct {
         var total_mlp_time: i128 = 0;
         var total_residual_time: i128 = 0;
 
-        // const blocks_start = timer.read();
+        const blocks_start = timer.read();
         for (0..self.config.n_vit_layers) |block| {
-            // const block_start = timer.read();
+            const block_start = timer.read();
             try projected.reshape(&[_]usize{ B * M, self.config.vit_dim });
 
             var x_orig = try projected.copy();
@@ -332,10 +332,10 @@ pub const VisionModel = struct {
             total_residual_time += timer.read() - res2_start;
 
             // Format the block label and print timing
-            // const block_label = try std.fmt.bufPrint(&block_label_buf, "Transformer Block {d}", .{block});
-            // try printTimeDiff(&timer, block_start, block_label);
+            const block_label = try std.fmt.bufPrint(&block_label_buf, "Transformer Block {d}", .{block});
+            try printTimeDiff(&timer, block_start, block_label);
         }
-        // try printTimeDiff(&timer, blocks_start, "Total Transformer Blocks");
+        try printTimeDiff(&timer, blocks_start, "Total Transformer Blocks");
 
         // Print average times per block
         const blocks_f64 = @as(f64, @floatFromInt(self.config.n_vit_layers));
@@ -348,22 +348,22 @@ pub const VisionModel = struct {
         try stdout.print("\x1b[93m Residual Connections: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_residual_time)) / blocks_f64 / 1_000_000.0});
 
         // Final layer norm
-        // const final_ln_start = timer.read();
+        const final_ln_start = timer.read();
         try projected.reshape(&[_]usize{ B * M, self.config.vit_dim });
         var final_out = try ops.layerNorm(f16, projected, self.weights.v_norm_out_w, self.weights.v_norm_out_b, eps);
         errdefer final_out.deinit();
         try final_out.reshape(&[_]usize{ B, M, self.config.vit_dim });
-        // try printTimeDiff(&timer, final_ln_start, "Final Layer Norm");
+        try printTimeDiff(&timer, final_ln_start, "Final Layer Norm");
 
         // Print total execution time
-        // try printTimeDiff(&timer, total_start, "Total Vision Encoder");
+        try printTimeDiff(&timer, total_start, "Total Vision Encoder");
 
         return final_out;
     }
 
     pub fn attention_block(self: Self, x: Tensor(f16), layer: usize) !Tensor(f16) {
-        // var timer = try Timer.start();
-        // const total_start = timer.read();
+        var timer = try Timer.start();
+        const total_start = timer.read();
 
         const q_len = x.shape[0];
         const d_model = x.shape[1];
@@ -371,25 +371,25 @@ pub const VisionModel = struct {
         const head_dim = self.config.vit_head_dim;
 
         // Get QKV weights and biases
-        // const weight_start = timer.read();
+        const weight_start = timer.read();
         const layer_v_Wqkv_w = self.presliced_weights.v_Wqkv_w[layer];
         const layer_v_Wqkv_b = self.presliced_weights.v_Wqkv_b[layer];
-        // try printTimeDiff(&timer, weight_start, "QKV Weight Loading");
+        try printTimeDiff(&timer, weight_start, "QKV Weight Loading");
 
         // QKV linear projection
-        // const qkv_proj_start = timer.read();
+        const qkv_proj_start = timer.read();
         var qkv = try hgemm.matmul(x, layer_v_Wqkv_w, self.allocator);
         defer qkv.deinit();
-        // try printTimeDiff(&timer, qkv_proj_start, "QKV Linear Projection");
+        try printTimeDiff(&timer, qkv_proj_start, "QKV Linear Projection");
 
         // Cast and bias add
-        // const cast_start =s timer.read();
+        const cast_start = timer.read();
 
         try ops.broadcast_add_simd(&qkv, layer_v_Wqkv_b);
-        // try printTimeDiff(&timer, cast_start, "QKV Cast and Bias Add");
+        try printTimeDiff(&timer, cast_start, "QKV Cast and Bias Add");
 
         // Split QKV
-        // const split_start = timer.read();
+        const split_start = timer.read();
         const num_chunks = 3;
         var q = try ops.getChunk(f16, qkv, 1, 0, num_chunks);
         defer q.deinit();
@@ -397,10 +397,10 @@ pub const VisionModel = struct {
         defer k.deinit();
         var v = try ops.getChunk(f16, qkv, 1, 2, num_chunks);
         defer v.deinit();
-        // try printTimeDiff(&timer, split_start, "QKV Split");
+        try printTimeDiff(&timer, split_start, "QKV Split");
 
         // Reshape and transpose operations
-        // const reshape_start = timer.read();
+        const reshape_start = timer.read();
         try q.reshape(&[_]usize{ q_len, n_heads, head_dim });
         try k.reshape(&[_]usize{ q_len, n_heads, head_dim });
         try v.reshape(&[_]usize{ q_len, n_heads, head_dim });
@@ -408,22 +408,22 @@ pub const VisionModel = struct {
         try ops.transposeAxes(f16, &q, 0, 1);
         try ops.transposeAxes(f16, &k, 0, 1);
         try ops.transposeAxes(f16, &v, 0, 1);
-        // try printTimeDiff(&timer, reshape_start, "QKV Reshape and Transpose");
+        try printTimeDiff(&timer, reshape_start, "QKV Reshape and Transpose");
 
         // Attention computation
-        // const attention_start = timer.read();
+        const attention_start = timer.read();
         var attn_out = try ops.multimasklessDotProductAttention(q, k, v, self.allocator);
         defer attn_out.deinit();
-        // try printTimeDiff(&timer, attention_start, "Dot Product Attention");
+        try printTimeDiff(&timer, attention_start, "Dot Product Attention");
 
         // Post-attention reshape
-        // const post_attn_start = timer.read();
+        const post_attn_start = timer.read();
         try ops.transposeAxes(f16, &attn_out, 0, 1);
         try attn_out.reshape(&[_]usize{ q_len, d_model });
-        // try printTimeDiff(&timer, post_attn_start, "Post-Attention Reshape");
+        try printTimeDiff(&timer, post_attn_start, "Post-Attention Reshape");
 
         // Output projection
-        // const proj_start = timer.read();
+        const proj_start = timer.read();
         var layer_v_out_proj_w = try self.weights.v_out_proj_w.getDimensionSlice(0, layer);
         defer layer_v_out_proj_w.deinit();
         var layer_v_out_proj_b = try self.weights.v_out_proj_b.getDimensionSlice(0, layer);
@@ -431,107 +431,107 @@ pub const VisionModel = struct {
 
         var out = try hgemm.matmul(attn_out, layer_v_out_proj_w, self.allocator);
         errdefer out.deinit();
-        // try printTimeDiff(&timer, proj_start, "Output Projection");
+        try printTimeDiff(&timer, proj_start, "Output Projection");
 
         // Final cast and bias
-        // const final_start = timer.read();
+        const final_start = timer.read();
         try ops.broadcast_add_simd(&out, layer_v_out_proj_b);
-        // try printTimeDiff(&timer, final_start, "Final Cast and Bias Add");
+        try printTimeDiff(&timer, final_start, "Final Cast and Bias Add");
 
         // Print total attention block time
-        // try printTimeDiff(&timer, total_start, "Total Attention Block");
+        try printTimeDiff(&timer, total_start, "Total Attention Block");
 
         return out;
     }
 
     fn mlp(self: Self, input: Tensor(f16), layer: usize) !Tensor(f16) {
-        // var timer = try Timer.start();
-        // const total_start = timer.read();
+        var timer = try Timer.start();
+        const total_start = timer.read();
 
         // Load weights and biases
-        // const weight_start = timer.read();
+        const weight_start = timer.read();
         const layer_v_fc1_w = self.presliced_weights.v_fc1_w[layer];
         const layer_v_fc1_b = self.presliced_weights.v_fc1_b[layer];
         const layer_v_fc2_w = self.presliced_weights.v_fc2_w[layer];
         const layer_v_fc2_b = self.presliced_weights.v_fc2_b[layer];
-        // try printTimeDiff(&timer, weight_start, "MLP Weight Loading");
+        try printTimeDiff(&timer, weight_start, "MLP Weight Loading");
 
         // First linear layer
-        // const fc1_start = timer.read();
+        const fc1_start = timer.read();
 
         var fc1 = try hgemm.matmul(input, layer_v_fc1_w, self.allocator);
         defer fc1.deinit();
 
-        // try printTimeDiff(&timer, fc1_start, "FC1 Linear");
+        try printTimeDiff(&timer, fc1_start, "FC1 Linear");
 
         // Cast and bias for first layer
-        // const cast1_start = timer.read();
+        const cast1_start = timer.read();
         try ops.broadcast_add_simd(&fc1, layer_v_fc1_b);
-        // try printTimeDiff(&timer, cast1_start, "FC1 Cast and Bias");
+        try printTimeDiff(&timer, cast1_start, "FC1 Cast and Bias");
 
         // GELU activation
-        // const gelu_start = timer.read();
+        const gelu_start = timer.read();
         try ops.gelu(f16, &fc1);
-        // try printTimeDiff(&timer, gelu_start, "GELU Activation");
+        try printTimeDiff(&timer, gelu_start, "GELU Activation");
 
         // Second linear layer
-        // const fc2_start = timer.read();
+        const fc2_start = timer.read();
 
         var fc2 = try hgemm.matmul(fc1, layer_v_fc2_w, self.allocator);
-        // try printTimeDiff(&timer, fc2_start, "FC2 Linear");
+        try printTimeDiff(&timer, fc2_start, "FC2 Linear");
 
         // Cast and bias for second layer
-        // const cast2_start = timer.read();
+        const cast2_start = timer.read();
         try ops.broadcast_add_simd(&fc2, layer_v_fc2_b);
-        // try printTimeDiff(&timer, cast2_start, "FC2 Cast and Bias");
+        try printTimeDiff(&timer, cast2_start, "FC2 Cast and Bias");
 
         // Print total MLP time
-        // try printTimeDiff(&timer, total_start, "Total MLP");
+        try printTimeDiff(&timer, total_start, "Total MLP");
 
         return fc2;
     }
     fn encode_mlp(self: Self, input: Tensor(f16)) !Tensor(f16) {
-        // var timer = try Timer.start();
-        // const total_start = timer.read();
+        var timer = try Timer.start();
+        const total_start = timer.read();
 
         // Get weight references
-        // const weight_start = timer.read();
+        const weight_start = timer.read();
         const layer_v_proj_fc1_w = self.weights.v_proj_fc1_w;
         const layer_v_proj_fc1_b = self.weights.v_proj_fc1_b;
         const layer_v_proj_fc2_w = self.weights.v_proj_fc2_w;
         const layer_v_proj_fc2_b = self.weights.v_proj_fc2_b;
-        // try printTimeDiff(&timer, weight_start, "Projection Weight References");
+        try printTimeDiff(&timer, weight_start, "Projection Weight References");
 
         // First linear layer
-        // const fc1_start = timer.read();
+        const fc1_start = timer.read();
         var fc1 = try hgemm.matmul(input, layer_v_proj_fc1_w, self.allocator);
         defer fc1.deinit();
-        // try printTimeDiff(&timer, fc1_start, "Projection FC1 Linear");
+        try printTimeDiff(&timer, fc1_start, "Projection FC1 Linear");
 
         // Cast and bias for first layer
-        // const cast1_start = timer.read();
+        const cast1_start = timer.read();
         try ops.broadcast_add_simd(&fc1, layer_v_proj_fc1_b);
-        // try printTimeDiff(&timer, cast1_start, "Projection FC1 Cast and Bias");
+        try printTimeDiff(&timer, cast1_start, "Projection FC1 Cast and Bias");
 
         // GELU activation
-        // const gelu_start = timer.read();
+        const gelu_start = timer.read();
         try ops.gelu(f16, &fc1);
-        // try printTimeDiff(&timer, gelu_start, "Projection GELU Activation");
+        try printTimeDiff(&timer, gelu_start, "Projection GELU Activation");
 
         // Second linear layer
-        // const fc2_start = timer.read();
+        const fc2_start = timer.read();
 
         var fc2 = try hgemm.matmul(fc1, layer_v_proj_fc2_w, self.allocator);
         errdefer fc2.deinit();
-        // try printTimeDiff(&timer, fc2_start, "Projection FC2 Linear");
+        try printTimeDiff(&timer, fc2_start, "Projection FC2 Linear");
 
         // Cast and bias for second layer
-        // const cast2_start = timer.read();
+        const cast2_start = timer.read();
         try ops.broadcast_add_simd(&fc2, layer_v_proj_fc2_b);
-        // try printTimeDiff(&timer, cast2_start, "Projection FC2 Cast and Bias");
+        try printTimeDiff(&timer, cast2_start, "Projection FC2 Cast and Bias");
 
         // Print total encode MLP time
-        // try printTimeDiff(&timer, total_start, "Total Projection MLP");
+        try printTimeDiff(&timer, total_start, "Total Projection MLP");
 
         return fc2;
     }
