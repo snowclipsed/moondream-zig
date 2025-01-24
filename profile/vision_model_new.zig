@@ -16,6 +16,11 @@ const c = @cImport({
     @cInclude("stb_image_resize2.h");
     @cInclude("stdio.h");
 });
+
+comptime {
+    @setFloatMode(.optimized);
+}
+
 const PreSlicedWeights = @import("preslice.zig").PreSlicedWeights;
 
 pub const VisionModel = struct {

@@ -6,6 +6,10 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const testing = std.testing;
 
+comptime {
+    @setFloatMode(.optimized);
+}
+
 // tuning parameters
 pub const Tile: usize = 168; // Tile size for matrix blocking
 pub const Vec: usize = 8; // Vector size for SIMD operations

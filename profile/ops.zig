@@ -14,8 +14,13 @@ const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expectError = testing.expectError;
 const Timer = std.time.Timer;
-const printTimeDiffVision = @import("timediffvision.zig").printTimeDiff;
+const printTimeDiff = @import("timeattention.zig").printTimeDiff;
 
+comptime {
+    @setFloatMode(.optimized);
+}
+
+const mode = @import("std").builtin.FloatMode;
 // Tensor Operations
 pub fn transpose(comptime T: type, tensor: *Tensor(T)) !void {
     if (tensor.shape.len != 2) return error.UnsupportedDimension;
@@ -2288,14 +2293,14 @@ pub fn masklessDotProductAttention(
     const init_start = timer.read();
     var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
     errdefer out.deinit();
-    try printTimeDiffVision(&timer, init_start, "Output Tensor Initialization");
+    try printTimeDiff(&timer, init_start, "Output Tensor Initialization");
 
     // Prepare transposed key for all heads
     const transpose_start = timer.read();
     var key_transpose = try key.copy();
     defer key_transpose.deinit();
     try transposeAxes(f16, &key_transpose, 1, 2);
-    try printTimeDiffVision(&timer, transpose_start, "Key Transpose");
+    try printTimeDiff(&timer, transpose_start, "Key Transpose");
 
     // Track total times for operations across all heads
     var total_slice_time: i128 = 0;
@@ -2367,8 +2372,8 @@ pub fn masklessDotProductAttention(
     try stdout.print("\x1b[91m   Attention Computation: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_attn_time)) / heads_f64 / 1_000_000.0});
     try stdout.print("\x1b[91m   Output Copy: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_copy_time)) / heads_f64 / 1_000_000.0});
 
-    try printTimeDiffVision(&timer, heads_start, "Total Attention Heads Processing");
-    try printTimeDiffVision(&timer, total_start, "Total Maskless Attention");
+    try printTimeDiff(&timer, heads_start, "Total Attention Heads Processing");
+    try printTimeDiff(&timer, total_start, "Total Maskless Attention");
 
     return out;
 }
@@ -3346,142 +3351,6 @@ pub fn broadcast_add_simd(a: *Tensor(f16), b: Tensor(f16)) !void {
     }
 }
 
-//// multirheaded attention ///
-
-// pub fn multimasklessDotProductAttention(
-//     query: Tensor(f16),
-//     key: Tensor(f16),
-//     value: Tensor(f16),
-//     allocator: Allocator,
-// ) !Tensor(f16) {
-//     var timer = try Timer.start();
-//     const total_start = timer.read();
-
-//     const n_heads = query.shape[0];
-//     const q_len = query.shape[1];
-//     const kv_len = key.shape[1];
-//     const head_dim = query.shape[2];
-
-//     // Scale factor
-//     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-
-//     // Initialize output tensor
-//     var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
-//     errdefer out.deinit();
-
-//     // Prepare transposed key for all heads
-//     var key_transpose = try key.copy();
-//     defer key_transpose.deinit();
-//     try transposeAxes(f16, &key_transpose, 1, 2);
-
-//     // Pre-cast query and value to f32 to avoid repeated casting
-//     var query_f32 = try query.castWithSimd(f32);
-//     defer query_f32.deinit();
-//     var value_f32 = try value.castWithSimd(f32);
-//     defer value_f32.deinit();
-//     var key_transpose_f32 = try key_transpose.castWithSimd(f32);
-//     defer key_transpose_f32.deinit();
-
-//     // Create thread pool for parallel processing
-//     const thread_count = @min(n_heads, try Thread.getCpuCount());
-//     var threads = try allocator.alloc(Thread, thread_count);
-//     defer allocator.free(threads);
-
-//     // Create a context struct for thread data
-//     const ThreadContext = struct {
-//         start_head: usize,
-//         end_head: usize,
-//         query: Tensor(f32),
-//         key: Tensor(f32),
-//         value: Tensor(f32),
-//         out: *Tensor(f16),
-//         scale: f32,
-//         q_len: usize,
-//         kv_len: usize,
-//         head_dim: usize, // Add head_dim to the context
-//         allocator: Allocator,
-//     };
-
-//     // Divide work among threads
-//     const heads_per_thread = n_heads / thread_count;
-//     const remaining_heads = n_heads % thread_count;
-
-//     var current_head: usize = 0;
-//     var thread_contexts = try allocator.alloc(ThreadContext, thread_count);
-//     defer allocator.free(thread_contexts);
-
-//     // Thread worker function
-//     const worker = struct {
-//         fn process(ctx: ThreadContext) !void {
-//             var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-//             defer arena.deinit();
-//             const arena_allocator = arena.allocator();
-
-//             for (ctx.start_head..ctx.end_head) |h| {
-//                 // Get slices for this head
-//                 var query_head = try ctx.query.getDimensionSlice(0, h);
-//                 defer query_head.deinit();
-//                 var key_head = try ctx.key.getDimensionSlice(0, h);
-//                 defer key_head.deinit();
-//                 var value_head = try ctx.value.getDimensionSlice(0, h);
-//                 defer value_head.deinit();
-
-//                 // Calculate QK^T directly in f32
-
-//                 var attn_weights = try sgemm.matmul(f32, query_head, key_head, arena_allocator);
-//                 defer attn_weights.deinit();
-
-//                 // Apply scaling and softmax in-place
-//                 for (attn_weights.data) |*w| {
-//                     w.* *= ctx.scale;
-//                 }
-//                 try softmax(&attn_weights, 1, arena_allocator);
-
-//                 // Compute attention output
-//                 const out_head = try sgemm.matmul(f32, attn_weights, value_head, arena_allocator);
-
-//                 // Copy to output tensor with casting
-//                 const out_slice = h * ctx.q_len * ctx.head_dim; // Use ctx.head_dim
-//                 for (0..ctx.q_len * ctx.head_dim) |i| {
-//                     ctx.out.data[out_slice + i] = @floatCast(out_head.data[i]);
-//                 }
-//             }
-//         }
-//     }.process;
-
-//     // Launch threads
-//     for (0..thread_count) |t| {
-//         const start_head = current_head;
-//         const extra_head: usize = if (t < remaining_heads) 1 else 0;
-//         current_head += heads_per_thread + extra_head;
-
-//         thread_contexts[t] = ThreadContext{
-//             .start_head = start_head,
-//             .end_head = current_head,
-//             .query = query_f32,
-//             .key = key_transpose_f32,
-//             .value = value_f32,
-//             .out = &out,
-//             .scale = scale,
-//             .q_len = q_len,
-//             .kv_len = kv_len,
-//             .head_dim = head_dim, // Pass head_dim here
-//             .allocator = allocator,
-//         };
-
-//         threads[t] = try Thread.spawn(.{}, worker, .{thread_contexts[t]});
-//     }
-
-//     // Wait for all threads to complete
-//     for (threads) |thread| {
-//         thread.join();
-//     }
-
-//     try printTimeDiff(&timer, total_start, "Total Maskless Attention");
-
-//     return out;
-// }
-
 // Thread workspace pre-allocated for each thread
 const ThreadWorkspace = struct {
     allocator: Allocator,
@@ -3582,7 +3451,7 @@ pub fn multimasklessDotProductAttention(
     defer query_f32.deinit();
     var value_f32 = try value.castWithSimd(f32);
     defer value_f32.deinit();
-    try printTimeDiffVision(&timer, init_and_cast_time, "Init and cast tensors");
+    try printTimeDiff(&timer, init_and_cast_time, "Init and Query and Value tensors");
 
     // Prepare transposed key for all heads
     const transpose_time = timer.read();
@@ -3591,7 +3460,7 @@ pub fn multimasklessDotProductAttention(
     try transposeAxes(f16, &key_transpose, 1, 2);
     var key_transpose_f32 = try key_transpose.castWithSimd(f32);
     defer key_transpose_f32.deinit();
-    try printTimeDiffVision(&timer, transpose_time, "Transpose key");
+    try printTimeDiff(&timer, transpose_time, "Transpose + Cast key");
 
     // Initialize thread pool and workspaces
     const pool_init_time = timer.read();
@@ -3601,7 +3470,7 @@ pub fn multimasklessDotProductAttention(
 
     var threads = try allocator.alloc(Thread, thread_count);
     defer allocator.free(threads);
-    try printTimeDiffVision(&timer, pool_init_time, "Init thread pool");
+    try printTimeDiff(&timer, pool_init_time, "Init thread pool");
 
     // Divide work among threads
     const divide_work_time = timer.read();
@@ -3611,7 +3480,7 @@ pub fn multimasklessDotProductAttention(
     var current_head: usize = 0;
     var thread_contexts = try allocator.alloc(AttnThreadContext, thread_count);
     defer allocator.free(thread_contexts);
-    try printTimeDiffVision(&timer, divide_work_time, "Divide work among threads");
+    try printTimeDiff(&timer, divide_work_time, "Divide work among threads");
 
     // Thread worker function
     const worker = struct {
@@ -3625,27 +3494,27 @@ pub fn multimasklessDotProductAttention(
                 try copyHeadData(f32, &workspace.query_head, ctx.query, h);
                 try copyHeadData(f32, &workspace.key_head, ctx.key, h);
                 try copyHeadData(f32, &workspace.value_head, ctx.value, h);
-                try printTimeDiffVision(&processtimer, copy_head_time, "Copy head data");
+                try printTimeDiff(&processtimer, copy_head_time, "Copy head data");
 
                 // Calculate QK^T directly in f32 using workspace tensors
                 const matmul_time = processtimer.read();
                 workspace.attn_weights = try sgemm.matmul(f32, workspace.query_head, workspace.key_head, workspace.allocator);
-                try printTimeDiffVision(&processtimer, matmul_time, "Matmul QK^T");
+                try printTimeDiff(&processtimer, matmul_time, "Matmul QK^T");
 
                 // Apply scaling and softmax in-place
                 const scale_time = processtimer.read();
                 for (workspace.attn_weights.data) |*w| {
                     w.* *= ctx.scale;
                 }
-                try printTimeDiffVision(&processtimer, scale_time, "Scale Time");
+                try printTimeDiff(&processtimer, scale_time, "Scale Time");
                 const softmax_time = processtimer.read();
                 try softmax(&workspace.attn_weights, 1, workspace.allocator);
-                try printTimeDiffVision(&processtimer, softmax_time, "Softmax");
+                try printTimeDiff(&processtimer, softmax_time, "Softmax");
 
                 // Compute attention output using workspace
                 const attn_time = processtimer.read();
                 workspace.out_head = try sgemm.matmul(f32, workspace.attn_weights, workspace.value_head, workspace.allocator);
-                try printTimeDiffVision(&processtimer, attn_time, "Matmul attention output");
+                try printTimeDiff(&processtimer, attn_time, "Matmul attention output");
 
                 // Copy to output tensor with casting
                 const copy_out_time = processtimer.read();
@@ -3653,7 +3522,7 @@ pub fn multimasklessDotProductAttention(
                 for (0..ctx.q_len * ctx.head_dim) |i| {
                     ctx.out.data[out_slice + i] = @floatCast(workspace.out_head.data[i]);
                 }
-                try printTimeDiffVision(&processtimer, copy_out_time, "Copy output data");
+                try printTimeDiff(&processtimer, copy_out_time, "Copy output data");
             }
         }
     }.process;
@@ -3686,18 +3555,18 @@ pub fn multimasklessDotProductAttention(
         thread.join();
     }
 
-    try printTimeDiffVision(&timer, total_start, "Total Maskless Attention");
+    try printTimeDiff(&timer, total_start, "Total Maskless Attention");
 
     return out;
 }
 
-// Helper function to copy head data into workspace tensors
+// // Helper function to copy head data into workspace tensors
 fn copyHeadData(comptime T: type, dst: *Tensor(T), src: Tensor(T), head_idx: usize) !void {
     const slice_size = src.shape[1] * src.shape[2];
     const start_idx = head_idx * slice_size;
     @memcpy(dst.data[0..slice_size], src.data[start_idx..][0..slice_size]);
 }
-// Thread context for masked attention
+
 // Thread context for masked attention
 const MaskedAttnThreadContext = struct {
     start_head: usize,

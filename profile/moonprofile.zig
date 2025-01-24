@@ -14,6 +14,11 @@ const displayImage = @import("imagedisplay.zig").displayImage;
 const print = std.debug.print;
 const Timer = std.time.Timer;
 
+comptime {
+    @setFloatMode(.optimized);
+}
+const mode = @import("std").builtin.FloatMode;
+
 const main_color = "\x1b[38;5;214m";
 const reset_color = "\x1b[0m";
 const time_color = "\x1b[96m";
@@ -47,6 +52,8 @@ pub fn main() !void {
     );
     try stdout.print("{s}", .{reset_color});
     try printTimeDiff(display_start, timer.read(), "ASCII Art Display");
+
+    print("Float mode : {any} \n", .{mode});
 
     // Initialize allocator
     const init_start = timer.read();
@@ -100,11 +107,12 @@ pub fn main() !void {
     try printTimeDiff(weights_start, timer.read(), "Model Weights Loading");
 
     std.debug.print("\n\n", .{});
-    std.debug.print("Loading image, displaying at scale {d:3}x.\n", .{0.75});
+    const scale = 1.0;
+    std.debug.print("Loading image, displaying at scale {d:3}x.\n", .{scale});
 
     // Display and process image
     const image_start = timer.read();
-    try displayImage(allocator, image_path, 0.75);
+    try displayImage(allocator, image_path, scale);
     try printTimeDiff(image_start, timer.read(), "Image Display");
 
     // Initialize vision model and encode image

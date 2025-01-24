@@ -13,6 +13,10 @@ const Timer = std.time.Timer;
 const printTimeDiff = @import("timedifftext.zig").printTimeDiff;
 const TextPreSlicedWeights = @import("preslice_text.zig").TextPreSlicedWeights;
 
+comptime {
+    @setFloatMode(.optimized);
+}
+
 pub const TextModel = struct {
     const Self = @This();
     config: Config,
