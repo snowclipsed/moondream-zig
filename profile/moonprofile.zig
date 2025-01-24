@@ -71,7 +71,7 @@ pub fn main() !void {
     const config_path: []const u8 = "../model_config.json";
     const tokenizer_path: []const u8 = "../tokenizer.bin";
     const image_path: []const u8 = "../images/demo-1.jpg";
-    const max_tokens: usize = 10;
+    const max_tokens: usize = 200;
     const sampling_config = ops.SamplingConfig{ .method = .greedy };
 
     // Load tokenizer
@@ -108,18 +108,19 @@ pub fn main() !void {
     try printTimeDiff(image_start, timer.read(), "Image Display");
 
     // Initialize vision model and encode image
-    const vision_start = timer.read();
+    const modelinit_start = timer.read();
     var vision_model = try VisionModel.init(config, weights, allocator);
     defer vision_model.deinit();
-    var image_tensor = try vision_model.encode_image(image_path);
-    defer image_tensor.deinit();
-    try printTimeDiff(vision_start, timer.read(), "Vision Model Init and Image Encoding");
-
-    // Initialize text model
-    const text_model_start = timer.read();
     var text_model = try TextModel.init(config, weights, allocator);
     defer text_model.deinit();
-    try printTimeDiff(text_model_start, timer.read(), "Text Model Initialization");
+
+    try printTimeDiff(modelinit_start, timer.read(), "Models Init");
+
+    const image_encode_start = timer.read();
+    var image_tensor = try vision_model.encode_image(image_path);
+    defer image_tensor.deinit();
+    try printTimeDiff(image_encode_start, timer.read(), "Image Encoding");
+    // Initialize text model
 
     // Initialize tokens and create input tensor
     const token_init_start = timer.read();
