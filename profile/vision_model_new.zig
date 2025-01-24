@@ -391,18 +391,21 @@ pub const VisionModel = struct {
 
         // Cast and bias add
         const cast_start = timer.read();
-
         try ops.broadcast_add_simd(&qkv, layer_v_Wqkv_b);
-        try printTimeDiff(&timer, cast_start, "QKV Cast and Bias Add");
+        try printTimeDiff(&timer, cast_start, "QKV Bias Add");
 
-        // Split QKV
+        // Split QKV using views
         const split_start = timer.read();
         const num_chunks = 3;
-        var q = try ops.getChunk(f16, qkv, 1, 0, num_chunks);
+        var qkv_view = try qkv.asView();
+        defer qkv_view.deinit();
+
+        // Get chunks using views and convert to contiguous tensors
+        var q = try (try qkv_view.getChunkView(1, 0, num_chunks)).toContiguousTensor();
         defer q.deinit();
-        var k = try ops.getChunk(f16, qkv, 1, 1, num_chunks);
+        var k = try (try qkv_view.getChunkView(1, 1, num_chunks)).toContiguousTensor();
         defer k.deinit();
-        var v = try ops.getChunk(f16, qkv, 1, 2, num_chunks);
+        var v = try (try qkv_view.getChunkView(1, 2, num_chunks)).toContiguousTensor();
         defer v.deinit();
         try printTimeDiff(&timer, split_start, "QKV Split");
 
@@ -411,11 +414,12 @@ pub const VisionModel = struct {
         try q.reshape(&[_]usize{ q_len, n_heads, head_dim });
         try k.reshape(&[_]usize{ q_len, n_heads, head_dim });
         try v.reshape(&[_]usize{ q_len, n_heads, head_dim });
-
+        try printTimeDiff(&timer, reshape_start, "QKV Reshape ");
+        const transpose_start = timer.read();
         try ops.transposeAxes(f16, &q, 0, 1);
         try ops.transposeAxes(f16, &k, 0, 1);
         try ops.transposeAxes(f16, &v, 0, 1);
-        try printTimeDiff(&timer, reshape_start, "QKV Reshape and Transpose");
+        try printTimeDiff(&timer, transpose_start, "QKV Transpose");
 
         // Attention computation
         const attention_start = timer.read();
