@@ -438,6 +438,9 @@ pub const LayerCache = struct {
             .current_len = 0,
         };
     }
+    pub fn reset(self: *LayerCache) void {
+        self.current_len = 0;
+    }
 
     pub fn deinit(self: *LayerCache) void {
         self.key.deinit();
@@ -486,6 +489,11 @@ pub const KVCache = struct {
             layer.deinit();
         }
         self.allocator.free(self.layers);
+    }
+    pub fn reset(self: *KVCache) void {
+        for (self.layers) |*layer| {
+            layer.reset();
+        }
     }
 
     pub fn getLayerCache(self: *KVCache, layer: usize) !*LayerCache {
