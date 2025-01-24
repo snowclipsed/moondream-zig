@@ -436,6 +436,22 @@ pub fn Tensor(comptime DataType: type) type {
             self.shape = new_shape_copy;
         }
 
+        // Add to your Tensor struct:
+        pub fn asView(self: *const Self) !TensorView(DataType) {
+            return TensorView(DataType).fromTensor(self);
+        }
+
+        // Optional: Add a convenience wrapper that uses views internally
+        pub fn getChunkFast(self: *const Self, dim: usize, chunk_idx: usize, num_chunks: usize) !Self {
+            var view = try self.asView();
+            defer view.deinit();
+
+            var chunk_view = try view.getChunkView(dim, chunk_idx, num_chunks);
+            defer chunk_view.deinit();
+
+            return chunk_view.toTensor();
+        }
+
         // Inside the Tensor struct definition:
 
         /// Adds a dimension of size 1 at the specified position.
@@ -1238,3 +1254,224 @@ pub const CastError = error{
     LossyConversion, // When precision would be lost (e.g., float to int with decimals)
     OutOfRange, // When value is outside the target type's range
 };
+
+/// A view into a tensor that doesn't own its data
+pub fn TensorView(comptime DataType: type) type {
+    return struct {
+        const Self = @This();
+
+        data: []align(32) DataType, // Reference to original aligned data
+        shape: []usize, // View dimensions
+        strides: []usize, // Stride for each dimension
+        offset: usize, // Offset into original data
+        allocator: Allocator, // For managing shape/strides arrays
+
+        /// Create a view from an existing tensor
+        pub fn fromTensor(tensor: *const Tensor(DataType)) !Self {
+            const strides = try calculateStrides(tensor.shape, tensor.allocator);
+            errdefer tensor.allocator.free(strides);
+
+            const shape = try tensor.allocator.alloc(usize, tensor.shape.len);
+            errdefer tensor.allocator.free(shape);
+            @memcpy(shape, tensor.shape);
+
+            return Self{
+                .data = tensor.data,
+                .shape = shape,
+                .strides = strides,
+                .offset = 0,
+                .allocator = tensor.allocator,
+            };
+        }
+
+        /// Get a chunk view without copying data
+        pub fn getChunkView(self: *const Self, dim: usize, chunk_idx: usize, num_chunks: usize) !Self {
+            if (dim >= self.shape.len) return error.InvalidDimension;
+
+            const dim_size = self.shape[dim];
+            if (num_chunks == 0 or dim_size < num_chunks) return error.InvalidNumChunks;
+            if (chunk_idx >= num_chunks) return error.InvalidChunkIndex;
+
+            const chunk_size = dim_size / num_chunks;
+            if (chunk_size * num_chunks != dim_size) return error.UnevenChunkSize;
+
+            const start_idx = chunk_idx * chunk_size;
+
+            // Create new shape array
+            var new_shape = try self.allocator.alloc(usize, self.shape.len);
+            errdefer self.allocator.free(new_shape);
+            @memcpy(new_shape, self.shape);
+            new_shape[dim] = chunk_size;
+
+            // Calculate new strides (reuse existing ones)
+            const new_strides = try self.allocator.alloc(usize, self.strides.len);
+            errdefer self.allocator.free(new_strides);
+            @memcpy(new_strides, self.strides);
+
+            // Calculate new offset
+            const new_offset = self.offset + start_idx * self.strides[dim];
+
+            return Self{
+                .data = self.data,
+                .shape = new_shape,
+                .strides = new_strides,
+                .offset = new_offset,
+                .allocator = self.allocator,
+            };
+        }
+
+        /// Convert view back to owned tensor (copies data)
+        pub fn toTensor(self: Self) !Tensor(DataType) {
+            var result = try Tensor(DataType).init(self.allocator, self.shape);
+            errdefer result.deinit();
+
+            // Copy data using view's layout
+            var coords = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(coords);
+            @memset(coords, 0);
+
+            const total_elements = calculateSize(self.shape);
+            var i: usize = 0;
+            while (i < total_elements) : (i += 1) {
+                const src_idx = self.getIndex(coords);
+                result.data[i] = self.data[src_idx];
+
+                // Update coordinates
+                var dim = self.shape.len;
+                while (dim > 0) {
+                    dim -= 1;
+                    coords[dim] += 1;
+                    if (coords[dim] < self.shape[dim]) break;
+                    coords[dim] = 0;
+                }
+            }
+
+            return result;
+        }
+
+        /// Calculate actual data index from coordinates
+        pub inline fn getIndex(self: Self, coords: []const usize) usize {
+            var index = self.offset;
+            for (coords, 0..) |coord, dim| {
+                index += coord * self.strides[dim];
+            }
+            return index;
+        }
+
+        /// Free allocated memory
+        pub fn deinit(self: *Self) void {
+            self.allocator.free(self.shape);
+            self.allocator.free(self.strides);
+        }
+
+        /// Calculate strides for given shape
+        fn calculateStrides(shape: []const usize, allocator: Allocator) ![]usize {
+            var strides = try allocator.alloc(usize, shape.len);
+            errdefer allocator.free(strides);
+
+            if (shape.len == 0) return strides;
+
+            strides[shape.len - 1] = 1;
+            var i = shape.len - 1;
+            while (i > 0) : (i -= 1) {
+                strides[i - 1] = strides[i] * shape[i];
+            }
+            return strides;
+        }
+
+        /// Calculate total size from shape
+        fn calculateSize(shape: []const usize) usize {
+            var size: usize = 1;
+            for (shape) |dim| {
+                size *= dim;
+            }
+            return size;
+        }
+
+        pub fn transposeAxes(self: *Self, axis1: usize, axis2: usize) !void {
+            if (axis1 >= self.shape.len or axis2 >= self.shape.len) {
+                return error.InvalidDimension;
+            }
+
+            // Swap shapes
+            const temp_shape = self.shape[axis1];
+            self.shape[axis1] = self.shape[axis2];
+            self.shape[axis2] = temp_shape;
+
+            // Swap strides
+            const temp_stride = self.strides[axis1];
+            self.strides[axis1] = self.strides[axis2];
+            self.strides[axis2] = temp_stride;
+        }
+
+        /// Fast indexing for transposed/reshaped views
+        pub fn getDataIndex(self: Self, coords: []const usize) usize {
+            var index = self.offset;
+            for (coords, 0..) |coord, dim| {
+                index += coord * self.strides[dim];
+            }
+            return index;
+        }
+
+        pub fn reshape(self: *Self, new_shape: []const usize) !void {
+            // Calculate new size
+            var new_size: usize = 1;
+            for (new_shape) |dim| {
+                new_size *= dim;
+            }
+
+            // Verify compatible size
+            const current_size = calculateSize(self.shape);
+            if (new_size != current_size) {
+                return error.IncompatibleShape;
+            }
+
+            // Update shape array
+            if (new_shape.len != self.shape.len) {
+                const new_shape_copy = try self.allocator.alloc(usize, new_shape.len);
+                errdefer self.allocator.free(new_shape_copy);
+                @memcpy(new_shape_copy, new_shape);
+                self.allocator.free(self.shape);
+                self.shape = new_shape_copy;
+            } else {
+                @memcpy(self.shape, new_shape);
+            }
+
+            // Update strides for new shape
+            const new_strides = try calculateStrides(self.shape, self.allocator);
+            self.allocator.free(self.strides);
+            self.strides = new_strides;
+        }
+        /// Add to TensorView struct
+        pub fn toContiguousTensor(self: Self) !Tensor(DataType) {
+            // Create new tensor with current shape
+            var result = try Tensor(DataType).init(self.allocator, self.shape);
+            errdefer result.deinit();
+
+            // Copy data using view's layout
+            var coords = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(coords);
+            @memset(coords, 0);
+
+            const total_elements = calculateSize(self.shape);
+            var i: usize = 0;
+            while (i < total_elements) : (i += 1) {
+                // Get source index using view's strides
+                const src_idx = self.getDataIndex(coords);
+                // Destination index is sequential
+                result.data[i] = self.data[src_idx];
+
+                // Update coordinates
+                var dim = self.shape.len;
+                while (dim > 0) {
+                    dim -= 1;
+                    coords[dim] += 1;
+                    if (coords[dim] < self.shape[dim]) break;
+                    coords[dim] = 0;
+                }
+            }
+
+            return result;
+        }
+    };
+}

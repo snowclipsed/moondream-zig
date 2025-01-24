@@ -14,7 +14,7 @@ const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expectError = testing.expectError;
 const Timer = std.time.Timer;
-const printTimeDiff = @import("timediffvision.zig").printTimeDiff;
+const printTimeDiffVision = @import("timediffvision.zig").printTimeDiff;
 
 // Tensor Operations
 pub fn transpose(comptime T: type, tensor: *Tensor(T)) !void {
@@ -44,6 +44,7 @@ pub fn transpose(comptime T: type, tensor: *Tensor(T)) !void {
 /// - tensor: Input tensor to transpose
 /// - dim0: First dimension to swap
 /// - dim1: Second dimension to swap
+///
 pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: usize) !void {
     if (dim0 >= tensor.shape.len or dim1 >= tensor.shape.len) {
         return error.InvalidDimension;
@@ -64,13 +65,7 @@ pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: us
     errdefer tensor.allocator.free(new_shape);
 
     for (tensor.shape, 0..) |dim, idx| {
-        if (idx == dim0) {
-            new_shape[idx] = tensor.shape[dim1];
-        } else if (idx == dim1) {
-            new_shape[idx] = tensor.shape[dim0];
-        } else {
-            new_shape[idx] = dim;
-        }
+        new_shape[idx] = if (idx == dim0) tensor.shape[dim1] else if (idx == dim1) tensor.shape[dim0] else dim;
     }
 
     // Allocate memory for transposed data
@@ -87,28 +82,76 @@ pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: us
         new_strides[i - 1] = new_strides[i] * new_shape[i];
     }
 
-    // Create coordinate arrays
+    // SIMD optimization for 3D tensors swapping first two dimensions
+    if (tensor.shape.len == 3 and dim0 == 0 and dim1 == 1 and
+        (T == f16 or T == f32))
+    {
+        const batch_size = tensor.shape[0];
+        const rows = tensor.shape[1];
+        const cols = tensor.shape[2];
+        const vector_size = if (T == f16) 16 else 8; // AVX2: 16 fp16 or 8 fp32
+
+        if (cols >= vector_size) {
+            const Vector = @Vector(vector_size, T);
+
+            var col: usize = 0;
+            while (col < cols) : (col += vector_size) {
+                const vec_size = @min(vector_size, cols - col);
+
+                // Process each column vector block
+                for (0..batch_size) |b| {
+                    for (0..rows) |r| {
+                        const src_idx = b * rows * cols + r * cols + col;
+                        var vec: Vector = undefined;
+
+                        // Load with potential partial vector
+                        if (vec_size == vector_size) {
+                            vec = tensor.data[src_idx..][0..vector_size].*;
+                        } else {
+                            var temp: [vector_size]T = undefined;
+                            @memcpy(temp[0..vec_size], tensor.data[src_idx..][0..vec_size]);
+                            vec = temp;
+                        }
+
+                        // Store transposed
+                        const dst_idx = r * batch_size * cols + b * cols + col;
+                        if (vec_size == vector_size) {
+                            new_data[dst_idx..][0..vector_size].* = vec;
+                        } else {
+                            @memcpy(new_data[dst_idx..][0..vec_size], @as([vector_size]T, vec)[0..vec_size]);
+                        }
+                    }
+                }
+            }
+            // Update tensor and return early since we handled this case
+            tensor.allocator.free(tensor.data);
+            tensor.data = new_data;
+            tensor.allocator.free(tensor.shape);
+            tensor.shape = new_shape;
+            return;
+        }
+    }
+
+    // General case implementation
     var coords = try tensor.allocator.alloc(usize, tensor.shape.len);
     defer tensor.allocator.free(coords);
     @memset(coords, 0);
 
-    // Perform the transpose operation
     const total_elements = tensor.data.len;
     var idx: usize = 0;
     while (idx < total_elements) : (idx += 1) {
-        // Calculate source coordinates
         var remaining = idx;
         for (0..tensor.shape.len) |dim| {
             coords[dim] = remaining / new_strides[dim];
-            remaining = remaining % new_strides[dim];
+            remaining %= new_strides[dim];
         }
 
-        // Swap coordinates for the transposed dimensions
+        // Swap coordinates
         const temp = coords[dim0];
         coords[dim0] = coords[dim1];
         coords[dim1] = temp;
 
-        // Calculate source index using original strides
+        // Calculate source index
         var src_idx: usize = 0;
         for (0..tensor.shape.len) |dim| {
             src_idx += coords[dim] * strides[dim];
@@ -117,7 +160,276 @@ pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: us
         new_data[idx] = tensor.data[src_idx];
     }
 
-    // Update tensor with new data and shape
+    // Update tensor metadata
+    tensor.allocator.free(tensor.data);
+    tensor.data = new_data;
+    tensor.allocator.free(tensor.shape);
+    tensor.shape = new_shape;
+}
+// pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: usize) !void {
+//     if (dim0 >= tensor.shape.len or dim1 >= tensor.shape.len) {
+//         return error.InvalidDimension;
+//     }
+
+//     // Calculate strides for the current shape
+//     var strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+//     defer tensor.allocator.free(strides);
+
+//     strides[tensor.shape.len - 1] = 1;
+//     var i: usize = tensor.shape.len - 1;
+//     while (i > 0) : (i -= 1) {
+//         strides[i - 1] = strides[i] * tensor.shape[i];
+//     }
+
+//     // Create new shape with swapped dimensions
+//     var new_shape = try tensor.allocator.alloc(usize, tensor.shape.len);
+//     errdefer tensor.allocator.free(new_shape);
+
+//     for (tensor.shape, 0..) |dim, idx| {
+//         if (idx == dim0) {
+//             new_shape[idx] = tensor.shape[dim1];
+//         } else if (idx == dim1) {
+//             new_shape[idx] = tensor.shape[dim0];
+//         } else {
+//             new_shape[idx] = dim;
+//         }
+//     }
+
+//     // Allocate memory for transposed data
+//     var new_data = try tensor.allocator.alignedAlloc(T, 32, tensor.data.len);
+//     errdefer tensor.allocator.free(new_data);
+
+//     // Calculate new strides
+//     var new_strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+//     defer tensor.allocator.free(new_strides);
+
+//     new_strides[tensor.shape.len - 1] = 1;
+//     i = tensor.shape.len - 1;
+//     while (i > 0) : (i -= 1) {
+//         new_strides[i - 1] = new_strides[i] * new_shape[i];
+//     }
+
+//     // For 3D tensors with dim0=0 and dim1=1, use SIMD optimization
+//     if (tensor.shape.len == 3 and dim0 == 0 and dim1 == 1 and
+//         (T == f16 or T == f32) and tensor.shape[2] >= 8)
+//     {
+//         const batch_size = tensor.shape[0];
+//         const rows = tensor.shape[1];
+//         const cols = tensor.shape[2];
+//         const Vector = @Vector(8, T);
+
+//         var col: usize = 0;
+//         while (col < cols) : (col += 8) {
+//             const vec_size = @min(8, cols - col);
+
+//             // Process each column vector
+//             for (0..batch_size) |b| {
+//                 for (0..rows) |r| {
+//                     var vec: Vector = undefined;
+//                     if (vec_size == 8) {
+//                         // Full vector load
+//                         const src_idx = b * rows * cols + r * cols + col;
+//                         vec = tensor.data[src_idx..][0..8].*;
+//                     } else {
+//                         // Partial load
+//                         var temp: [8]T = undefined;
+//                         const src_idx = b * rows * cols + r * cols + col;
+//                         @memcpy(temp[0..vec_size], tensor.data[src_idx..][0..vec_size]);
+//                         vec = temp;
+//                     }
+
+//                     // Store in transposed location
+//                     const dst_idx = r * batch_size * cols + b * cols + col;
+//                     if (vec_size == 8) {
+//                         new_data[dst_idx..][0..8].* = vec;
+//                     } else {
+//                         @memcpy(new_data[dst_idx..][0..vec_size], @as([8]T, vec)[0..vec_size]);
+//                     }
+//                 }
+//             }
+//         }
+//     } else {
+//         // Use original implementation for other cases
+//         var coords = try tensor.allocator.alloc(usize, tensor.shape.len);
+//         defer tensor.allocator.free(coords);
+//         @memset(coords, 0);
+
+//         const total_elements = tensor.data.len;
+//         var idx: usize = 0;
+//         while (idx < total_elements) : (idx += 1) {
+//             var remaining = idx;
+//             for (0..tensor.shape.len) |dim| {
+//                 coords[dim] = remaining / new_strides[dim];
+//                 remaining = remaining % new_strides[dim];
+//             }
+
+//             const temp = coords[dim0];
+//             coords[dim0] = coords[dim1];
+//             coords[dim1] = temp;
+
+//             var src_idx: usize = 0;
+//             for (0..tensor.shape.len) |dim| {
+//                 src_idx += coords[dim] * strides[dim];
+//             }
+
+//             new_data[idx] = tensor.data[src_idx];
+//         }
+//     }
+
+//     // Update tensor with new data and shape
+//     tensor.allocator.free(tensor.data);
+//     tensor.data = new_data;
+//     tensor.allocator.free(tensor.shape);
+//     tensor.shape = new_shape;
+// }
+
+pub fn transposeF16SIMD(tensor: *Tensor(f16), batch_size: usize, rows: usize, cols: usize, new_data: []align(32) f16) void {
+    const vec_size = 8;
+
+    var col: usize = 0;
+    while (col < cols) : (col += vec_size) {
+        const remaining = cols - col;
+        const current_vec_size = @min(vec_size, remaining);
+
+        for (0..batch_size) |b| {
+            for (0..rows) |r| {
+                const src_idx = b * rows * cols + r * cols + col;
+                const dst_idx = r * batch_size * cols + b * cols + col;
+
+                // Check for special values in this vector
+                var has_special = false;
+                var i: usize = 0;
+                while (i < current_vec_size) : (i += 1) {
+                    const val = tensor.data[src_idx + i];
+                    if (std.math.isNan(val) or std.math.isInf(val)) {
+                        has_special = true;
+                        break;
+                    }
+                }
+
+                if (has_special) {
+                    // Handle scalar-wise for vectors containing special values
+                    for (0..current_vec_size) |idx| {
+                        new_data[dst_idx + idx] = tensor.data[src_idx + idx];
+                    }
+                } else {
+                    // Use SIMD for normal values
+                    var src_batch: [8]f16 align(32) = undefined;
+                    var dst_batch: [8]f16 align(32) = undefined;
+                    var temp_f32: [8]f32 align(32) = undefined;
+
+                    if (current_vec_size == vec_size) {
+                        @memcpy(&src_batch, tensor.data[src_idx..][0..8]);
+                        asm volatile (
+                            \\vmovups (%[src]), %%xmm0
+                            \\vcvtph2ps %%xmm0, %%ymm1
+                            \\vmovups %%ymm1, (%[dst])
+                            :
+                            : [src] "r" (&src_batch),
+                              [dst] "r" (&temp_f32),
+                            : "xmm0", "ymm1", "memory"
+                        );
+                        asm volatile (
+                            \\vmovups (%[src]), %%ymm0
+                            \\vcvtps2ph $0, %%ymm0, %%xmm1
+                            \\vmovups %%xmm1, (%[dst])
+                            :
+                            : [src] "r" (&temp_f32),
+                              [dst] "r" (&dst_batch),
+                            : "ymm0", "xmm1", "memory"
+                        );
+                        @memcpy(new_data[dst_idx..][0..8], &dst_batch);
+                    } else {
+                        @memset(&src_batch, 0);
+                        @memcpy(src_batch[0..current_vec_size], tensor.data[src_idx..][0..current_vec_size]);
+
+                        asm volatile (
+                            \\vmovups (%[src]), %%xmm0
+                            \\vcvtph2ps %%xmm0, %%ymm1
+                            \\vmovups %%ymm1, (%[dst])
+                            :
+                            : [src] "r" (&src_batch),
+                              [dst] "r" (&temp_f32),
+                            : "xmm0", "ymm1", "memory"
+                        );
+                        asm volatile (
+                            \\vmovups (%[src]), %%ymm0
+                            \\vcvtps2ph $0, %%ymm0, %%xmm1
+                            \\vmovups %%xmm1, (%[dst])
+                            :
+                            : [src] "r" (&temp_f32),
+                              [dst] "r" (&dst_batch),
+                            : "ymm0", "xmm1", "memory"
+                        );
+                        @memcpy(new_data[dst_idx..][0..current_vec_size], dst_batch[0..current_vec_size]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn transposeAxesGeneric(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: usize) !void {
+    // Original implementation for the general case
+    var strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+    defer tensor.allocator.free(strides);
+
+    strides[tensor.shape.len - 1] = 1;
+    var i: usize = tensor.shape.len - 1;
+    while (i > 0) : (i -= 1) {
+        strides[i - 1] = strides[i] * tensor.shape[i];
+    }
+
+    var new_shape = try tensor.allocator.alloc(usize, tensor.shape.len);
+    errdefer tensor.allocator.free(new_shape);
+
+    for (tensor.shape, 0..) |dim, idx| {
+        if (idx == dim0) {
+            new_shape[idx] = tensor.shape[dim1];
+        } else if (idx == dim1) {
+            new_shape[idx] = tensor.shape[dim0];
+        } else {
+            new_shape[idx] = dim;
+        }
+    }
+
+    var new_data = try tensor.allocator.alignedAlloc(T, 32, tensor.data.len);
+    errdefer tensor.allocator.free(new_data);
+
+    var new_strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+    defer tensor.allocator.free(new_strides);
+
+    new_strides[tensor.shape.len - 1] = 1;
+    i = tensor.shape.len - 1;
+    while (i > 0) : (i -= 1) {
+        new_strides[i - 1] = new_strides[i] * new_shape[i];
+    }
+
+    var coords = try tensor.allocator.alloc(usize, tensor.shape.len);
+    defer tensor.allocator.free(coords);
+    @memset(coords, 0);
+
+    const total_elements = tensor.data.len;
+    var idx: usize = 0;
+    while (idx < total_elements) : (idx += 1) {
+        var remaining = idx;
+        for (0..tensor.shape.len) |dim| {
+            coords[dim] = remaining / new_strides[dim];
+            remaining = remaining % new_strides[dim];
+        }
+
+        const temp = coords[dim0];
+        coords[dim0] = coords[dim1];
+        coords[dim1] = temp;
+
+        var src_idx: usize = 0;
+        for (0..tensor.shape.len) |dim| {
+            src_idx += coords[dim] * strides[dim];
+        }
+
+        new_data[idx] = tensor.data[src_idx];
+    }
+
     tensor.allocator.free(tensor.data);
     tensor.data = new_data;
     tensor.allocator.free(tensor.shape);
@@ -1976,14 +2288,14 @@ pub fn masklessDotProductAttention(
     const init_start = timer.read();
     var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
     errdefer out.deinit();
-    try printTimeDiff(&timer, init_start, "Output Tensor Initialization");
+    try printTimeDiffVision(&timer, init_start, "Output Tensor Initialization");
 
     // Prepare transposed key for all heads
     const transpose_start = timer.read();
     var key_transpose = try key.copy();
     defer key_transpose.deinit();
     try transposeAxes(f16, &key_transpose, 1, 2);
-    try printTimeDiff(&timer, transpose_start, "Key Transpose");
+    try printTimeDiffVision(&timer, transpose_start, "Key Transpose");
 
     // Track total times for operations across all heads
     var total_slice_time: i128 = 0;
@@ -2055,8 +2367,8 @@ pub fn masklessDotProductAttention(
     try stdout.print("\x1b[91m   Attention Computation: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_attn_time)) / heads_f64 / 1_000_000.0});
     try stdout.print("\x1b[91m   Output Copy: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_copy_time)) / heads_f64 / 1_000_000.0});
 
-    try printTimeDiff(&timer, heads_start, "Total Attention Heads Processing");
-    try printTimeDiff(&timer, total_start, "Total Maskless Attention");
+    try printTimeDiffVision(&timer, heads_start, "Total Attention Heads Processing");
+    try printTimeDiffVision(&timer, total_start, "Total Maskless Attention");
 
     return out;
 }
@@ -2136,6 +2448,62 @@ pub fn masklessDotProductAttention(
 //     }
 // }
 
+// pub fn softmax(tensor: *Tensor(f32), dim: usize, allocator: Allocator) !void {
+//     const dim_size = tensor.shape[dim];
+
+//     // Calculate stride for the specified dimension
+//     var stride: usize = 1;
+//     for (dim + 1..tensor.shape.len) |i| {
+//         stride *= tensor.shape[i];
+//     }
+
+//     // Calculate number of vectors to process
+//     var num_vectors: usize = 1;
+//     for (0..dim) |i| {
+//         num_vectors *= tensor.shape[i];
+//     }
+
+//     var temp_exp = try allocator.alloc(f32, dim_size);
+//     defer allocator.free(temp_exp);
+
+//     // Simple optimizations:
+//     // 1. Use while loops instead of for
+//     // 2. Minimize array bounds checking with pointers
+//     // 3. Let compiler auto-vectorize
+//     // 4. Keep memory access patterns simple
+//     var vec: usize = 0;
+//     while (vec < num_vectors) : (vec += 1) {
+//         const base_idx = vec * dim_size * stride;
+
+//         // Find max
+//         var max: f32 = tensor.data[base_idx];
+//         var i: usize = 1;
+//         while (i < dim_size) : (i += 1) {
+//             const val = tensor.data[base_idx + i * stride];
+//             if (val > max) max = val;
+//         }
+
+//         // Calculate exp and sum
+//         var sum: f32 = 0;
+//         i = 0;
+//         while (i < dim_size) : (i += 1) {
+//             const val = tensor.data[base_idx + i * stride] - max;
+//             // Avoid exp calculation if value too small
+//             temp_exp[i] = if (val > -88.0) @exp(val) else 0;
+//             sum += temp_exp[i];
+//         }
+
+//         // Normalize in one pass if sum > 0
+//         if (sum > 0) {
+//             const inv_sum = 1.0 / sum;
+//             i = 0;
+//             while (i < dim_size) : (i += 1) {
+//                 tensor.data[base_idx + i * stride] = temp_exp[i] * inv_sum;
+//             }
+//         }
+//     }
+// }
+
 pub fn softmax(tensor: *Tensor(f32), dim: usize, allocator: Allocator) !void {
     const dim_size = tensor.shape[dim];
 
@@ -2151,42 +2519,73 @@ pub fn softmax(tensor: *Tensor(f32), dim: usize, allocator: Allocator) !void {
         num_vectors *= tensor.shape[i];
     }
 
+    // Allocate temporary buffer for exponentials
     var temp_exp = try allocator.alloc(f32, dim_size);
     defer allocator.free(temp_exp);
 
-    // Simple optimizations:
-    // 1. Use while loops instead of for
-    // 2. Minimize array bounds checking with pointers
-    // 3. Let compiler auto-vectorize
-    // 4. Keep memory access patterns simple
+    const data = tensor.data.ptr; // Pointer to the tensor data
+
     var vec: usize = 0;
     while (vec < num_vectors) : (vec += 1) {
-        const base_idx = vec * dim_size * stride;
+        const base_offset = vec * dim_size * stride;
 
-        // Find max
-        var max: f32 = tensor.data[base_idx];
-        var i: usize = 1;
-        while (i < dim_size) : (i += 1) {
-            const val = tensor.data[base_idx + i * stride];
-            if (val > max) max = val;
-        }
+        // Optimize for contiguous case (stride == 1)
+        if (stride == 1) {
+            const vec_start = base_offset;
 
-        // Calculate exp and sum
-        var sum: f32 = 0;
-        i = 0;
-        while (i < dim_size) : (i += 1) {
-            const val = tensor.data[base_idx + i * stride] - max;
-            // Avoid exp calculation if value too small
-            temp_exp[i] = if (val > -88.0) @exp(val) else 0;
-            sum += temp_exp[i];
-        }
+            // Find max value in the vector
+            var max: f32 = data[vec_start];
+            var i: usize = 1;
+            while (i < dim_size) : (i += 1) {
+                const val = data[vec_start + i];
+                if (val > max) max = val;
+            }
 
-        // Normalize in one pass if sum > 0
-        if (sum > 0) {
-            const inv_sum = 1.0 / sum;
+            // Calculate exp and sum
+            var sum: f32 = 0;
             i = 0;
             while (i < dim_size) : (i += 1) {
-                tensor.data[base_idx + i * stride] = temp_exp[i] * inv_sum;
+                const val = data[vec_start + i] - max;
+                temp_exp[i] = if (val > -88.0) @exp(val) else 0;
+                sum += temp_exp[i];
+            }
+
+            // Normalize in one pass if sum > 0
+            if (sum > 0) {
+                const inv_sum = 1.0 / sum;
+                i = 0;
+                while (i < dim_size) : (i += 1) {
+                    data[vec_start + i] = temp_exp[i] * inv_sum;
+                }
+            }
+        } else {
+            // Non-contiguous case (stride > 1)
+            var i: usize = 0;
+            var max: f32 = data[base_offset + i * stride];
+            i = 1;
+
+            // Find max value in the vector
+            while (i < dim_size) : (i += 1) {
+                const val = data[base_offset + i * stride];
+                if (val > max) max = val;
+            }
+
+            // Calculate exp and sum
+            var sum: f32 = 0;
+            i = 0;
+            while (i < dim_size) : (i += 1) {
+                const val = data[base_offset + i * stride] - max;
+                temp_exp[i] = if (val > -88.0) @exp(val) else 0;
+                sum += temp_exp[i];
+            }
+
+            // Normalize in one pass if sum > 0
+            if (sum > 0) {
+                const inv_sum = 1.0 / sum;
+                i = 0;
+                while (i < dim_size) : (i += 1) {
+                    data[base_offset + i * stride] = temp_exp[i] * inv_sum;
+                }
             }
         }
     }
@@ -3162,8 +3561,8 @@ pub fn multimasklessDotProductAttention(
     value: Tensor(f16),
     allocator: Allocator,
 ) !Tensor(f16) {
-    // var timer = try Timer.start();
-    // const total_start = timer.read();
+    var timer = try Timer.start();
+    const total_start = timer.read();
 
     const n_heads = query.shape[0];
     const q_len = query.shape[1];
@@ -3174,6 +3573,7 @@ pub fn multimasklessDotProductAttention(
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
     // Initialize output tensor
+    const init_and_cast_time = timer.read();
     var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
     errdefer out.deinit();
 
@@ -3182,58 +3582,78 @@ pub fn multimasklessDotProductAttention(
     defer query_f32.deinit();
     var value_f32 = try value.castWithSimd(f32);
     defer value_f32.deinit();
+    try printTimeDiffVision(&timer, init_and_cast_time, "Init and cast tensors");
 
     // Prepare transposed key for all heads
+    const transpose_time = timer.read();
     var key_transpose = try key.copy();
     defer key_transpose.deinit();
     try transposeAxes(f16, &key_transpose, 1, 2);
     var key_transpose_f32 = try key_transpose.castWithSimd(f32);
     defer key_transpose_f32.deinit();
+    try printTimeDiffVision(&timer, transpose_time, "Transpose key");
 
     // Initialize thread pool and workspaces
+    const pool_init_time = timer.read();
     const thread_count = @min(n_heads, try Thread.getCpuCount());
     var thread_pool = try ThreadPoolContext.init(allocator, thread_count, q_len, head_dim);
     defer thread_pool.deinit();
 
     var threads = try allocator.alloc(Thread, thread_count);
     defer allocator.free(threads);
+    try printTimeDiffVision(&timer, pool_init_time, "Init thread pool");
 
     // Divide work among threads
+    const divide_work_time = timer.read();
     const heads_per_thread = n_heads / thread_count;
     const remaining_heads = n_heads % thread_count;
 
     var current_head: usize = 0;
     var thread_contexts = try allocator.alloc(AttnThreadContext, thread_count);
     defer allocator.free(thread_contexts);
+    try printTimeDiffVision(&timer, divide_work_time, "Divide work among threads");
 
     // Thread worker function
     const worker = struct {
         fn process(ctx: AttnThreadContext) !void {
+            var processtimer = try Timer.start();
             const workspace = ctx.workspace;
 
             for (ctx.start_head..ctx.end_head) |h| {
                 // Get slices for this head using pre-allocated workspace
+                const copy_head_time = processtimer.read();
                 try copyHeadData(f32, &workspace.query_head, ctx.query, h);
                 try copyHeadData(f32, &workspace.key_head, ctx.key, h);
                 try copyHeadData(f32, &workspace.value_head, ctx.value, h);
+                try printTimeDiffVision(&processtimer, copy_head_time, "Copy head data");
 
                 // Calculate QK^T directly in f32 using workspace tensors
+                const matmul_time = processtimer.read();
                 workspace.attn_weights = try sgemm.matmul(f32, workspace.query_head, workspace.key_head, workspace.allocator);
+                try printTimeDiffVision(&processtimer, matmul_time, "Matmul QK^T");
 
                 // Apply scaling and softmax in-place
+                const scale_time = processtimer.read();
                 for (workspace.attn_weights.data) |*w| {
                     w.* *= ctx.scale;
                 }
+                try printTimeDiffVision(&processtimer, scale_time, "Scale Time");
+                const softmax_time = processtimer.read();
                 try softmax(&workspace.attn_weights, 1, workspace.allocator);
+                try printTimeDiffVision(&processtimer, softmax_time, "Softmax");
 
                 // Compute attention output using workspace
+                const attn_time = processtimer.read();
                 workspace.out_head = try sgemm.matmul(f32, workspace.attn_weights, workspace.value_head, workspace.allocator);
+                try printTimeDiffVision(&processtimer, attn_time, "Matmul attention output");
 
                 // Copy to output tensor with casting
+                const copy_out_time = processtimer.read();
                 const out_slice = h * ctx.q_len * ctx.head_dim;
                 for (0..ctx.q_len * ctx.head_dim) |i| {
                     ctx.out.data[out_slice + i] = @floatCast(workspace.out_head.data[i]);
                 }
+                try printTimeDiffVision(&processtimer, copy_out_time, "Copy output data");
             }
         }
     }.process;
@@ -3266,7 +3686,7 @@ pub fn multimasklessDotProductAttention(
         thread.join();
     }
 
-    // try printTimeDiff(&timer, total_start, "Total Maskless Attention");
+    try printTimeDiffVision(&timer, total_start, "Total Maskless Attention");
 
     return out;
 }
