@@ -3,7 +3,7 @@ const Timer = std.time.Timer;
 
 // Configuration struct to control logging
 const config = struct {
-    pub var enableLogging: bool = true; // Set this to false to disable output
+    pub var enableLogging: bool = false; // Set this to false to disable output
 };
 
 pub fn printTimeDiff(timer: *Timer, start_time: i128, step_name: []const u8) !void {
