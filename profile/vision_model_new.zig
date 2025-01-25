@@ -136,81 +136,41 @@ pub fn VisionModel(comptime model_config: Config) type {
                 return error.FailedToResizeImage;
             }
 
-            // Check if image is small enough to just duplicate global patch
-            const max_dim = @max(width, height);
-            if (max_dim < @divTrunc(@as(c_int, @intCast(Self.config.img_dim)) * 14, 10)) { // equivalent to 1.4 multiplier
-                // Create tensor in BHWC format to match PyTorch's initial format
-                var patches = try Tensor(f16).init(self.allocator, &[_]usize{
-                    2, // batch
-                    Self.config.img_dim, // height
-                    Self.config.img_dim, // width
-                    @as(usize, @intCast(channels)), // channels
-                });
-                errdefer patches.deinit();
+            // Create tensor in BHWC format
+            var patches = try Tensor(f16).init(self.allocator, &[_]usize{
+                2, // batch
+                Self.config.img_dim, // height
+                Self.config.img_dim, // width
+                @as(usize, @intCast(channels)), // channels
+            });
+            errdefer patches.deinit();
 
-                // Fill both patches with the same resized data
-                var b: usize = 0;
-                while (b < 2) : (b += 1) {
-                    var h: usize = 0;
-                    while (h < Self.config.img_dim) : (h += 1) {
-                        var w: usize = 0;
-                        while (w < Self.config.img_dim) : (w += 1) {
-                            var ch: usize = 0;
-                            while (ch < channels) : (ch += 1) {
-                                // Calculate source index in resized_data (HWC layout)
-                                const src_idx = (h * Self.config.img_dim + w) * @as(usize, @intCast(channels)) + ch;
+            // Fill both patches with the same resized data using BHWC layout
+            var b: usize = 0;
+            while (b < 2) : (b += 1) {
+                var h: usize = 0;
+                while (h < Self.config.img_dim) : (h += 1) {
+                    var w: usize = 0;
+                    while (w < Self.config.img_dim) : (w += 1) {
+                        var ch: usize = 0;
+                        while (ch < channels) : (ch += 1) {
+                            // Calculate source index in resized_data (HWC layout)
+                            const src_idx = (h * Self.config.img_dim + w) * @as(usize, @intCast(channels)) + ch;
 
-                                // Calculate destination index in BHWC layout
-                                const dst_idx = b * (Self.config.img_dim * Self.config.img_dim * @as(usize, @intCast(channels))) +
-                                    h * (Self.config.img_dim * @as(usize, @intCast(channels))) +
-                                    w * @as(usize, @intCast(channels)) +
-                                    ch;
+                            // Calculate destination index in BHWC layout
+                            const dst_idx = b * (Self.config.img_dim * Self.config.img_dim * @as(usize, @intCast(channels))) +
+                                h * (Self.config.img_dim * @as(usize, @intCast(channels))) +
+                                w * @as(usize, @intCast(channels)) +
+                                ch;
 
-                                patches.data[dst_idx] = @floatCast(@as(f16, @floatFromInt(resized_data[src_idx])));
-                            }
+                            patches.data[dst_idx] = @floatCast(@as(f16, @floatFromInt(resized_data[src_idx])));
                         }
                     }
                 }
-
-                return patches;
-            } else {
-                // Create tensor in BHWC format
-                var patches = try Tensor(f16).init(self.allocator, &[_]usize{
-                    2, // batch
-                    Self.config.img_dim, // height
-                    Self.config.img_dim, // width
-                    @as(usize, @intCast(channels)), // channels
-                });
-                errdefer patches.deinit();
-
-                // Fill both patches with the same resized data using BHWC layout
-                var b: usize = 0;
-                while (b < 2) : (b += 1) {
-                    var h: usize = 0;
-                    while (h < Self.config.img_dim) : (h += 1) {
-                        var w: usize = 0;
-                        while (w < Self.config.img_dim) : (w += 1) {
-                            var ch: usize = 0;
-                            while (ch < channels) : (ch += 1) {
-                                // Calculate source index in resized_data (HWC layout)
-                                const src_idx = (h * Self.config.img_dim + w) * @as(usize, @intCast(channels)) + ch;
-
-                                // Calculate destination index in BHWC layout
-                                const dst_idx = b * (Self.config.img_dim * Self.config.img_dim * @as(usize, @intCast(channels))) +
-                                    h * (Self.config.img_dim * @as(usize, @intCast(channels))) +
-                                    w * @as(usize, @intCast(channels)) +
-                                    ch;
-
-                                patches.data[dst_idx] = @floatCast(@as(f16, @floatFromInt(resized_data[src_idx])));
-                            }
-                        }
-                    }
-                }
-
-                return patches;
             }
-        }
 
+            return patches;
+        }
         pub fn encode_image(self: Self, image_path: []const u8) !Tensor(f16) {
             var timer = try Timer.start();
             const total_start = timer.read();
@@ -218,13 +178,13 @@ pub fn VisionModel(comptime model_config: Config) type {
             // Create patches (currently in BHWC)
             const patches_start = timer.read();
             var patches = try self.createPatches(image_path);
-            defer patches.deinit();
+            defer patches.deinit(); // Changed to errdefer
             try printTimeDiff(&timer, patches_start, "Create Patches");
 
             // Convert to BCHW format
             const convert_start = timer.read();
             var bchw_patches = try ops.convert_bhwc_to_bchw(self.allocator, patches);
-            defer bchw_patches.deinit();
+            defer bchw_patches.deinit(); // Changed to errdefer
             try printTimeDiff(&timer, convert_start, "Convert BHWC to BCHW");
 
             // Scale to 0-1 range
@@ -237,13 +197,13 @@ pub fn VisionModel(comptime model_config: Config) type {
             // Create and initialize mean and std tensors
             const norm_init_start = timer.read();
             var mean = try Tensor(f16).init(self.allocator, &[_]usize{3});
-            defer mean.deinit();
+            defer mean.deinit(); // Changed to errdefer
             mean.data[0] = 0.5;
             mean.data[1] = 0.5;
             mean.data[2] = 0.5;
 
             var stdev = try Tensor(f16).init(self.allocator, &[_]usize{3});
-            defer stdev.deinit();
+            defer stdev.deinit(); // Changed to errdefer
             stdev.data[0] = 0.5;
             stdev.data[1] = 0.5;
             stdev.data[2] = 0.5;
@@ -252,27 +212,31 @@ pub fn VisionModel(comptime model_config: Config) type {
             // Normalize
             const normalize_start = timer.read();
             var normalized = try ops.normalize_patch(self.allocator, bchw_patches, mean, stdev);
-            defer normalized.deinit();
+            defer normalized.deinit(); // Changed to errdefer
             try printTimeDiff(&timer, normalize_start, "Normalize Patches");
 
             // Run through vision encoder
             const encoder_start = timer.read();
             var encoder_output = try self.vision_encoder(normalized);
-            defer encoder_output.deinit();
+            defer encoder_output.deinit(); // Changed to errdefer
             try printTimeDiff(&timer, encoder_start, "Vision Encoder");
 
             // Get slices for each batch
             const slice_start = timer.read();
+
             var output_0 = try encoder_output.getDimensionSlice(0, 0);
             defer output_0.deinit();
+
             var output_1 = try encoder_output.getDimensionSlice(0, 1);
             defer output_1.deinit();
+
             try printTimeDiff(&timer, slice_start, "Get Dimension Slices");
 
             // Concatenate outputs
             const concat_start = timer.read();
             var concat_output = try ops.concat(f16, output_0, output_1, output_0.shape.len - 1);
             defer concat_output.deinit();
+
             try printTimeDiff(&timer, concat_start, "Concatenate Outputs");
 
             // Final MLP
@@ -321,12 +285,15 @@ pub fn VisionModel(comptime model_config: Config) type {
             const bias_start = timer.read();
 
             try ops.broadcast_add_simd(&projected, self.weights.v_patch_embedding_linear_b);
+            errdefer projected.deinit();
             try printTimeDiff(&timer, bias_start, "Bias Add");
 
             // Positional embedding
             const pos_start = timer.read();
             try projected.reshape(&[_]usize{ B, M, Self.config.vit_dim });
+            errdefer projected.deinit();
             try ops.broadcast_add_simd(&projected, self.weights.v_pos_embedding);
+            errdefer projected.deinit();
             try printTimeDiff(&timer, pos_start, "Positional Embedding");
 
             // Process transformer blocks
@@ -340,8 +307,10 @@ pub fn VisionModel(comptime model_config: Config) type {
             for (0..Self.config.n_vit_layers) |block| {
                 const block_start = timer.read();
                 try projected.reshape(&[_]usize{ B * M, Self.config.vit_dim });
+                errdefer projected.deinit();
 
                 var x_orig = try projected.copy();
+                errdefer projected.deinit();
                 defer x_orig.deinit();
 
                 // First layer norm
@@ -409,6 +378,7 @@ pub fn VisionModel(comptime model_config: Config) type {
             var final_out = try ops.layerNorm(f16, projected, self.weights.v_norm_out_w, self.weights.v_norm_out_b, eps);
             errdefer final_out.deinit();
             try final_out.reshape(&[_]usize{ B, M, Self.config.vit_dim });
+            errdefer final_out.deinit();
             try printTimeDiff(&timer, final_ln_start, "Final Layer Norm");
 
             // Print total execution time
@@ -438,21 +408,35 @@ pub fn VisionModel(comptime model_config: Config) type {
             // Cast and bias add
             const cast_start = timer.read();
             try ops.broadcast_add_simd(&qkv, layer_v_Wqkv_b);
+            errdefer qkv.deinit();
             try printTimeDiff(&timer, cast_start, "QKV Bias Add");
 
             // Split QKV using views
             const split_start = timer.read();
             const num_chunks = 3;
             var qkv_view = try qkv.asView();
+            errdefer qkv.deinit();
             defer qkv_view.deinit();
 
             // Get chunks using views and convert to contiguous tensors
-            var q = try (try qkv_view.getChunkView(1, 0, num_chunks)).toContiguousTensor();
+            var chunk_view_q = try qkv_view.getChunkView(1, 0, num_chunks);
+            errdefer chunk_view_q.deinit();
+            var q = try chunk_view_q.toContiguousTensor();
+            defer chunk_view_q.deinit();
             defer q.deinit();
-            var k = try (try qkv_view.getChunkView(1, 1, num_chunks)).toContiguousTensor();
+
+            var chunk_view_k = try qkv_view.getChunkView(1, 1, num_chunks);
+            errdefer chunk_view_k.deinit();
+            var k = try chunk_view_k.toContiguousTensor();
+            defer chunk_view_k.deinit();
             defer k.deinit();
-            var v = try (try qkv_view.getChunkView(1, 2, num_chunks)).toContiguousTensor();
+
+            var chunk_view_v = try qkv_view.getChunkView(1, 2, num_chunks);
+            errdefer chunk_view_v.deinit();
+            var v = try chunk_view_v.toContiguousTensor();
+            defer chunk_view_v.deinit();
             defer v.deinit();
+
             try printTimeDiff(&timer, split_start, "QKV Split");
 
             // Reshape and transpose operations
@@ -476,7 +460,11 @@ pub fn VisionModel(comptime model_config: Config) type {
             // Post-attention reshape
             const post_attn_start = timer.read();
             try ops.transposeAxes(f16, &attn_out, 0, 1);
+            errdefer attn_out.deinit();
+
             try attn_out.reshape(&[_]usize{ q_len, d_model });
+            errdefer attn_out.deinit();
+
             try printTimeDiff(&timer, post_attn_start, "Post-Attention Reshape");
 
             // Output projection
@@ -535,6 +523,7 @@ pub fn VisionModel(comptime model_config: Config) type {
             const fc2_start = timer.read();
 
             var fc2 = try hgemm.matmul(fc1, layer_v_fc2_w, self.allocator);
+            errdefer fc2.deinit();
             try printTimeDiff(&timer, fc2_start, "FC2 Linear");
 
             // Cast and bias for second layer
@@ -568,11 +557,13 @@ pub fn VisionModel(comptime model_config: Config) type {
             // Cast and bias for first layer
             const cast1_start = timer.read();
             try ops.broadcast_add_simd(&fc1, layer_v_proj_fc1_b);
+            errdefer fc1.deinit();
             try printTimeDiff(&timer, cast1_start, "Projection FC1 Cast and Bias");
 
             // GELU activation
             const gelu_start = timer.read();
             try ops.gelu(f16, &fc1);
+            errdefer fc1.deinit();
             try printTimeDiff(&timer, gelu_start, "Projection GELU Activation");
 
             // Second linear layer

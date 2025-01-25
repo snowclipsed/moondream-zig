@@ -222,8 +222,10 @@ pub fn TextModel(comptime model_config: Config) type {
             // Print total execution time
             // try printTimeDiff(&timer, total_start, "Total Text Decoder");
 
+            var final_output = try hidden.copy();
+            errdefer final_output.deinit();
             return .{
-                .output = try hidden.copy(),
+                .output = final_output,
                 .cache = new_cache,
             };
         }
@@ -258,11 +260,20 @@ pub fn TextModel(comptime model_config: Config) type {
             defer qkv_view.deinit();
 
             // Get chunks using views and convert to contiguous tensors
-            var q = try (try qkv_view.getChunkView(1, 0, num_chunks)).toContiguousTensor();
+            var q_chunk_view = try qkv_view.getChunkView(1, 0, num_chunks);
+            defer q_chunk_view.deinit();
+            var q = try q_chunk_view.toContiguousTensor();
             defer q.deinit();
-            var k = try (try qkv_view.getChunkView(1, 1, num_chunks)).toContiguousTensor();
+
+            var k_chunk_view = try qkv_view.getChunkView(1, 1, num_chunks);
+            defer k_chunk_view.deinit();
+            var k = try k_chunk_view.toContiguousTensor();
             defer k.deinit();
-            var v = try (try qkv_view.getChunkView(1, 2, num_chunks)).toContiguousTensor();
+
+            var v_chunk_view = try qkv_view.getChunkView(1, 2, num_chunks);
+            defer v_chunk_view.deinit();
+            var v = try v_chunk_view.toContiguousTensor();
+            defer v.deinit();
             try printTimeDiff(&timer, split_start, "QKV Split");
 
             // Reshape and transpose operations
@@ -302,6 +313,7 @@ pub fn TextModel(comptime model_config: Config) type {
                 position_ids,
                 rot_dim,
             );
+            errdefer kr.deinit();
             try printTimeDiff(&timer, rotary_start, "Rotary Embeddings");
 
             // KV cache handling
@@ -339,11 +351,14 @@ pub fn TextModel(comptime model_config: Config) type {
                 cache.current_len = new_len;
 
                 const active_cache = try cache.getActiveCache();
+                errdefer {
+                    active_cache.key.deinit();
+                    active_cache.value.deinit();
+                }
                 k_final = active_cache.key;
                 v_final = active_cache.value;
 
                 kr.deinit();
-                v.deinit();
             } else {
                 k_final = try kr.copy();
                 v_final = try v.copy();
@@ -483,8 +498,16 @@ pub fn KVCache(comptime model_config: Config) type {
             var layers = try allocator.alloc(LayerCache, n_layers);
             errdefer allocator.free(layers);
 
-            inline for (0..n_layers) |i| {
+            var initialized: usize = 0;
+            errdefer {
+                for (layers[0..initialized]) |*layer| {
+                    layer.deinit();
+                }
+            }
+
+            for (0..n_layers) |i| {
                 layers[i] = try LayerCache.init(allocator);
+                initialized += 1;
             }
 
             return Self{
@@ -514,6 +537,7 @@ pub fn KVCache(comptime model_config: Config) type {
             pub fn deinit(self: *LayerCache) void {
                 self.key.deinit();
                 self.value.deinit();
+                self.* = undefined; // Add this
             }
 
             pub fn getActiveCache(self: *LayerCache) !struct { key: Tensor(f16), value: Tensor(f16) } {
@@ -529,6 +553,7 @@ pub fn KVCache(comptime model_config: Config) type {
                     Slice.from(0, self.current_len),
                     Slice.full(),
                 });
+
                 errdefer value_slice.deinit();
 
                 return .{ .key = key_slice, .value = value_slice };
@@ -540,6 +565,7 @@ pub fn KVCache(comptime model_config: Config) type {
                 layer.deinit();
             }
             self.allocator.free(self.layers);
+            self.* = undefined; // Add this
         }
 
         pub fn reset(self: *Self) void {
