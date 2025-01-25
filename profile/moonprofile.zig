@@ -58,8 +58,15 @@ pub fn main() !void {
 
     // Initialize allocator
     const init_start = timer.read();
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var gpa = std.heap.GeneralPurposeAllocator(.{
+        .stack_trace_frames = 10,
+    }){};
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            std.debug.print("Memory leaked\n", .{});
+        }
+    }
     const allocator = gpa.allocator();
 
     // var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -106,7 +113,8 @@ pub fn main() !void {
 
     // Load model weights
     const weights_start = timer.read();
-    const weights = try Weights.init(config, bin_path, allocator);
+    var weights = try Weights.init(config, bin_path, allocator);
+    defer weights.deinit();
     try printTimeDiff(weights_start, timer.read(), "Model Weights Loading");
 
     std.debug.print("\n\n", .{});
@@ -139,7 +147,7 @@ pub fn main() !void {
     const token_init_start = timer.read();
     var token_ids = std.ArrayList(u32).init(allocator);
     defer token_ids.deinit();
-    try token_ids.appendSlice(&[_]u32{ 50256, 198, 198, 24361, 25, 39373, 4892, 262, 2939, 198, 198, 33706, 25 });
+    try token_ids.appendSlice(&[_]u32{ 50256, 198, 198, 24361, 25, 39373, 4892, 262, 2939, 287, 1790, 198, 198, 33706, 25 }); //describe the image in short
 
     var input_ids = try Tensor(u32).init(allocator, &[_]usize{token_ids.items.len});
     defer input_ids.deinit();
