@@ -7,7 +7,17 @@ const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
 const time = std.time;
 
-const T: usize = 160;
+comptime {
+    @setFloatMode(.optimized);
+}
+
+// Compile-time optimizations for tuning parameters
+const T: usize = blk: {
+    // const cache_line = atomic.cache_line;
+    const ideal_tile = 160; // Original tile size
+    break :blk (ideal_tile + 7) & ~@as(usize, 7); // Ensure multiple of 8
+};
+
 const V: usize = 8;
 const CACHE_LINE_SIZE: usize = atomic.cache_line;
 const CHUNK_SIZE: usize = 1;
@@ -23,7 +33,7 @@ const ThreadLocalData = struct {
 const ThreadContext = struct {
     A: []const f16,
     B: []const f16,
-    C: []f16, // Changed to f16 output
+    C: []f16,
     M: usize,
     N: usize,
     K: usize,
@@ -34,6 +44,7 @@ const ThreadContext = struct {
 };
 
 fn workerThread(ctx: ThreadContext) void {
+    @setRuntimeSafety(false);
     var local_C: [T][T]f32 align(AVX2_ALIGNMENT) = undefined;
 
     while (true) {
@@ -62,7 +73,7 @@ fn workerThread(ctx: ThreadContext) void {
                 computeTile(ctx, &local_C, i_start, j_start, k, i_end, j_end, k_end);
             }
 
-            // Write directly to f16 output
+            // Write directly to f16 output with runtime safety disabled
             for (i_start..i_end) |ii| {
                 const row_offset = ii * ctx.N;
                 const local_row = ii - i_start;
@@ -85,6 +96,7 @@ fn computeTile(
     j_end: usize,
     k_end: usize,
 ) void {
+    @setRuntimeSafety(false);
     var A_local: [T][T]f32 align(32) = undefined;
     var B_local: [T][T]f32 align(32) = undefined;
 
@@ -92,7 +104,7 @@ fn computeTile(
     const i_size = i_end - i_start;
     const j_size = j_end - j_start;
 
-    // Load and convert A to f32
+    // Load and convert A to f32 with runtime safety disabled
     for (0..i_size) |i| {
         const row_offset = (i_start + i) * ctx.K;
         for (0..k_size) |k| {
@@ -101,7 +113,7 @@ fn computeTile(
         }
     }
 
-    // Load and convert B to f32
+    // Load and convert B to f32 with runtime safety disabled
     for (0..k_size) |k| {
         const row_offset = (k_start + k) * ctx.N;
         for (0..j_size) |j| {
@@ -174,6 +186,7 @@ fn computeTile(
 }
 
 pub fn matmul(a: Tensor(f16), b: Tensor(f16), allocator: Allocator) !Tensor(f16) {
+    @setRuntimeSafety(false);
     const A_shape = a.shape;
     const B_shape = b.shape;
 
@@ -191,7 +204,6 @@ pub fn matmul(a: Tensor(f16), b: Tensor(f16), allocator: Allocator) !Tensor(f16)
         return error.IncompatibleTensorShapes;
     }
 
-    // Create output tensor
     var result = try Tensor(f16).init(allocator, &[_]usize{ M, N });
     errdefer result.deinit();
 
@@ -222,8 +234,14 @@ pub fn matmul(a: Tensor(f16), b: Tensor(f16), allocator: Allocator) !Tensor(f16)
         .shared_counter = &shared_data,
     };
 
+    const WorkerFn = struct {
+        fn worker(ctx: ThreadContext) void {
+            workerThread(ctx);
+        }
+    };
+
     for (0..num_threads) |_| {
-        try thread_pool.append(try std.Thread.spawn(.{}, workerThread, .{context}));
+        try thread_pool.append(try std.Thread.spawn(.{}, WorkerFn.worker, .{context}));
     }
 
     for (thread_pool.items) |thread| thread.join();

@@ -20,8 +20,9 @@ const ThreadLocalData = struct {
     _padding: [CACHE_LINE_SIZE - @sizeOf(atomic.Value(usize))]u8 = undefined,
 };
 
+const mode = std.builtin.FloatMode.optimized;
 comptime {
-    @setFloatMode(.optimized);
+    @setFloatMode(mode);
 }
 
 const ThreadContext = struct {

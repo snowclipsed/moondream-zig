@@ -16,11 +16,11 @@ const expectError = testing.expectError;
 const Timer = std.time.Timer;
 const printTimeDiff = @import("timeattention.zig").printTimeDiff;
 
+const mode = std.builtin.FloatMode.optimized;
 comptime {
-    @setFloatMode(.optimized);
+    @setFloatMode(mode);
 }
 
-const mode = @import("std").builtin.FloatMode;
 // Tensor Operations
 pub fn transpose(comptime T: type, tensor: *Tensor(T)) !void {
     if (tensor.shape.len != 2) return error.UnsupportedDimension;

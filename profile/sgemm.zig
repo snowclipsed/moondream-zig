@@ -10,14 +10,18 @@ comptime {
     @setFloatMode(.optimized);
 }
 
-// tuning parameters
-pub const Tile: usize = 168; // Tile size for matrix blocking
+// Compile-time optimizations for tuning parameters
+pub const Tile: usize = blk: {
+    const ideal_tile = 168; // Original tile size
+    break :blk (ideal_tile + 7) & ~@as(usize, 7); // Ensure multiple of 8
+};
+
 pub const Vec: usize = 8; // Vector size for SIMD operations
 
 const CACHE_LINE_SIZE: usize = atomic.cache_line;
 const CHUNK_SIZE: usize = 1;
 const AVX2_ALIGNMENT = 32;
-const MICRO_KERNEL_SIZE: usize = Vec; // Match micro-kernel to vector size
+const MICRO_KERNEL_SIZE: usize = Vec;
 
 const Vec8f = @Vector(8, f32);
 
@@ -48,7 +52,7 @@ pub fn matmul(comptime T: type, a: Tensor(T), b: Tensor(T), allocator: Allocator
     }
 
     // Use optimized implementation for f32
-    if (T == f32) {
+    if (comptime T == f32) {
         return optimizedMatmulF32(a, b, allocator);
     }
 
@@ -61,14 +65,16 @@ pub fn matmul(comptime T: type, a: Tensor(T), b: Tensor(T), allocator: Allocator
     var result = try Tensor(T).init(allocator, &result_shape);
     errdefer result.deinit();
 
-    // Initialize result to zero
     @memset(std.mem.sliceAsBytes(result.data), 0);
 
     // Simple triple-loop matrix multiplication
-    for (0..M) |i| {
-        for (0..N) |j| {
+    comptime var i: usize = 0;
+    inline while (i < M) : (i += 1) {
+        comptime var j: usize = 0;
+        inline while (j < N) : (j += 1) {
             var sum: T = 0;
-            for (0..K) |k| {
+            comptime var k: usize = 0;
+            inline while (k < K) : (k += 1) {
                 sum += a.data[i * K + k] * b.data[k * N + j];
             }
             result.data[i * N + j] = sum;
@@ -79,6 +85,8 @@ pub fn matmul(comptime T: type, a: Tensor(T), b: Tensor(T), allocator: Allocator
 }
 
 fn optimizedMatmulF32(a: Tensor(f32), b: Tensor(f32), allocator: Allocator) !Tensor(f32) {
+    @setRuntimeSafety(false); // Disable bounds checking in release mode
+
     const M = a.shape[0];
     const N = b.shape[1];
     const K = a.shape[1];
@@ -87,25 +95,19 @@ fn optimizedMatmulF32(a: Tensor(f32), b: Tensor(f32), allocator: Allocator) !Ten
     var result = try Tensor(f32).init(allocator, &result_shape);
     errdefer result.deinit();
 
-    // Initialize result to zero
     @memset(result.data, 0);
 
-    // Calculate tile grid dimensions
     const tiles_M = (M + Tile - 1) / Tile;
     const tiles_N = (N + Tile - 1) / Tile;
     const total_tiles = tiles_M * tiles_N;
 
-    // Initialize shared atomic counter
     var shared_data = ThreadLocalData{ .current_index = atomic.Value(usize).init(0) };
 
-    // Get number of CPU cores
     const num_threads = try std.Thread.getCpuCount();
 
-    // Create thread pool
     var thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, num_threads);
     defer thread_pool.deinit();
 
-    // Create thread context
     const context = ThreadContext{
         .a = a.data,
         .b = b.data,
@@ -119,7 +121,6 @@ fn optimizedMatmulF32(a: Tensor(f32), b: Tensor(f32), allocator: Allocator) !Ten
         .shared_counter = &shared_data,
     };
 
-    // Spawn worker threads
     const WorkerFn = struct {
         fn worker(ctx: ThreadContext) void {
             workerThread(ctx);
@@ -130,7 +131,6 @@ fn optimizedMatmulF32(a: Tensor(f32), b: Tensor(f32), allocator: Allocator) !Ten
         try thread_pool.append(try std.Thread.spawn(.{}, WorkerFn.worker, .{context}));
     }
 
-    // Wait for all threads to complete
     for (thread_pool.items) |thread| {
         thread.join();
     }
@@ -139,6 +139,7 @@ fn optimizedMatmulF32(a: Tensor(f32), b: Tensor(f32), allocator: Allocator) !Ten
 }
 
 fn workerThread(ctx: ThreadContext) void {
+    @setRuntimeSafety(false);
     var local_C: [Tile][Tile]f32 align(AVX2_ALIGNMENT) = undefined;
 
     while (true) {
@@ -162,9 +163,10 @@ fn workerThread(ctx: ThreadContext) void {
             var k: usize = 0;
             while (k < ctx.K) : (k += Tile) {
                 const k_end = @min(k + Tile, ctx.K);
-                microKernelAVX2(ctx, &local_C, i_start, j_start, k, i_end, j_end, k_end);
+                @call(.always_inline, microKernelAVX2, .{ ctx, &local_C, i_start, j_start, k, i_end, j_end, k_end });
             }
 
+            // Update result matrix
             for (i_start..i_end) |ii| {
                 const row_offset = ii * ctx.N;
                 const local_row = ii - i_start;
@@ -172,7 +174,6 @@ fn workerThread(ctx: ThreadContext) void {
                 var j_idx = j_start;
                 while (j_idx + Vec <= j_end) : (j_idx += Vec) {
                     const vec_idx = j_idx - j_start;
-
                     const c_vec = Vec8f{
                         local_C[local_row][vec_idx],
                         local_C[local_row][vec_idx + 1],
@@ -219,6 +220,7 @@ fn microKernelAVX2(
     j_end: usize,
     k_end: usize,
 ) void {
+    @setRuntimeSafety(false);
     var A_local: [Tile][Tile]f32 align(32) = undefined;
     var B_local: [Tile][Tile]f32 align(32) = undefined;
 
@@ -226,6 +228,7 @@ fn microKernelAVX2(
     const i_size = i_end - i_start;
     const j_size = j_end - j_start;
 
+    // Load A matrix block
     for (0..i_size) |i| {
         const src_idx = (i_start + i) * ctx.K + k_start;
         for (0..k_size) |k| {
@@ -233,6 +236,7 @@ fn microKernelAVX2(
         }
     }
 
+    // Load B matrix block
     for (0..k_size) |k| {
         const src_idx = (k_start + k) * ctx.N + j_start;
         for (0..j_size) |j| {
@@ -303,69 +307,6 @@ fn microKernelAVX2(
         }
     }
 }
-// test "optimized matmul benchmark" {
-//     var arena = std.heap.ArenaAllocator.init(testing.allocator);
-//     defer arena.deinit();
-//     const allocator = arena.allocator();
-
-//     const sizes = [_]struct { m: usize, n: usize, k: usize }{
-//         .{ .m = 256, .n = 256, .k = 256 },
-//         .{ .m = 512, .n = 512, .k = 512 },
-//         .{ .m = 1024, .n = 1024, .k = 1024 },
-//         .{ .m = 1024, .n = 2048, .k = 1024 },
-//         .{ .m = 2048, .n = 2048, .k = 2048 },
-//     };
-//     const iterations = 5;
-
-//     std.debug.print("\nT = {d} \nV = {d}\n", .{ T, V });
-//     std.debug.print("Number of threads = {d}\n", .{try std.Thread.getCpuCount()});
-
-//     for (sizes) |size| {
-//         const shape_a = [_]usize{ size.m, size.k };
-//         const shape_b = [_]usize{ size.k, size.n };
-
-//         var a = try Tensor(f32).init(allocator, &shape_a);
-//         defer a.deinit();
-//         var b = try Tensor(f32).init(allocator, &shape_b);
-//         defer b.deinit();
-
-//         // Initialize with random data
-//         var prng = std.rand.DefaultPrng.init(0);
-//         var random = prng.random();
-//         for (a.data) |*val| val.* = random.float(f32);
-//         for (b.data) |*val| val.* = random.float(f32);
-
-//         // Warmup run
-//         {
-//             var warmup = try matmul(f32, a, b, allocator);
-//             defer warmup.deinit();
-//         }
-
-//         var gflops_array = try allocator.alloc(f64, iterations);
-//         defer allocator.free(gflops_array);
-
-//         for (0..iterations) |i| {
-//             var timer = try std.time.Timer.start();
-//             var result = try matmul(f32, a, b, allocator);
-//             defer result.deinit();
-//             const elapsed_ns = timer.read();
-
-//             const opers = 2.0 * @as(f64, @floatFromInt(size.m * size.n * size.k));
-//             const seconds = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
-//             gflops_array[i] = opers / seconds / 1e9;
-//         }
-
-//         // Calculate average GFLOPS
-//         var total_gflops: f64 = 0;
-//         for (gflops_array) |gflops| {
-//             total_gflops += gflops;
-//         }
-//         const avg_gflops = total_gflops / @as(f64, @floatFromInt(iterations));
-
-//         std.debug.print("Matrix size: {d}x{d}x{d}, GFLOPS: {d:.2}\n", .{ size.m, size.n, size.k, avg_gflops });
-//     }
-// }
-
 test "matmul basic functionality" {
     const allocator = testing.allocator;
 
