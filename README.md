@@ -1,2 +1,2 @@
 # mooondream-zig
-An LLM visualizer in zig.
+Moondream inference in zig!
