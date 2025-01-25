@@ -43,7 +43,7 @@ const ThreadContext = struct {
     shared_counter: *ThreadLocalData,
 };
 
-pub fn matmulInPlace(
+pub fn matmul(
     comptime T: type,
     a: Tensor(T),
     b: Tensor(T),
@@ -325,7 +325,7 @@ test "matmul basic functionality" {
 
         var result = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
         defer result.deinit();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
 
         // Compare with known result
         try testing.expectApproxEqAbs(result.data[0], 19.0, 1e-6);
@@ -350,7 +350,7 @@ test "matmul edge cases" {
 
         var result = try Tensor(f32).init(allocator, &[_]usize{ 1, 1 });
         defer result.deinit();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
 
         try testing.expectApproxEqAbs(result.data[0], 12.0, 1e-6);
     }
@@ -372,7 +372,7 @@ test "matmul edge cases" {
 
         var result = try Tensor(f32).init(allocator, &[_]usize{ 3, 3 });
         defer result.deinit();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
 
         try testing.expectEqual(result.shape[0], @as(usize, 3));
         try testing.expectEqual(result.shape[1], @as(usize, 3));
@@ -390,7 +390,7 @@ test "matmul edge cases" {
 
         var result = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
         defer result.deinit();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
 
         for (result.data) |val| {
             try testing.expectEqual(val, 0);
@@ -411,7 +411,7 @@ test "matmul error cases" {
         var result = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
         defer result.deinit();
 
-        try testing.expectError(error.ShapeMismatch, matmulInPlace(f32, a, b, &result, allocator));
+        try testing.expectError(error.ShapeMismatch, matmul(f32, a, b, &result, allocator));
     }
 
     // Test case 2: Invalid dimensions
@@ -424,7 +424,7 @@ test "matmul error cases" {
         var result = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
         defer result.deinit();
 
-        try testing.expectError(error.InvalidDimensions, matmulInPlace(f32, a, b, &result, allocator));
+        try testing.expectError(error.InvalidDimensions, matmul(f32, a, b, &result, allocator));
     }
 }
 
@@ -455,7 +455,7 @@ test "matmul correctness against reference" {
         // Compute using tiled matmul
         var result = try Tensor(f32).init(allocator, &[_]usize{ M, N });
         defer result.deinit();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
 
         // Compute using reference matmul
         var expected = try ops.matmul(f32, &a, b);
@@ -488,7 +488,7 @@ test "matmul numerical stability" {
 
         var result = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
         defer result.deinit();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
 
         // Check results
         for (result.data) |val| {
@@ -513,7 +513,7 @@ test "matmul numerical stability" {
 
         var result = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
         defer result.deinit();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
 
         // Check results
         for (result.data) |val| {
@@ -544,7 +544,7 @@ test "matmul numerical stability" {
 
         var result = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
         defer result.deinit();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
 
         // Check results
         for (result.data) |val| {
@@ -574,14 +574,14 @@ pub fn calculateGflops(allocator: std.mem.Allocator, M: usize, N: usize, K: usiz
     defer result.deinit();
 
     // Warmup run
-    try matmulInPlace(f32, a, b, &result, allocator);
+    try matmul(f32, a, b, &result, allocator);
 
     var gflops_array = try allocator.alloc(f64, iterations);
     defer allocator.free(gflops_array);
 
     for (0..iterations) |i| {
         var timer = try std.time.Timer.start();
-        try matmulInPlace(f32, a, b, &result, allocator);
+        try matmul(f32, a, b, &result, allocator);
         const elapsed_ns = timer.read();
 
         const opers = 2 * M * N * K; // multiply-add is 2 operations

@@ -1,22 +1,19 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const max_items_per_row = 6; // Number of elements to show per row
-const max_rows = 8; // Maximum number of rows to show before truncating
+
 const Tensor = @import("tensor.zig").Tensor;
-const builtin = @import("builtin");
-const StabilityError = @import("tensor.zig").StabilityError;
-const sgemm = @import("sgemm.zig");
-const matmulInPlace = @import("sgemminplace.zig").matmulInPlace;
-const hgemminplace = @import("hgemminplace.zig");
-const hgemm = @import("hgemm.zig");
+const TensorView = @import("tensor.zig").TensorView;
 const Slice = @import("tensor.zig").Slice;
-const testing = std.testing;
-const expectEqual = testing.expectEqual;
-const expectError = testing.expectError;
+const StabilityError = @import("tensor.zig").StabilityError;
+
+const sgemm = @import("sgemm.zig").matmul;
+const sgemminplace = @import("sgemminplace.zig").matmul;
+const hgemminplace = @import("hgemminplace.zig").matmul;
+
 const Timer = std.time.Timer;
 const printTimeDiff = @import("timeattention.zig").printTimeDiff;
-const TensorView = @import("tensor.zig").TensorView;
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
@@ -1853,7 +1850,7 @@ pub fn scaledDotProductAttention(
         // Calculate QK^T and scale in one step using f32 accumulation
         var attn_weights = try Tensor(f32).init(allocator, &[_]usize{ q_len, kv_len });
         defer attn_weights.deinit();
-        try hgemminplace.matmul(allocator, query_head, key_head, attn_weights);
+        try hgemminplace(allocator, query_head, key_head, attn_weights);
 
         // Apply scaling
         for (attn_weights.data) |*w| {
@@ -1877,7 +1874,7 @@ pub fn scaledDotProductAttention(
         defer attn_weights_f16.deinit();
 
         // Compute attention output
-        try hgemminplace.matmul(allocator, attn_weights_f16, value_head, out_head);
+        try hgemminplace(allocator, attn_weights_f16, value_head, out_head);
 
         // Copy to output tensor with conversion to f16
         for (0..q_len) |q| {
@@ -1947,7 +1944,7 @@ pub fn masklessDotProductAttention(
         const qk_start = timer.read();
         var attn_weights = try Tensor(f32).init(allocator, &[_]usize{ q_len, kv_len });
         defer attn_weights.deinit();
-        try hgemminplace.matmul(allocator, query_head, key_head, attn_weights);
+        try hgemminplace(allocator, query_head, key_head, attn_weights);
         total_qk_time += timer.read() - qk_start;
 
         // Apply scaling
@@ -1966,7 +1963,7 @@ pub fn masklessDotProductAttention(
         const attn_start = timer.read();
         var value_head_f32 = try value_head.castWithSimd(f32);
         defer value_head_f32.deinit();
-        const out_head = try sgemm.matmul(f32, attn_weights, value_head_f32, allocator);
+        const out_head = try sgemm(f32, attn_weights, value_head_f32, allocator);
         total_attn_time += timer.read() - attn_start;
 
         // Copy to output tensor
@@ -3055,7 +3052,7 @@ const AttnThreadContext = struct {
 
 //                 // Calculate QK^T directly in f32 using workspace tensors
 //                 const matmul_time = processtimer.read();
-//                 workspace.attn_weights = try sgemm.matmul(f32, workspace.query_head, workspace.key_head, workspace.allocator);
+//                 workspace.attn_weights = try sgemm(f32, workspace.query_head, workspace.key_head, workspace.allocator);
 //                 try printTimeDiff(&processtimer, matmul_time, "Matmul QK^T");
 
 //                 // Apply scaling and softmax in-place
@@ -3070,7 +3067,7 @@ const AttnThreadContext = struct {
 
 //                 // Compute attention output using workspace
 //                 const attn_time = processtimer.read();
-//                 workspace.out_head = try sgemm.matmul(f32, workspace.attn_weights, workspace.value_head, workspace.allocator);
+//                 workspace.out_head = try sgemm(f32, workspace.attn_weights, workspace.value_head, workspace.allocator);
 //                 try printTimeDiff(&processtimer, attn_time, "Matmul attention output");
 
 //                 // Copy to output tensor with casting
@@ -3207,7 +3204,7 @@ pub fn multimasklessDotProductAttention(
                 const matmul_time = processtimer.read();
                 workspace.attn_weights.shape[0] = ctx.q_len;
                 workspace.attn_weights.shape[1] = ctx.kv_len;
-                try matmulInPlace(f32, workspace.query_head, workspace.key_head, &workspace.attn_weights, workspace.allocator);
+                try sgemminplace(f32, workspace.query_head, workspace.key_head, &workspace.attn_weights, workspace.allocator);
                 try printTimeDiff(&processtimer, matmul_time, "Matmul QK^T");
 
                 // Apply scaling and softmax in-place
@@ -3225,7 +3222,7 @@ pub fn multimasklessDotProductAttention(
                 const attn_time = processtimer.read();
                 workspace.out_head.shape[0] = ctx.q_len;
                 workspace.out_head.shape[1] = ctx.head_dim;
-                try matmulInPlace(f32, workspace.attn_weights, workspace.value_head, &workspace.out_head, workspace.allocator);
+                try sgemminplace(f32, workspace.attn_weights, workspace.value_head, &workspace.out_head, workspace.allocator);
                 try printTimeDiff(&processtimer, attn_time, "Matmul attention output");
 
                 // Copy to output tensor with casting
@@ -3430,7 +3427,7 @@ pub fn multiscaledDotProductAttention(
                     workspace.attn_weights.deinit();
                 }
                 // Calculate QK^T using sgemm
-                workspace.attn_weights = try sgemm.matmul(f32, workspace.query_head, workspace.key_head, ctx.workspace.allocator);
+                workspace.attn_weights = try sgemm(f32, workspace.query_head, workspace.key_head, ctx.workspace.allocator);
 
                 // Apply scaling
                 for (workspace.attn_weights.data) |*w| {
@@ -3454,7 +3451,7 @@ pub fn multiscaledDotProductAttention(
                 }
 
                 // Compute attention output using sgemm
-                workspace.out_head = try sgemm.matmul(f32, workspace.attn_weights, workspace.value_head, ctx.workspace.allocator);
+                workspace.out_head = try sgemm(f32, workspace.attn_weights, workspace.value_head, ctx.workspace.allocator);
 
                 // Copy to output tensor with casting
                 const out_slice = h * ctx.q_len * ctx.head_dim;
