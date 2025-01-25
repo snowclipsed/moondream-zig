@@ -7,6 +7,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const builtin = @import("builtin");
 const StabilityError = @import("tensor.zig").StabilityError;
 const sgemm = @import("sgemm.zig");
+const matmulInPlace = @import("sgemminplace.zig").matmulInPlace;
 const hgemm = @import("hgemm.zig");
 const newhgemm = @import("hgemmnew.zig");
 const Slice = @import("tensor.zig").Slice;
@@ -15,6 +16,7 @@ const expectEqual = testing.expectEqual;
 const expectError = testing.expectError;
 const Timer = std.time.Timer;
 const printTimeDiff = @import("timeattention.zig").printTimeDiff;
+const TensorView = @import("tensor.zig").TensorView;
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
@@ -50,6 +52,127 @@ pub fn transpose(comptime T: type, tensor: *Tensor(T)) !void {
 /// - dim0: First dimension to swap
 /// - dim1: Second dimension to swap
 ///
+// pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: usize) !void {
+//     if (dim0 >= tensor.shape.len or dim1 >= tensor.shape.len) {
+//         return error.InvalidDimension;
+//     }
+
+//     // Calculate strides for the current shape
+//     var strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+//     defer tensor.allocator.free(strides);
+
+//     strides[tensor.shape.len - 1] = 1;
+//     var i: usize = tensor.shape.len - 1;
+//     while (i > 0) : (i -= 1) {
+//         strides[i - 1] = strides[i] * tensor.shape[i];
+//     }
+
+//     // Create new shape with swapped dimensions
+//     var new_shape = try tensor.allocator.alloc(usize, tensor.shape.len);
+//     errdefer tensor.allocator.free(new_shape);
+
+//     for (tensor.shape, 0..) |dim, idx| {
+//         new_shape[idx] = if (idx == dim0) tensor.shape[dim1] else if (idx == dim1) tensor.shape[dim0] else dim;
+//     }
+
+//     // Allocate memory for transposed data
+//     var new_data = try tensor.allocator.alignedAlloc(T, 32, tensor.data.len);
+//     errdefer tensor.allocator.free(new_data);
+
+//     // Calculate new strides
+//     var new_strides = try tensor.allocator.alloc(usize, tensor.shape.len);
+//     defer tensor.allocator.free(new_strides);
+
+//     new_strides[tensor.shape.len - 1] = 1;
+//     i = tensor.shape.len - 1;
+//     while (i > 0) : (i -= 1) {
+//         new_strides[i - 1] = new_strides[i] * new_shape[i];
+//     }
+
+//     // SIMD optimization for 3D tensors swapping first two dimensions
+//     if (tensor.shape.len == 3 and dim0 == 0 and dim1 == 1 and
+//         (T == f16 or T == f32))
+//     {
+//         const batch_size = tensor.shape[0];
+//         const rows = tensor.shape[1];
+//         const cols = tensor.shape[2];
+//         const vector_size = if (T == f16) 16 else 8; // AVX2: 16 fp16 or 8 fp32
+
+//         if (cols >= vector_size) {
+//             const Vector = @Vector(vector_size, T);
+
+//             var col: usize = 0;
+//             while (col < cols) : (col += vector_size) {
+//                 const vec_size = @min(vector_size, cols - col);
+
+//                 // Process each column vector block
+//                 for (0..batch_size) |b| {
+//                     for (0..rows) |r| {
+//                         const src_idx = b * rows * cols + r * cols + col;
+//                         var vec: Vector = undefined;
+
+//                         // Load with potential partial vector
+//                         if (vec_size == vector_size) {
+//                             vec = tensor.data[src_idx..][0..vector_size].*;
+//                         } else {
+//                             var temp: [vector_size]T = undefined;
+//                             @memcpy(temp[0..vec_size], tensor.data[src_idx..][0..vec_size]);
+//                             vec = temp;
+//                         }
+
+//                         // Store transposed
+//                         const dst_idx = r * batch_size * cols + b * cols + col;
+//                         if (vec_size == vector_size) {
+//                             new_data[dst_idx..][0..vector_size].* = vec;
+//                         } else {
+//                             @memcpy(new_data[dst_idx..][0..vec_size], @as([vector_size]T, vec)[0..vec_size]);
+//                         }
+//                     }
+//                 }
+//             }
+//             // Update tensor and return early since we handled this case
+//             tensor.allocator.free(tensor.data);
+//             tensor.data = new_data;
+//             tensor.allocator.free(tensor.shape);
+//             tensor.shape = new_shape;
+//             return;
+//         }
+//     }
+
+//     // General case implementation
+//     var coords = try tensor.allocator.alloc(usize, tensor.shape.len);
+//     defer tensor.allocator.free(coords);
+//     @memset(coords, 0);
+
+//     const total_elements = tensor.data.len;
+//     var idx: usize = 0;
+//     while (idx < total_elements) : (idx += 1) {
+//         var remaining = idx;
+//         for (0..tensor.shape.len) |dim| {
+//             coords[dim] = remaining / new_strides[dim];
+//             remaining %= new_strides[dim];
+//         }
+
+//         // Swap coordinates
+//         const temp = coords[dim0];
+//         coords[dim0] = coords[dim1];
+//         coords[dim1] = temp;
+
+//         // Calculate source index
+//         var src_idx: usize = 0;
+//         for (0..tensor.shape.len) |dim| {
+//             src_idx += coords[dim] * strides[dim];
+//         }
+
+//         new_data[idx] = tensor.data[src_idx];
+//     }
+
+//     // Update tensor metadata
+//     tensor.allocator.free(tensor.data);
+//     tensor.data = new_data;
+//     tensor.allocator.free(tensor.shape);
+//     tensor.shape = new_shape;
+// }
 pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: usize) !void {
     if (dim0 >= tensor.shape.len or dim1 >= tensor.shape.len) {
         return error.InvalidDimension;
@@ -77,7 +200,7 @@ pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: us
     var new_data = try tensor.allocator.alignedAlloc(T, 32, tensor.data.len);
     errdefer tensor.allocator.free(new_data);
 
-    // Calculate new strides
+    // Calculate new strides - Moved before SIMD block
     var new_strides = try tensor.allocator.alloc(usize, tensor.shape.len);
     defer tensor.allocator.free(new_strides);
 
@@ -87,53 +210,52 @@ pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: us
         new_strides[i - 1] = new_strides[i] * new_shape[i];
     }
 
-    // SIMD optimization for 3D tensors swapping first two dimensions
-    if (tensor.shape.len == 3 and dim0 == 0 and dim1 == 1 and
-        (T == f16 or T == f32))
+    // SIMD optimization wrapped in a block
     {
-        const batch_size = tensor.shape[0];
-        const rows = tensor.shape[1];
-        const cols = tensor.shape[2];
-        const vector_size = if (T == f16) 16 else 8; // AVX2: 16 fp16 or 8 fp32
+        if (tensor.shape.len == 3 and dim0 == 0 and dim1 == 1 and
+            (T == f16 or T == f32))
+        {
+            const batch_size = tensor.shape[0];
+            const rows = tensor.shape[1];
+            const cols = tensor.shape[2];
+            const vector_size = if (T == f16) 16 else 8; // AVX2: 16 fp16 or 8 fp32
 
-        if (cols >= vector_size) {
-            const Vector = @Vector(vector_size, T);
+            if (cols >= vector_size) {
+                const Vector = @Vector(vector_size, T);
 
-            var col: usize = 0;
-            while (col < cols) : (col += vector_size) {
-                const vec_size = @min(vector_size, cols - col);
+                var col: usize = 0;
+                while (col < cols) : (col += vector_size) {
+                    const vec_size = @min(vector_size, cols - col);
 
-                // Process each column vector block
-                for (0..batch_size) |b| {
-                    for (0..rows) |r| {
-                        const src_idx = b * rows * cols + r * cols + col;
-                        var vec: Vector = undefined;
+                    for (0..batch_size) |b| {
+                        for (0..rows) |r| {
+                            const src_idx = b * rows * cols + r * cols + col;
+                            var vec: Vector = undefined;
 
-                        // Load with potential partial vector
-                        if (vec_size == vector_size) {
-                            vec = tensor.data[src_idx..][0..vector_size].*;
-                        } else {
-                            var temp: [vector_size]T = undefined;
-                            @memcpy(temp[0..vec_size], tensor.data[src_idx..][0..vec_size]);
-                            vec = temp;
-                        }
+                            if (vec_size == vector_size) {
+                                vec = tensor.data[src_idx..][0..vector_size].*;
+                            } else {
+                                var temp: [vector_size]T = undefined;
+                                @memcpy(temp[0..vec_size], tensor.data[src_idx..][0..vec_size]);
+                                vec = temp;
+                            }
 
-                        // Store transposed
-                        const dst_idx = r * batch_size * cols + b * cols + col;
-                        if (vec_size == vector_size) {
-                            new_data[dst_idx..][0..vector_size].* = vec;
-                        } else {
-                            @memcpy(new_data[dst_idx..][0..vec_size], @as([vector_size]T, vec)[0..vec_size]);
+                            const dst_idx = r * batch_size * cols + b * cols + col;
+                            if (vec_size == vector_size) {
+                                new_data[dst_idx..][0..vector_size].* = vec;
+                            } else {
+                                @memcpy(new_data[dst_idx..][0..vec_size], @as([vector_size]T, vec)[0..vec_size]);
+                            }
                         }
                     }
                 }
+
+                tensor.allocator.free(tensor.data);
+                tensor.data = new_data;
+                tensor.allocator.free(tensor.shape);
+                tensor.shape = new_shape;
+                return;
             }
-            // Update tensor and return early since we handled this case
-            tensor.allocator.free(tensor.data);
-            tensor.data = new_data;
-            tensor.allocator.free(tensor.shape);
-            tensor.shape = new_shape;
-            return;
         }
     }
 
@@ -171,123 +293,6 @@ pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: us
     tensor.allocator.free(tensor.shape);
     tensor.shape = new_shape;
 }
-// pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: usize) !void {
-//     if (dim0 >= tensor.shape.len or dim1 >= tensor.shape.len) {
-//         return error.InvalidDimension;
-//     }
-
-//     // Calculate strides for the current shape
-//     var strides = try tensor.allocator.alloc(usize, tensor.shape.len);
-//     defer tensor.allocator.free(strides);
-
-//     strides[tensor.shape.len - 1] = 1;
-//     var i: usize = tensor.shape.len - 1;
-//     while (i > 0) : (i -= 1) {
-//         strides[i - 1] = strides[i] * tensor.shape[i];
-//     }
-
-//     // Create new shape with swapped dimensions
-//     var new_shape = try tensor.allocator.alloc(usize, tensor.shape.len);
-//     errdefer tensor.allocator.free(new_shape);
-
-//     for (tensor.shape, 0..) |dim, idx| {
-//         if (idx == dim0) {
-//             new_shape[idx] = tensor.shape[dim1];
-//         } else if (idx == dim1) {
-//             new_shape[idx] = tensor.shape[dim0];
-//         } else {
-//             new_shape[idx] = dim;
-//         }
-//     }
-
-//     // Allocate memory for transposed data
-//     var new_data = try tensor.allocator.alignedAlloc(T, 32, tensor.data.len);
-//     errdefer tensor.allocator.free(new_data);
-
-//     // Calculate new strides
-//     var new_strides = try tensor.allocator.alloc(usize, tensor.shape.len);
-//     defer tensor.allocator.free(new_strides);
-
-//     new_strides[tensor.shape.len - 1] = 1;
-//     i = tensor.shape.len - 1;
-//     while (i > 0) : (i -= 1) {
-//         new_strides[i - 1] = new_strides[i] * new_shape[i];
-//     }
-
-//     // For 3D tensors with dim0=0 and dim1=1, use SIMD optimization
-//     if (tensor.shape.len == 3 and dim0 == 0 and dim1 == 1 and
-//         (T == f16 or T == f32) and tensor.shape[2] >= 8)
-//     {
-//         const batch_size = tensor.shape[0];
-//         const rows = tensor.shape[1];
-//         const cols = tensor.shape[2];
-//         const Vector = @Vector(8, T);
-
-//         var col: usize = 0;
-//         while (col < cols) : (col += 8) {
-//             const vec_size = @min(8, cols - col);
-
-//             // Process each column vector
-//             for (0..batch_size) |b| {
-//                 for (0..rows) |r| {
-//                     var vec: Vector = undefined;
-//                     if (vec_size == 8) {
-//                         // Full vector load
-//                         const src_idx = b * rows * cols + r * cols + col;
-//                         vec = tensor.data[src_idx..][0..8].*;
-//                     } else {
-//                         // Partial load
-//                         var temp: [8]T = undefined;
-//                         const src_idx = b * rows * cols + r * cols + col;
-//                         @memcpy(temp[0..vec_size], tensor.data[src_idx..][0..vec_size]);
-//                         vec = temp;
-//                     }
-
-//                     // Store in transposed location
-//                     const dst_idx = r * batch_size * cols + b * cols + col;
-//                     if (vec_size == 8) {
-//                         new_data[dst_idx..][0..8].* = vec;
-//                     } else {
-//                         @memcpy(new_data[dst_idx..][0..vec_size], @as([8]T, vec)[0..vec_size]);
-//                     }
-//                 }
-//             }
-//         }
-//     } else {
-//         // Use original implementation for other cases
-//         var coords = try tensor.allocator.alloc(usize, tensor.shape.len);
-//         defer tensor.allocator.free(coords);
-//         @memset(coords, 0);
-
-//         const total_elements = tensor.data.len;
-//         var idx: usize = 0;
-//         while (idx < total_elements) : (idx += 1) {
-//             var remaining = idx;
-//             for (0..tensor.shape.len) |dim| {
-//                 coords[dim] = remaining / new_strides[dim];
-//                 remaining = remaining % new_strides[dim];
-//             }
-
-//             const temp = coords[dim0];
-//             coords[dim0] = coords[dim1];
-//             coords[dim1] = temp;
-
-//             var src_idx: usize = 0;
-//             for (0..tensor.shape.len) |dim| {
-//                 src_idx += coords[dim] * strides[dim];
-//             }
-
-//             new_data[idx] = tensor.data[src_idx];
-//         }
-//     }
-
-//     // Update tensor with new data and shape
-//     tensor.allocator.free(tensor.data);
-//     tensor.data = new_data;
-//     tensor.allocator.free(tensor.shape);
-//     tensor.shape = new_shape;
-// }
-
 pub fn transposeF16SIMD(tensor: *Tensor(f16), batch_size: usize, rows: usize, cols: usize, new_data: []align(32) f16) void {
     const vec_size = 8;
 
@@ -1764,391 +1769,6 @@ pub fn applyRotaryEmb(
     return output;
 }
 
-// Optimized constants
-//23036.95ms
-// const CACHE_LINE_SIZE = std.atomic.cache_line;
-// const VECTOR_WIDTH = 8;
-// const UNROLL_FACTOR = 16;
-// const MIN_PARALLEL_SIZE = 512;
-
-// pub fn applyRotaryEmb(
-//     allocator: Allocator,
-//     x: Tensor(f16),
-//     freqs_cis: Tensor(f32),
-//     position_ids: Tensor(usize),
-//     rot_dim: usize,
-// ) !Tensor(f16) {
-//     // Early exit for small inputs - use serial implementation
-//     const total_elements = x.shape[0] * x.shape[1] * x.shape[2];
-//     if (total_elements < MIN_PARALLEL_SIZE) {
-//         return applyRotaryEmbSerial(allocator, x, freqs_cis, position_ids, rot_dim);
-//     }
-
-//     // Original validation
-//     if (x.shape.len != 3) return error.InvalidInputDimensions;
-//     if (rot_dim != freqs_cis.shape[freqs_cis.shape.len - 2] * 2) {
-//         return error.InvalidRotationDimension;
-//     }
-
-//     const n_heads = x.shape[0];
-//     const seq_len = x.shape[1];
-//     const head_dim = x.shape[2];
-
-//     // Extract parts with aligned memory allocation
-//     var x_rot = try x.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(0, rot_dim),
-//     });
-//     defer x_rot.deinit();
-
-//     var x_pass = if (rot_dim < head_dim) blk: {
-//         const pass = try x.getSliceRange(&[_]Slice{
-//             Slice.full(),
-//             Slice.full(),
-//             Slice.from(rot_dim, null),
-//         });
-//         break :blk pass;
-//     } else Tensor(f16).init(allocator, &[_]usize{ n_heads, seq_len, 0 }) catch unreachable;
-//     defer x_pass.deinit();
-
-//     // Extract real and imaginary parts directly without interleaving
-//     var xq_r = try x_rot.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(0, rot_dim / 2),
-//     });
-//     var xq_i = try x_rot.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(rot_dim / 2, null),
-//     });
-//     defer xq_r.deinit();
-//     defer xq_i.deinit();
-
-//     // Convert to f32 for computation with aligned allocation
-//     var xq_out_r = try xq_r.castWithSimd(f32);
-//     defer xq_out_r.deinit();
-//     var xq_out_i = try xq_i.castWithSimd(f32);
-//     defer xq_out_i.deinit();
-
-//     // Pre-compute and align frequencies
-//     var freqs_cos = try zeros(f32, allocator, &[_]usize{ 1, seq_len, rot_dim / 2 });
-//     var freqs_sin = try zeros(f32, allocator, &[_]usize{ 1, seq_len, rot_dim / 2 });
-//     defer freqs_cos.deinit();
-//     defer freqs_sin.deinit();
-
-//     // Extract cos/sin parts once
-//     var cos_part = try freqs_cis.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(0, 1),
-//     });
-//     defer cos_part.deinit();
-
-//     var sin_part = try freqs_cis.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(1, 2),
-//     });
-//     defer sin_part.deinit();
-
-//     // Fill frequencies with SIMD
-//     const vec_size = VECTOR_WIDTH;
-//     for (0..seq_len) |i| {
-//         const pos_id = position_ids.data[i];
-//         const offset = i * (rot_dim / 2);
-//         const src_offset = pos_id * cos_part.shape[1];
-
-//         var j: usize = 0;
-//         while (j + vec_size <= rot_dim / 2) : (j += vec_size) {
-//             const src_cos = cos_part.data[src_offset + j .. src_offset + j + vec_size];
-//             const src_sin = sin_part.data[src_offset + j .. src_offset + j + vec_size];
-//             const dst_cos = freqs_cos.data[offset + j .. offset + j + vec_size];
-//             const dst_sin = freqs_sin.data[offset + j .. offset + j + vec_size];
-//             @memcpy(dst_cos, src_cos);
-//             @memcpy(dst_sin, src_sin);
-//         }
-//         while (j < rot_dim / 2) : (j += 1) {
-//             freqs_cos.data[offset + j] = cos_part.data[src_offset + j];
-//             freqs_sin.data[offset + j] = sin_part.data[src_offset + j];
-//         }
-//     }
-
-//     // Optimized thread context
-//     const ThreadContext = struct {
-//         xq_out_r: []f32,
-//         xq_out_i: []f32,
-//         freqs_cos: []f32,
-//         freqs_sin: []f32,
-//         head_start: usize,
-//         head_end: usize,
-//         seq_len: usize,
-//         rot_dim_half: usize,
-//     };
-
-//     const Worker = struct {
-//         fn process(ctx: ThreadContext) void {
-//             for (ctx.head_start..ctx.head_end) |h| {
-//                 for (0..ctx.seq_len) |s| {
-//                     var f: usize = 0;
-
-//                     // SIMD processing with aggressive unrolling
-//                     while (f + UNROLL_FACTOR * vec_size <= ctx.rot_dim_half) : (f += UNROLL_FACTOR * vec_size) {
-//                         inline for (0..UNROLL_FACTOR) |u| {
-//                             const base_idx = h * ctx.seq_len * ctx.rot_dim_half + s * ctx.rot_dim_half + f + u * vec_size;
-//                             const freq_idx = s * ctx.rot_dim_half + f + u * vec_size;
-
-//                             // Prefetch next iteration
-//                             if (f + (u + 1) * vec_size < ctx.rot_dim_half) {
-//                                 const next_base = base_idx + vec_size;
-//                                 const next_freq = freq_idx + vec_size;
-//                                 @prefetch(ctx.xq_out_r[next_base..][0..vec_size], .{ .locality = 3 });
-//                                 @prefetch(ctx.xq_out_i[next_base..][0..vec_size], .{ .locality = 3 });
-//                                 @prefetch(ctx.freqs_cos[next_freq..][0..vec_size], .{ .locality = 3 });
-//                                 @prefetch(ctx.freqs_sin[next_freq..][0..vec_size], .{ .locality = 3 });
-//                             }
-
-//                             // Load vectors
-//                             const xr = @Vector(vec_size, f32){
-//                                 ctx.xq_out_r[base_idx + 0],
-//                                 ctx.xq_out_r[base_idx + 1],
-//                                 ctx.xq_out_r[base_idx + 2],
-//                                 ctx.xq_out_r[base_idx + 3],
-//                                 ctx.xq_out_r[base_idx + 4],
-//                                 ctx.xq_out_r[base_idx + 5],
-//                                 ctx.xq_out_r[base_idx + 6],
-//                                 ctx.xq_out_r[base_idx + 7],
-//                             };
-
-//                             const xi = @Vector(vec_size, f32){
-//                                 ctx.xq_out_i[base_idx + 0],
-//                                 ctx.xq_out_i[base_idx + 1],
-//                                 ctx.xq_out_i[base_idx + 2],
-//                                 ctx.xq_out_i[base_idx + 3],
-//                                 ctx.xq_out_i[base_idx + 4],
-//                                 ctx.xq_out_i[base_idx + 5],
-//                                 ctx.xq_out_i[base_idx + 6],
-//                                 ctx.xq_out_i[base_idx + 7],
-//                             };
-
-//                             const cos = @Vector(vec_size, f32){
-//                                 ctx.freqs_cos[freq_idx + 0],
-//                                 ctx.freqs_cos[freq_idx + 1],
-//                                 ctx.freqs_cos[freq_idx + 2],
-//                                 ctx.freqs_cos[freq_idx + 3],
-//                                 ctx.freqs_cos[freq_idx + 4],
-//                                 ctx.freqs_cos[freq_idx + 5],
-//                                 ctx.freqs_cos[freq_idx + 6],
-//                                 ctx.freqs_cos[freq_idx + 7],
-//                             };
-
-//                             const sin = @Vector(vec_size, f32){
-//                                 ctx.freqs_sin[freq_idx + 0],
-//                                 ctx.freqs_sin[freq_idx + 1],
-//                                 ctx.freqs_sin[freq_idx + 2],
-//                                 ctx.freqs_sin[freq_idx + 3],
-//                                 ctx.freqs_sin[freq_idx + 4],
-//                                 ctx.freqs_sin[freq_idx + 5],
-//                                 ctx.freqs_sin[freq_idx + 6],
-//                                 ctx.freqs_sin[freq_idx + 7],
-//                             };
-
-//                             // Complex multiply using FMA for exact results
-//                             const neg_xi_sin = -xi * sin;
-//                             const out_r = @mulAdd(@Vector(vec_size, f32), xr, cos, neg_xi_sin);
-//                             const out_i = @mulAdd(@Vector(vec_size, f32), xr, sin, xi * cos);
-
-//                             // Store results
-//                             @memcpy(ctx.xq_out_r[base_idx..][0..vec_size], @as([vec_size]f32, out_r)[0..]);
-//                             @memcpy(ctx.xq_out_i[base_idx..][0..vec_size], @as([vec_size]f32, out_i)[0..]);
-//                         }
-//                     }
-
-//                     // Handle remaining elements exactly as original
-//                     while (f < ctx.rot_dim_half) : (f += 1) {
-//                         const base_idx = h * ctx.seq_len * ctx.rot_dim_half + s * ctx.rot_dim_half + f;
-//                         const freq_idx = s * ctx.rot_dim_half + f;
-
-//                         const xr = ctx.xq_out_r[base_idx];
-//                         const xi = ctx.xq_out_i[base_idx];
-//                         const cos = ctx.freqs_cos[freq_idx];
-//                         const sin = ctx.freqs_sin[freq_idx];
-
-//                         ctx.xq_out_r[base_idx] = xr * cos - xi * sin;
-//                         ctx.xq_out_i[base_idx] = xr * sin + xi * cos;
-//                     }
-//                 }
-//             }
-//         }
-//     };
-
-//     // Optimal thread distribution
-//     const cpu_count = try Thread.getCpuCount();
-//     const num_threads = @min(n_heads, cpu_count);
-//     const heads_per_thread = (n_heads + num_threads - 1) / num_threads;
-
-//     var threads = try allocator.alloc(Thread, num_threads - 1);
-//     defer allocator.free(threads);
-
-//     // Launch worker threads
-//     var thread_idx: usize = 0;
-//     while (thread_idx < num_threads - 1) : (thread_idx += 1) {
-//         const head_start = thread_idx * heads_per_thread;
-//         const head_end = @min((thread_idx + 1) * heads_per_thread, n_heads);
-
-//         const ctx = ThreadContext{
-//             .xq_out_r = xq_out_r.data,
-//             .xq_out_i = xq_out_i.data,
-//             .freqs_cos = freqs_cos.data,
-//             .freqs_sin = freqs_sin.data,
-//             .head_start = head_start,
-//             .head_end = head_end,
-//             .seq_len = seq_len,
-//             .rot_dim_half = rot_dim / 2,
-//         };
-
-//         threads[thread_idx] = try Thread.spawn(.{}, Worker.process, .{ctx});
-//     }
-
-//     // Use main thread for last batch
-//     const ctx = ThreadContext{
-//         .xq_out_r = xq_out_r.data,
-//         .xq_out_i = xq_out_i.data,
-//         .freqs_cos = freqs_cos.data,
-//         .freqs_sin = freqs_sin.data,
-//         .head_start = (num_threads - 1) * heads_per_thread,
-//         .head_end = n_heads,
-//         .seq_len = seq_len,
-//         .rot_dim_half = rot_dim / 2,
-//     };
-//     Worker.process(ctx);
-
-//     // Wait for all threads
-//     for (threads) |thread| {
-//         thread.join();
-//     }
-
-//     // Stack results exactly as original
-//     var tensors = [_]Tensor(f32){ xq_out_r, xq_out_i };
-//     var stacked = try stack(f32, &tensors, 3);
-//     defer stacked.deinit();
-//     try flatten(f32, &stacked, 2, 3);
-
-//     if (x_pass.data.len > 0) {
-//         var x_pass_f32 = try x_pass.castWithSimd(f32);
-//         defer x_pass_f32.deinit();
-//         var result = try concat(f32, stacked, x_pass_f32, 2);
-//         defer result.deinit();
-//         return try result.castWithSimd(f16);
-//     } else {
-//         var result = try stacked.copy();
-//         defer result.deinit();
-//         return try result.castWithSimd(f16);
-//     }
-// }
-// fn applyRotaryEmbSerial(
-//     allocator: Allocator,
-//     x: Tensor(f16),
-//     freqs_cis: Tensor(f32),
-//     position_ids: Tensor(usize),
-//     rot_dim: usize,
-// ) !Tensor(f16) {
-//     if (x.shape.len != 3) return error.InvalidInputDimensions;
-//     if (rot_dim != freqs_cis.shape[freqs_cis.shape.len - 2] * 2) {
-//         return error.InvalidRotationDimension;
-//     }
-
-//     const n_heads = x.shape[0];
-//     const seq_len = x.shape[1];
-//     const head_dim = x.shape[2];
-
-//     var x_rot = try x.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(0, rot_dim),
-//     });
-//     defer x_rot.deinit();
-
-//     var x_pass = if (rot_dim < head_dim) blk: {
-//         const pass = try x.getSliceRange(&[_]Slice{
-//             Slice.full(),
-//             Slice.full(),
-//             Slice.from(rot_dim, null),
-//         });
-//         break :blk pass;
-//     } else Tensor(f16).init(allocator, &[_]usize{ n_heads, seq_len, 0 }) catch unreachable;
-//     defer x_pass.deinit();
-
-//     // Extract real and imaginary parts directly without interleaving
-//     var xq_r = try x_rot.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(0, rot_dim / 2),
-//     });
-//     var xq_i = try x_rot.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(rot_dim / 2, null),
-//     });
-//     defer xq_r.deinit();
-//     defer xq_i.deinit();
-
-//     var xq_out_r = try xq_r.castWithSimd(f32);
-//     defer xq_out_r.deinit();
-//     var xq_out_i = try xq_i.castWithSimd(f32);
-//     defer xq_out_i.deinit();
-
-//     var cos_part = try freqs_cis.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(0, 1),
-//     });
-//     defer cos_part.deinit();
-
-//     var sin_part = try freqs_cis.getSliceRange(&[_]Slice{
-//         Slice.full(),
-//         Slice.full(),
-//         Slice.from(1, 2),
-//     });
-//     defer sin_part.deinit();
-
-//     // Serial processing with exact same operations
-//     for (0..n_heads) |h| {
-//         for (0..seq_len) |s| {
-//             const pos_id = position_ids.data[s];
-//             for (0..rot_dim / 2) |d| {
-//                 const idx = h * seq_len * (rot_dim / 2) + s * (rot_dim / 2) + d;
-//                 const cos = cos_part.data[pos_id * cos_part.shape[1] + d];
-//                 const sin = sin_part.data[pos_id * sin_part.shape[1] + d];
-
-//                 const xr = xq_out_r.data[idx];
-//                 const xi = xq_out_i.data[idx];
-
-//                 xq_out_r.data[idx] = xr * cos - xi * sin;
-//                 xq_out_i.data[idx] = xr * sin + xi * cos;
-//             }
-//         }
-//     }
-
-//     var tensors = [_]Tensor(f32){ xq_out_r, xq_out_i };
-//     var stacked = try stack(f32, &tensors, 3);
-//     defer stacked.deinit();
-//     try flatten(f32, &stacked, 2, 3);
-
-//     if (x_pass.data.len > 0) {
-//         var x_pass_f32 = try x_pass.castWithSimd(f32);
-//         defer x_pass_f32.deinit();
-//         var result = try concat(f32, stacked, x_pass_f32, 2);
-//         defer result.deinit();
-//         return try result.castWithSimd(f16);
-//     } else {
-//         var result = try stacked.copy();
-//         defer result.deinit();
-//         return try result.castWithSimd(f16);
-//     }
-// }
-
 // Create attention mask for proper causal attention alignment
 pub fn createAttentionMask(allocator: Allocator, pos: usize, seq_len: usize) !Tensor(bool) {
     // First create the base mask of shape [seq_len, pos + seq_len]
@@ -2595,81 +2215,6 @@ pub fn softmax(tensor: *Tensor(f32), dim: usize, allocator: Allocator) !void {
         }
     }
 }
-
-// pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
-//     if (@typeInfo(T) != .Float) {
-//         @compileError("GELU operation requires floating-point tensor");
-//     }
-
-//     // Constants for GELU approximation
-//     const sqrt_2_div_pi: T = @sqrt(2.0 / std.math.pi);
-//     const alpha: T = 0.044715;
-
-//     for (tensor.data) |*x| {
-//         const val = x.*;
-//         const x_cubed = val * val * val;
-//         const inner = sqrt_2_div_pi * (val + alpha * x_cubed);
-//         // Convert result back to type T after tanh operation
-//         x.* = @floatCast(0.5 * @as(f32, @floatCast(val)) * (1.0 + std.math.tanh(@as(f32, @floatCast(inner)))));
-//     }
-// }
-// pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
-//     if (@typeInfo(T) != .Float) {
-//         @compileError("GELU operation requires floating-point tensor");
-//     }
-
-//     // Constants for GELU approximation
-//     const sqrt_2_div_pi: T = @sqrt(@as(T, 2.0) / std.math.pi);
-//     const alpha: T = 0.044715;
-
-//     var i: usize = 0;
-
-//     // SIMD optimization for f32 only (AVX2/SSE compatibility)
-//     if (T == f32) {
-//         if (std.simd.suggestVectorLength(f32)) |vector_len| {
-//             const SimdVec = @Vector(vector_len, f32);
-
-//             while (i + vector_len <= tensor.data.len) : (i += vector_len) {
-//                 const simd_slice = tensor.data[i .. i + vector_len];
-
-//                 // Load SIMD data (explicit pointer cast)
-//                 const ptr = @as([*]align(1) const f32, @ptrCast(simd_slice.ptr));
-//                 var simd_data: SimdVec = ptr[0..vector_len].*;
-
-//                 // Compute GELU
-//                 const x_cubed = simd_data * simd_data * simd_data;
-//                 const alpha_vec = @as(SimdVec, @splat(alpha));
-//                 const sqrt_2_div_pi_vec = @as(SimdVec, @splat(sqrt_2_div_pi));
-//                 const inner = sqrt_2_div_pi_vec * (simd_data + alpha_vec * x_cubed);
-//                 const tanh_inner = std.math.tanh(inner);
-//                 simd_data = @as(SimdVec, @splat(0.5)) * simd_data * (@as(SimdVec, @splat(1.0)) + tanh_inner);
-
-//                 // Store back (explicit pointer cast)
-//                 const out_ptr = @as([*]f32, @ptrCast(simd_slice.ptr));
-//                 out_ptr[0..vector_len].* = simd_data;
-//             }
-//         }
-//     }
-
-//     // Process remaining elements (f16 or leftover f32)
-//     for (tensor.data[i..]) |*x| {
-//         const val = x.*;
-//         if (T == f16) {
-//             // Compute in f32 to work around missing tanh(f16)
-//             const val_f32 = @as(f32, val);
-//             const x_cubed_f32 = val_f32 * val_f32 * val_f32;
-//             const inner_f32 = @as(f32, sqrt_2_div_pi) * (val_f32 + @as(f32, alpha) * x_cubed_f32);
-//             const tanh_inner_f32 = std.math.tanh(inner_f32);
-//             x.* = @floatCast(0.5 * val_f32 * (1.0 + tanh_inner_f32));
-//         } else {
-//             // f32 scalar fallback
-//             const x_cubed = val * val * val;
-//             const inner = sqrt_2_div_pi * (val + alpha * x_cubed);
-//             const tanh_inner = std.math.tanh(inner);
-//             x.* = 0.5 * val * (1.0 + tanh_inner);
-//         }
-//     }
-// }
 
 pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
     if (@typeInfo(T) != .Float) {
@@ -3176,7 +2721,7 @@ pub fn convert_bhwc_to_bchw(allocator: Allocator, input: Tensor(f16)) !Tensor(f1
 //// SIMD Operations ////
 
 // AVX2 optimized broadcast add for f16
-// AVX2 optimized broadcast add for f16
+
 pub fn broadcast_add_simd(a: *Tensor(f16), b: Tensor(f16)) !void {
     // Validate broadcast compatibility
     if (b.shape.len > a.shape.len) {
@@ -3321,10 +2866,13 @@ pub fn broadcast_add_simd(a: *Tensor(f16), b: Tensor(f16)) !void {
         break :blk prod;
     };
 
+    var a_coords = try a.allocator.alloc(usize, a.shape.len);
+    defer a.allocator.free(a_coords);
+
     var i: usize = 0;
     while (i < total_elements) : (i += 1) {
-        var a_coords = try a.allocator.alloc(usize, a.shape.len);
-        defer a.allocator.free(a_coords);
+        // var a_coords = try a.allocator.alloc(usize, a.shape.len);
+        // defer a.allocator.free(a_coords);
         var temp = i;
 
         for (0..a.shape.len) |j| {
@@ -3381,7 +2929,7 @@ const ThreadWorkspace = struct {
     }
 };
 
-// Persistent thread pool context
+// // Persistent thread pool context
 const ThreadPoolContext = struct {
     workspaces: []ThreadWorkspace,
     allocator: Allocator,
@@ -3390,9 +2938,18 @@ const ThreadPoolContext = struct {
         const workspaces = try allocator.alloc(ThreadWorkspace, thread_count);
         errdefer allocator.free(workspaces);
 
+        var initialized: usize = 0;
+        errdefer {
+            // Clean up any successfully initialized workspaces
+            for (workspaces[0..initialized]) |*workspace| {
+                workspace.deinit();
+            }
+        }
+
         // Initialize workspaces for each thread
         for (workspaces) |*workspace| {
             workspace.* = try ThreadWorkspace.init(allocator, max_seq_len, head_dim);
+            initialized += 1;
         }
 
         return ThreadPoolContext{
@@ -3409,7 +2966,7 @@ const ThreadPoolContext = struct {
     }
 };
 
-// Updated thread context with workspace
+// // Updated thread context with workspace
 const AttnThreadContext = struct {
     start_head: usize,
     end_head: usize,
@@ -3423,6 +2980,142 @@ const AttnThreadContext = struct {
     head_dim: usize,
     workspace: *ThreadWorkspace,
 };
+
+// pub fn multimasklessDotProductAttention(
+//     query: Tensor(f16),
+//     key: Tensor(f16),
+//     value: Tensor(f16),
+//     allocator: Allocator,
+// ) !Tensor(f16) {
+//     var timer = try Timer.start();
+//     const total_start = timer.read();
+
+//     const n_heads = query.shape[0];
+//     const q_len = query.shape[1];
+//     const kv_len = key.shape[1];
+//     const head_dim = query.shape[2];
+
+//     // Scale factor
+//     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+//     // Initialize output tensor
+//     const init_and_cast_time = timer.read();
+//     var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
+//     errdefer out.deinit();
+
+//     // Pre-cast query and value to f32 (reused across threads)
+//     var query_f32 = try query.castWithSimd(f32);
+//     defer query_f32.deinit();
+//     var value_f32 = try value.castWithSimd(f32);
+//     defer value_f32.deinit();
+//     try printTimeDiff(&timer, init_and_cast_time, "Init and Query and Value tensors");
+
+//     // Prepare transposed key for all heads
+//     const transpose_time = timer.read();
+//     var key_transpose = try key.copy();
+//     defer key_transpose.deinit();
+//     try transposeAxes(f16, &key_transpose, 1, 2);
+//     var key_transpose_f32 = try key_transpose.castWithSimd(f32);
+//     defer key_transpose_f32.deinit();
+//     try printTimeDiff(&timer, transpose_time, "Transpose + Cast key");
+
+//     // Initialize thread pool and workspaces
+//     const pool_init_time = timer.read();
+//     const thread_count = @min(n_heads, try Thread.getCpuCount());
+//     var thread_pool = try ThreadPoolContext.init(allocator, thread_count, q_len, head_dim);
+//     defer thread_pool.deinit();
+
+//     var threads = try allocator.alloc(Thread, thread_count);
+//     defer allocator.free(threads);
+//     try printTimeDiff(&timer, pool_init_time, "Init thread pool");
+
+//     // Divide work among threads
+//     const divide_work_time = timer.read();
+//     const heads_per_thread = n_heads / thread_count;
+//     const remaining_heads = n_heads % thread_count;
+
+//     var current_head: usize = 0;
+//     var thread_contexts = try allocator.alloc(AttnThreadContext, thread_count);
+//     defer allocator.free(thread_contexts);
+//     try printTimeDiff(&timer, divide_work_time, "Divide work among threads");
+
+//     // Thread worker function
+//     const worker = struct {
+//         fn process(ctx: AttnThreadContext) !void {
+//             var processtimer = try Timer.start();
+//             const workspace = ctx.workspace;
+
+//             for (ctx.start_head..ctx.end_head) |h| {
+//                 // Get slices for this head using pre-allocated workspace
+//                 const copy_head_time = processtimer.read();
+//                 try copyHeadData(f32, &workspace.query_head, ctx.query, h);
+//                 try copyHeadData(f32, &workspace.key_head, ctx.key, h);
+//                 try copyHeadData(f32, &workspace.value_head, ctx.value, h);
+//                 try printTimeDiff(&processtimer, copy_head_time, "Copy head data");
+
+//                 // Calculate QK^T directly in f32 using workspace tensors
+//                 const matmul_time = processtimer.read();
+//                 workspace.attn_weights = try sgemm.matmul(f32, workspace.query_head, workspace.key_head, workspace.allocator);
+//                 try printTimeDiff(&processtimer, matmul_time, "Matmul QK^T");
+
+//                 // Apply scaling and softmax in-place
+//                 const scale_time = processtimer.read();
+//                 for (workspace.attn_weights.data) |*w| {
+//                     w.* *= ctx.scale;
+//                 }
+//                 try printTimeDiff(&processtimer, scale_time, "Scale Time");
+//                 const softmax_time = processtimer.read();
+//                 try softmax(&workspace.attn_weights, 1, workspace.allocator);
+//                 try printTimeDiff(&processtimer, softmax_time, "Softmax");
+
+//                 // Compute attention output using workspace
+//                 const attn_time = processtimer.read();
+//                 workspace.out_head = try sgemm.matmul(f32, workspace.attn_weights, workspace.value_head, workspace.allocator);
+//                 try printTimeDiff(&processtimer, attn_time, "Matmul attention output");
+
+//                 // Copy to output tensor with casting
+//                 const copy_out_time = processtimer.read();
+//                 const out_slice = h * ctx.q_len * ctx.head_dim;
+//                 for (0..ctx.q_len * ctx.head_dim) |i| {
+//                     ctx.out.data[out_slice + i] = @floatCast(workspace.out_head.data[i]);
+//                 }
+//                 try printTimeDiff(&processtimer, copy_out_time, "Copy output data");
+//             }
+//         }
+//     }.process;
+
+//     // Launch threads
+//     for (0..thread_count) |t| {
+//         const start_head = current_head;
+//         const extra_head: usize = if (t < remaining_heads) 1 else 0;
+//         current_head += heads_per_thread + extra_head;
+
+//         thread_contexts[t] = AttnThreadContext{
+//             .start_head = start_head,
+//             .end_head = current_head,
+//             .query = query_f32,
+//             .key = key_transpose_f32,
+//             .value = value_f32,
+//             .out = &out,
+//             .scale = scale,
+//             .q_len = q_len,
+//             .kv_len = kv_len,
+//             .head_dim = head_dim,
+//             .workspace = &thread_pool.workspaces[t],
+//         };
+
+//         threads[t] = try Thread.spawn(.{}, worker, .{thread_contexts[t]});
+//     }
+
+//     // Wait for all threads to complete
+//     for (threads) |thread| {
+//         thread.join();
+//     }
+
+//     try printTimeDiff(&timer, total_start, "Total Maskless Attention");
+
+//     return out;
+// }
 
 pub fn multimasklessDotProductAttention(
     query: Tensor(f16),
@@ -3483,37 +3176,56 @@ pub fn multimasklessDotProductAttention(
     try printTimeDiff(&timer, divide_work_time, "Divide work among threads");
 
     // Thread worker function
+    // Modified worker function with proper shape updates
     const worker = struct {
         fn process(ctx: AttnThreadContext) !void {
             var processtimer = try Timer.start();
             const workspace = ctx.workspace;
 
             for (ctx.start_head..ctx.end_head) |h| {
-                // Get slices for this head using pre-allocated workspace
+                // Copy head data and adjust shapes
                 const copy_head_time = processtimer.read();
                 try copyHeadData(f32, &workspace.query_head, ctx.query, h);
                 try copyHeadData(f32, &workspace.key_head, ctx.key, h);
                 try copyHeadData(f32, &workspace.value_head, ctx.value, h);
                 try printTimeDiff(&processtimer, copy_head_time, "Copy head data");
 
-                // Calculate QK^T directly in f32 using workspace tensors
+                // OPTIMIZATION: Update existing shape arrays instead of reassigning
+                // Query: [q_len, head_dim]
+                workspace.query_head.shape[0] = ctx.q_len;
+                workspace.query_head.shape[1] = ctx.head_dim;
+
+                // Key: [head_dim, kv_len] (already transposed)
+                workspace.key_head.shape[0] = ctx.head_dim;
+                workspace.key_head.shape[1] = ctx.kv_len;
+
+                // Value: [kv_len, head_dim]
+                workspace.value_head.shape[0] = ctx.kv_len;
+                workspace.value_head.shape[1] = ctx.head_dim;
+
+                // Calculate QK^T with corrected shapes
                 const matmul_time = processtimer.read();
-                workspace.attn_weights = try sgemm.matmul(f32, workspace.query_head, workspace.key_head, workspace.allocator);
+                workspace.attn_weights.shape[0] = ctx.q_len;
+                workspace.attn_weights.shape[1] = ctx.kv_len;
+                try matmulInPlace(f32, workspace.query_head, workspace.key_head, &workspace.attn_weights, workspace.allocator);
                 try printTimeDiff(&processtimer, matmul_time, "Matmul QK^T");
 
                 // Apply scaling and softmax in-place
                 const scale_time = processtimer.read();
-                for (workspace.attn_weights.data) |*w| {
+                for (workspace.attn_weights.data[0 .. ctx.q_len * ctx.kv_len]) |*w| {
                     w.* *= ctx.scale;
                 }
                 try printTimeDiff(&processtimer, scale_time, "Scale Time");
+
                 const softmax_time = processtimer.read();
                 try softmax(&workspace.attn_weights, 1, workspace.allocator);
                 try printTimeDiff(&processtimer, softmax_time, "Softmax");
 
-                // Compute attention output using workspace
+                // Compute attention output
                 const attn_time = processtimer.read();
-                workspace.out_head = try sgemm.matmul(f32, workspace.attn_weights, workspace.value_head, workspace.allocator);
+                workspace.out_head.shape[0] = ctx.q_len;
+                workspace.out_head.shape[1] = ctx.head_dim;
+                try matmulInPlace(f32, workspace.attn_weights, workspace.value_head, &workspace.out_head, workspace.allocator);
                 try printTimeDiff(&processtimer, attn_time, "Matmul attention output");
 
                 // Copy to output tensor with casting
@@ -3526,7 +3238,6 @@ pub fn multimasklessDotProductAttention(
             }
         }
     }.process;
-
     // Launch threads
     for (0..thread_count) |t| {
         const start_head = current_head;
@@ -3567,6 +3278,7 @@ fn copyHeadData(comptime T: type, dst: *Tensor(T), src: Tensor(T), head_idx: usi
     @memcpy(dst.data[0..slice_size], src.data[start_idx..][0..slice_size]);
 }
 
+/////////////////////////////////////////////// Masked Attention //////////
 // Thread context for masked attention
 const MaskedAttnThreadContext = struct {
     start_head: usize,
@@ -3714,6 +3426,9 @@ pub fn multiscaledDotProductAttention(
                 const value_slice = h * ctx.kv_len * ctx.head_dim;
                 @memcpy(workspace.value_head.data, ctx.value.data[value_slice..][0 .. ctx.kv_len * ctx.head_dim]);
 
+                if (workspace.attn_weights.data.len > 0) {
+                    workspace.attn_weights.deinit();
+                }
                 // Calculate QK^T using sgemm
                 workspace.attn_weights = try sgemm.matmul(f32, workspace.query_head, workspace.key_head, ctx.workspace.allocator);
 
@@ -3734,6 +3449,9 @@ pub fn multiscaledDotProductAttention(
                 }
 
                 try softmax(&workspace.attn_weights, 1, ctx.workspace.allocator);
+                if (workspace.out_head.data.len > 0) {
+                    workspace.out_head.deinit();
+                }
 
                 // Compute attention output using sgemm
                 workspace.out_head = try sgemm.matmul(f32, workspace.attn_weights, workspace.value_head, ctx.workspace.allocator);
