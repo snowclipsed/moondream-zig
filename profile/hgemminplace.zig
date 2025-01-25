@@ -7,17 +7,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
 const time = std.time;
 
-comptime {
-    @setFloatMode(.optimized);
-}
-
-// Compile-time optimizations for tuning parameters
-const T: usize = blk: {
-    // const cache_line = atomic.cache_line;
-    const ideal_tile = 160; // Original tile size
-    break :blk (ideal_tile + 7) & ~@as(usize, 7); // Ensure multiple of 8
-};
-
+const T: usize = 160;
 const V: usize = 8;
 const CACHE_LINE_SIZE: usize = atomic.cache_line;
 const CHUNK_SIZE: usize = 1;
@@ -30,10 +20,15 @@ const ThreadLocalData = struct {
     _padding: [CACHE_LINE_SIZE - @sizeOf(atomic.Value(usize))]u8 = undefined,
 };
 
+const mode = std.builtin.FloatMode.optimized;
+comptime {
+    @setFloatMode(mode);
+}
+
 const ThreadContext = struct {
     A: []const f16,
     B: []const f16,
-    C: []f16,
+    C: []f32,
     M: usize,
     N: usize,
     K: usize,
@@ -44,7 +39,6 @@ const ThreadContext = struct {
 };
 
 fn workerThread(ctx: ThreadContext) void {
-    @setRuntimeSafety(false);
     var local_C: [T][T]f32 align(AVX2_ALIGNMENT) = undefined;
 
     while (true) {
@@ -73,13 +67,12 @@ fn workerThread(ctx: ThreadContext) void {
                 computeTile(ctx, &local_C, i_start, j_start, k, i_end, j_end, k_end);
             }
 
-            // Write directly to f16 output with runtime safety disabled
             for (i_start..i_end) |ii| {
                 const row_offset = ii * ctx.N;
                 const local_row = ii - i_start;
                 for (j_start..j_end) |jj| {
                     const local_col = jj - j_start;
-                    ctx.C[row_offset + jj] = @floatCast(local_C[local_row][local_col]);
+                    ctx.C[row_offset + jj] += local_C[local_row][local_col];
                 }
             }
         }
@@ -96,7 +89,6 @@ fn computeTile(
     j_end: usize,
     k_end: usize,
 ) void {
-    @setRuntimeSafety(false);
     var A_local: [T][T]f32 align(32) = undefined;
     var B_local: [T][T]f32 align(32) = undefined;
 
@@ -104,7 +96,6 @@ fn computeTile(
     const i_size = i_end - i_start;
     const j_size = j_end - j_start;
 
-    // Load and convert A to f32 with runtime safety disabled
     for (0..i_size) |i| {
         const row_offset = (i_start + i) * ctx.K;
         for (0..k_size) |k| {
@@ -113,7 +104,6 @@ fn computeTile(
         }
     }
 
-    // Load and convert B to f32 with runtime safety disabled
     for (0..k_size) |k| {
         const row_offset = (k_start + k) * ctx.N;
         for (0..j_size) |j| {
@@ -185,13 +175,18 @@ fn computeTile(
     }
 }
 
-pub fn matmul(a: Tensor(f16), b: Tensor(f16), allocator: Allocator) !Tensor(f16) {
-    @setRuntimeSafety(false);
-    const A_shape = a.shape;
-    const B_shape = b.shape;
+pub fn matmul(
+    allocator: Allocator,
+    A: Tensor(f16),
+    B: Tensor(f16),
+    C: Tensor(f32),
+) !void {
+    const A_shape = A.shape;
+    const B_shape = B.shape;
+    const C_shape = C.shape;
 
-    if (A_shape.len != 2 or B_shape.len != 2) {
-        std.log.err("Incompatible Tensor Shapes, A shape : {any}, B shape {any}", .{ A_shape, B_shape });
+    if (A_shape.len != 2 or B_shape.len != 2 or C_shape.len != 2) {
+        std.log.err("Incompatible Tensor Shapes, A shape : {any}, B shape {any}, C shape {any}", .{ A_shape, B_shape, C_shape });
         return error.InvalidTensorDimension;
     }
 
@@ -199,17 +194,14 @@ pub fn matmul(a: Tensor(f16), b: Tensor(f16), allocator: Allocator) !Tensor(f16)
     const K = A_shape[1];
     const N = B_shape[1];
 
-    if (B_shape[0] != K) {
-        std.log.err("Incompatible shapes, A shape : {any}, B shape {any}", .{ A_shape, B_shape });
+    if (B_shape[0] != K or C_shape[0] != M or C_shape[1] != N) {
+        std.log.err("Incompatible shapes, A shape : {any}, B shape {any}, C shape {any}", .{ A_shape, B_shape, C_shape });
         return error.IncompatibleTensorShapes;
     }
 
-    var result = try Tensor(f16).init(allocator, &[_]usize{ M, N });
-    errdefer result.deinit();
-
-    const A_data = a.getSlice();
-    const B_data = b.getSlice();
-    const C_data = result.getSlice();
+    const A_data = A.getSlice();
+    const B_data = B.getSlice();
+    const C_data = C.getSlice();
 
     const tiles_M = (M + T - 1) / T;
     const tiles_N = (N + T - 1) / T;
@@ -234,19 +226,11 @@ pub fn matmul(a: Tensor(f16), b: Tensor(f16), allocator: Allocator) !Tensor(f16)
         .shared_counter = &shared_data,
     };
 
-    const WorkerFn = struct {
-        fn worker(ctx: ThreadContext) void {
-            workerThread(ctx);
-        }
-    };
-
     for (0..num_threads) |_| {
-        try thread_pool.append(try std.Thread.spawn(.{}, WorkerFn.worker, .{context}));
+        try thread_pool.append(try std.Thread.spawn(.{}, workerThread, .{context}));
     }
 
     for (thread_pool.items) |thread| thread.join();
-
-    return result;
 }
 //// benchmarking code ////
 
@@ -256,30 +240,31 @@ fn benchmarkMatMul(allocator: std.mem.Allocator, M: usize, N: usize, K: usize, n
     defer A.deinit();
     var B = try Tensor(f16).init(allocator, &[_]usize{ K, N });
     defer B.deinit();
+    var C = try Tensor(f32).init(allocator, &[_]usize{ M, N });
+    defer C.deinit();
 
     // Initialize with some values (random pattern)
     var rng = std.rand.DefaultPrng.init(42);
     const random = rng.random();
     for (A.data) |*val| {
-        val.* = @floatCast(random.float(f32) * 0.1 - 0.05); // Scaled down to avoid overflow
+        val.* = @floatCast(random.float(f32) * 2.0 - 1.0);
     }
     for (B.data) |*val| {
-        val.* = @floatCast(random.float(f32) * 0.1 - 0.05); // Scaled down to avoid overflow
+        val.* = @floatCast(random.float(f32) * 2.0 - 1.0);
     }
 
     // Warmup run
-    var warmup_C = try matmul(A, B, allocator);
-    warmup_C.deinit();
+    try matmul(allocator, A, B, C);
 
     // Timing runs
     var total_time: u64 = 0;
     var timer = try time.Timer.start();
 
     for (0..num_runs) |_| {
+        @memset(C.data, 0);
         timer.reset();
-        var C = try matmul(A, B, allocator);
+        try matmul(allocator, A, B, C);
         total_time += timer.read();
-        C.deinit();
     }
 
     const avg_nanos = @as(f64, @floatFromInt(total_time)) / @as(f64, @floatFromInt(num_runs));
@@ -418,77 +403,6 @@ fn compareResults(expected: *const Tensor(f32), actual: *const Tensor(f32), epsi
         try testing.expect(diff <= epsilon);
     }
 }
-// Helper functions
-fn naiveMatMulF16(A: *const Tensor(f16), B: *const Tensor(f16), C: *Tensor(f16)) !void {
-    const M = A.shape[0];
-    const K = A.shape[1];
-    const N = B.shape[1];
-
-    if (B.shape[0] != K) return error.IncompatibleTensorShapes;
-    if (C.shape[0] != M or C.shape[1] != N) return error.IncompatibleTensorShapes;
-
-    const A_data = A.getSlice();
-    const B_data = B.getSlice();
-    const C_data = C.getSlice();
-
-    for (0..M) |i| {
-        for (0..N) |j| {
-            var sum: f32 = 0; // Use f32 for intermediate calculations
-            for (0..K) |k| {
-                const a_val: f32 = @floatCast(A_data[i * K + k]);
-                const b_val: f32 = @floatCast(B_data[k * N + j]);
-                sum += a_val * b_val;
-            }
-            C_data[i * N + j] = @floatCast(sum);
-        }
-    }
-}
-
-fn compareResultsF16(expected: *const Tensor(f16), actual: *const Tensor(f16), epsilon: f32) !void {
-    if (!std.mem.eql(usize, expected.shape, actual.shape)) {
-        return error.ShapeMismatch;
-    }
-
-    var total_elements: usize = 1;
-    for (expected.shape) |dim| {
-        total_elements *= dim;
-    }
-
-    const expected_data = expected.getSlice();
-    const actual_data = actual.getSlice();
-
-    var max_diff: f32 = 0;
-    var max_diff_idx: usize = 0;
-    var num_diffs: usize = 0;
-
-    for (0..total_elements) |i| {
-        const exp_val: f32 = @floatCast(expected_data[i]);
-        const act_val: f32 = @floatCast(actual_data[i]);
-        const diff = @abs(exp_val - act_val);
-
-        // Track maximum difference
-        if (diff > max_diff) {
-            max_diff = diff;
-            max_diff_idx = i;
-        }
-
-        // Calculate relative error for larger values
-        const rel_error = if (@abs(exp_val) > 1.0) diff / @abs(exp_val) else diff;
-        const threshold = if (@abs(exp_val) > 1.0) epsilon else epsilon * 0.1;
-
-        if (rel_error > threshold) {
-            num_diffs += 1;
-            if (num_diffs <= 5) { // Only log first 5 differences
-                std.log.warn("Difference at index {}: expected {}, got {} (diff: {d}, rel_error: {d})", .{ i, exp_val, act_val, diff, rel_error });
-            }
-        }
-    }
-
-    if (num_diffs > 0) {
-        std.log.err("Total differences: {}, Max diff: {d} at index {}", .{ num_diffs, max_diff, max_diff_idx });
-        return error.TestExpectedEqual;
-    }
-}
 
 test "MatMul - Basic functionality" {
     const allocator = testing.allocator;
@@ -506,15 +420,18 @@ test "MatMul - Basic functionality" {
         fillTestPattern(&A, .Sequential);
         fillTestPattern(&B, .Sequential);
 
-        var expected = try Tensor(f16).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
-        defer expected.deinit();
-
-        try naiveMatMulF16(&A, &B, &expected);
-
-        var C = try matmul(A, B, allocator);
+        var C = try Tensor(f32).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
         defer C.deinit();
 
-        try compareResultsF16(&expected, &C, 0.005);
+        var expected = try Tensor(f32).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
+        defer expected.deinit();
+
+        // Compute with both implementations
+        try matmul(allocator, A, B, C);
+        try naiveMatMul(&A, &B, &expected);
+
+        // Compare results
+        try compareResults(&expected, &C, 0.001);
     }
 }
 
@@ -534,56 +451,16 @@ test "MatMul - Large matrices" {
         fillTestPattern(&A, .Random);
         fillTestPattern(&B, .Random);
 
-        // Normalize random values to avoid accumulation errors
-        for (A.data) |*val| val.* = @floatCast(@as(f32, @floatCast(val.*)) * 0.01);
-        for (B.data) |*val| val.* = @floatCast(@as(f32, @floatCast(val.*)) * 0.01);
-
-        var expected = try Tensor(f16).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
-        defer expected.deinit();
-
-        try naiveMatMulF16(&A, &B, &expected);
-
-        var C = try matmul(A, B, allocator);
+        var C = try Tensor(f32).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
         defer C.deinit();
 
-        try compareResultsF16(&expected, &C, 0.05); // Increased tolerance for large matrices
-    }
-}
-
-test "MatMul - Non-square matrices" {
-    const allocator = testing.allocator;
-
-    const test_shapes = [_][2][2]usize{
-        .{ .{ 50, 30 }, .{ 30, 70 } },
-        .{ .{ 25, 80 }, .{ 80, 35 } },
-        .{ .{ 100, 20 }, .{ 20, 100 } },
-    };
-
-    for (test_shapes) |shapes| {
-        const shape_a = shapes[0];
-        const shape_b = shapes[1];
-
-        var A = try Tensor(f16).init(allocator, &shape_a);
-        defer A.deinit();
-        var B = try Tensor(f16).init(allocator, &shape_b);
-        defer B.deinit();
-
-        fillTestPattern(&A, .Random);
-        fillTestPattern(&B, .Random);
-
-        // Normalize random values
-        for (A.data) |*val| val.* = @floatCast(@as(f32, @floatCast(val.*)) * 0.01);
-        for (B.data) |*val| val.* = @floatCast(@as(f32, @floatCast(val.*)) * 0.01);
-
-        var expected = try Tensor(f16).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
+        var expected = try Tensor(f32).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
         defer expected.deinit();
 
-        try naiveMatMulF16(&A, &B, &expected);
+        try matmul(allocator, A, B, C);
+        try naiveMatMul(&A, &B, &expected);
 
-        var C = try matmul(A, B, allocator);
-        defer C.deinit();
-
-        try compareResultsF16(&expected, &C, 0.05);
+        try compareResults(&expected, &C, 0.01);
     }
 }
 
@@ -603,14 +480,55 @@ test "MatMul - Identity matrix" {
         fillTestPattern(&A, .Random);
         fillTestPattern(&I, .Identity);
 
-        // Scale random values for A
-        for (A.data) |*val| val.* = @floatCast(@as(f32, @floatCast(val.*)) * 0.01);
-
-        // A * I should equal A
-        var C = try matmul(A, I, allocator);
+        var C = try Tensor(f32).init(allocator, &shape);
         defer C.deinit();
 
-        try compareResultsF16(&A, &C, 0.005);
+        // A * I should equal A
+        try matmul(allocator, A, I, C);
+
+        // Convert A to f32 for comparison
+        var A_f32 = try Tensor(f32).init(allocator, &shape);
+        defer A_f32.deinit();
+        for (A.data, A_f32.data) |a, *c| {
+            c.* = @floatCast(a);
+        }
+
+        try compareResults(&A_f32, &C, 0.001);
+    }
+}
+
+test "MatMul - Non-square matrices" {
+    const allocator = testing.allocator;
+
+    // Test various non-square matrix combinations
+    const test_shapes = [_][2][2]usize{
+        .{ .{ 50, 30 }, .{ 30, 70 } },
+        .{ .{ 25, 80 }, .{ 80, 35 } },
+        .{ .{ 100, 20 }, .{ 20, 100 } },
+    };
+
+    for (test_shapes) |shapes| {
+        const shape_a = shapes[0];
+        const shape_b = shapes[1];
+
+        var A = try Tensor(f16).init(allocator, &shape_a);
+        defer A.deinit();
+        var B = try Tensor(f16).init(allocator, &shape_b);
+        defer B.deinit();
+
+        fillTestPattern(&A, .Random);
+        fillTestPattern(&B, .Random);
+
+        var C = try Tensor(f32).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
+        defer C.deinit();
+
+        var expected = try Tensor(f32).init(allocator, &[_]usize{ shape_a[0], shape_b[1] });
+        defer expected.deinit();
+
+        try matmul(allocator, A, B, C);
+        try naiveMatMul(&A, &B, &expected);
+
+        try compareResults(&expected, &C, 0.01);
     }
 }
 
@@ -623,8 +541,22 @@ test "MatMul - Error cases" {
         defer A.deinit();
         var B = try Tensor(f16).init(allocator, &[_]usize{ 5, 6 }); // Wrong inner dimension
         defer B.deinit();
+        var C = try Tensor(f32).init(allocator, &[_]usize{ 3, 6 });
+        defer C.deinit();
 
-        try testing.expectError(error.IncompatibleTensorShapes, matmul(A, B, allocator));
+        try testing.expectError(error.IncompatibleTensorShapes, matmul(allocator, A, B, C));
+    }
+
+    // Test wrong output shape
+    {
+        var A = try Tensor(f16).init(allocator, &[_]usize{ 3, 4 });
+        defer A.deinit();
+        var B = try Tensor(f16).init(allocator, &[_]usize{ 4, 5 });
+        defer B.deinit();
+        var C = try Tensor(f32).init(allocator, &[_]usize{ 3, 6 }); // Wrong output size
+        defer C.deinit();
+
+        try testing.expectError(error.IncompatibleTensorShapes, matmul(allocator, A, B, C));
     }
 }
 
@@ -643,20 +575,16 @@ test "MatMul - Edge cases" {
         fillTestPattern(&A, .Random);
         fillTestPattern(&B, .Random);
 
-        // Scale random values
-        for (A.data) |*val| val.* = @floatCast(@as(f32, @floatCast(val.*)) * 0.01);
-        for (B.data) |*val| val.* = @floatCast(@as(f32, @floatCast(val.*)) * 0.01);
-
-        var expected = try Tensor(f16).init(allocator, &[_]usize{ size, size });
-        defer expected.deinit();
-
-        try naiveMatMulF16(&A, &B, &expected);
-
-        var C = try matmul(A, B, allocator);
+        var C = try Tensor(f32).init(allocator, &[_]usize{ size, size });
         defer C.deinit();
 
-        // Use larger epsilon for larger matrices
-        try compareResultsF16(&expected, &C, 0.05);
+        var expected = try Tensor(f32).init(allocator, &[_]usize{ size, size });
+        defer expected.deinit();
+
+        try matmul(allocator, A, B, C);
+        try naiveMatMul(&A, &B, &expected);
+
+        try compareResults(&expected, &C, 0.01);
     }
 }
 
@@ -671,36 +599,34 @@ test "MatMul - Numerical stability" {
         var B = try Tensor(f16).init(allocator, &shape);
         defer B.deinit();
 
-        // Test with very small numbers
+        // Fill with very small numbers
         fillTestPattern(&A, .Random);
         fillTestPattern(&B, .Random);
 
-        // Use very small numbers but not too small for f16
-        for (A.data) |*val| val.* = 1e-2;
-        for (B.data) |*val| val.* = 1e-2;
+        for (A.data) |*val| val.* = 1e-4;
+        for (B.data) |*val| val.* = 1e-4;
 
-        var expected = try Tensor(f16).init(allocator, &shape);
-        defer expected.deinit();
-
-        try naiveMatMulF16(&A, &B, &expected);
-
-        var C = try matmul(A, B, allocator);
+        var C = try Tensor(f32).init(allocator, &shape);
         defer C.deinit();
 
-        try compareResultsF16(&expected, &C, 0.01);
+        var expected = try Tensor(f32).init(allocator, &shape);
+        defer expected.deinit();
 
-        // Test with moderate numbers (staying well within f16 range)
-        for (A.data) |*val| val.* = 1.0;
-        for (B.data) |*val| val.* = 1.0;
+        try matmul(allocator, A, B, C);
+        try naiveMatMul(&A, &B, &expected);
 
-        var expected2 = try Tensor(f16).init(allocator, &shape);
-        defer expected2.deinit();
+        try compareResults(&expected, &C, 0.001);
 
-        try naiveMatMulF16(&A, &B, &expected2);
+        // Fill with larger numbers (but within f16 range)
+        for (A.data) |*val| val.* = 10.0;
+        for (B.data) |*val| val.* = 10.0;
 
-        var C2 = try matmul(A, B, allocator);
-        defer C2.deinit();
+        @memset(C.data, 0);
+        @memset(expected.data, 0);
 
-        try compareResultsF16(&expected2, &C2, 0.01);
+        try matmul(allocator, A, B, C);
+        try naiveMatMul(&A, &B, &expected);
+
+        try compareResults(&expected, &C, 0.1);
     }
 }

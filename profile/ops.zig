@@ -8,8 +8,8 @@ const builtin = @import("builtin");
 const StabilityError = @import("tensor.zig").StabilityError;
 const sgemm = @import("sgemm.zig");
 const matmulInPlace = @import("sgemminplace.zig").matmulInPlace;
+const hgemminplace = @import("hgemminplace.zig");
 const hgemm = @import("hgemm.zig");
-const newhgemm = @import("hgemmnew.zig");
 const Slice = @import("tensor.zig").Slice;
 const testing = std.testing;
 const expectEqual = testing.expectEqual;
@@ -1853,7 +1853,7 @@ pub fn scaledDotProductAttention(
         // Calculate QK^T and scale in one step using f32 accumulation
         var attn_weights = try Tensor(f32).init(allocator, &[_]usize{ q_len, kv_len });
         defer attn_weights.deinit();
-        try hgemm.matmul(allocator, query_head, key_head, attn_weights);
+        try hgemminplace.matmul(allocator, query_head, key_head, attn_weights);
 
         // Apply scaling
         for (attn_weights.data) |*w| {
@@ -1877,7 +1877,7 @@ pub fn scaledDotProductAttention(
         defer attn_weights_f16.deinit();
 
         // Compute attention output
-        try hgemm.matmul(allocator, attn_weights_f16, value_head, out_head);
+        try hgemminplace.matmul(allocator, attn_weights_f16, value_head, out_head);
 
         // Copy to output tensor with conversion to f16
         for (0..q_len) |q| {
@@ -1947,7 +1947,7 @@ pub fn masklessDotProductAttention(
         const qk_start = timer.read();
         var attn_weights = try Tensor(f32).init(allocator, &[_]usize{ q_len, kv_len });
         defer attn_weights.deinit();
-        try hgemm.matmul(allocator, query_head, key_head, attn_weights);
+        try hgemminplace.matmul(allocator, query_head, key_head, attn_weights);
         total_qk_time += timer.read() - qk_start;
 
         // Apply scaling

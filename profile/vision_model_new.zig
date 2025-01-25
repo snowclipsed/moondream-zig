@@ -5,12 +5,9 @@ const Allocator = std.mem.Allocator;
 const Weights = @import("weights.zig").Weights;
 const Config = @import("config.zig").Config;
 const Tensor = @import("tensor.zig").Tensor;
-const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
-const hgemm = @import("hgemmnew.zig");
-const sgemm = @import("sgemm.zig");
+const hgemm = @import("hgemm.zig");
 const printTimeDiff = @import("timediffvision.zig").printTimeDiff;
-const getAndPrintTimeDiff = @import("timediffvision.zig").getAndPrintTimeDiff;
 const c = @cImport({
     @cInclude("stb_image.h");
     @cInclude("stb_image_resize2.h");
@@ -18,6 +15,7 @@ const c = @cImport({
 });
 
 const mode = std.builtin.FloatMode.optimized;
+
 comptime {
     @setFloatMode(mode);
 }
