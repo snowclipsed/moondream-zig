@@ -1,5 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
+const model_config = @import("config.zig").MODEL_CONFIG;
 const ConfigReader = @import("config.zig").ConfigReader;
 const Weights = @import("weights.zig").Weights;
 const Tensor = @import("tensor.zig").Tensor;
@@ -14,10 +15,10 @@ const displayImage = @import("imagedisplay.zig").displayImage;
 const print = std.debug.print;
 const Timer = std.time.Timer;
 
+const mode = std.builtin.FloatMode.optimized;
 comptime {
-    @setFloatMode(.optimized);
+    @setFloatMode(mode);
 }
-const mode = @import("std").builtin.FloatMode;
 
 const main_color = "\x1b[38;5;214m";
 const reset_color = "\x1b[0m";
@@ -75,7 +76,7 @@ pub fn main() !void {
 
     // Constants and configuration
     const bin_path: []const u8 = "../moondream.bin";
-    const config_path: []const u8 = "../model_config.json";
+    // const config_path: []const u8 = "../model_config.json";
     const tokenizer_path: []const u8 = "../tokenizer.bin";
     const image_path: []const u8 = "../images/demo-1.jpg";
     const max_tokens: usize = 200;
@@ -87,19 +88,21 @@ pub fn main() !void {
     defer tokenizer.deinit();
     try printTimeDiff(tokenizer_start, timer.read(), "Tokenizer Loading");
 
-    // Load and parse config
-    const config_start = timer.read();
-    const config_file = try std.fs.cwd().openFile(config_path, .{});
-    defer config_file.close();
-    const config_size = (try config_file.stat()).size;
-    const config_buffer = try allocator.alloc(u8, config_size);
-    defer allocator.free(config_buffer);
-    _ = try config_file.readAll(config_buffer);
+    // // Load and parse config
+    // const config_start = timer.read();
+    // const config_file = try std.fs.cwd().openFile(config_path, .{});
+    // defer config_file.close();
+    // const config_size = (try config_file.stat()).size;
+    // const config_buffer = try allocator.alloc(u8, config_size);
+    // defer allocator.free(config_buffer);
+    // _ = try config_file.readAll(config_buffer);
 
-    var json_tree = try std.json.parseFromSlice(ConfigReader, allocator, config_buffer, .{});
-    defer json_tree.deinit();
-    const config = json_tree.value.config();
-    try printTimeDiff(config_start, timer.read(), "Config Loading");
+    // var json_tree = try std.json.parseFromSlice(ConfigReader, allocator, config_buffer, .{});
+    // defer json_tree.deinit();
+    // const config = json_tree.value.config();
+    // try printTimeDiff(config_start, timer.read(), "Config Loading");
+
+    const config = model_config;
 
     // Load model weights
     const weights_start = timer.read();
@@ -117,9 +120,11 @@ pub fn main() !void {
 
     // Initialize vision model and encode image
     const modelinit_start = timer.read();
-    var vision_model = try VisionModel.init(config, weights, allocator);
+    const VisionModelType = VisionModel(model_config);
+    var vision_model = try VisionModelType.init(weights, allocator);
     defer vision_model.deinit();
-    var text_model = try TextModel.init(config, weights, allocator);
+    const TextModelType = TextModel(model_config);
+    var text_model = try TextModelType.init(weights, allocator);
     defer text_model.deinit();
 
     try printTimeDiff(modelinit_start, timer.read(), "Models Init");
@@ -166,7 +171,8 @@ pub fn main() !void {
 
     // Initialize KV cache
     const cache_start = timer.read();
-    var kv_cache = try KVCache.init(allocator, config.n_layers, config.n_heads, config.head_dim);
+    const MyKVCache = KVCache(config);
+    var kv_cache = try MyKVCache.init(allocator);
     defer kv_cache.deinit();
     try printTimeDiff(cache_start, timer.read(), "KV Cache Initialization");
 
@@ -247,3 +253,5 @@ pub fn main() !void {
     // Print total execution time
     try printTimeDiff(total_start, timer.read(), "Total Execution");
 }
+
+// TODO : Add stream disable at comptime
