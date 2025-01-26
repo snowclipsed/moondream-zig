@@ -543,7 +543,7 @@ test "matmul numerical stability" {
         }
     }
 }
-pub fn calculateGflops(allocator: std.mem.Allocator, M: usize, N: usize, K: usize, iterations: usize) !f64 {
+pub fn calculateGflops(allocator: std.mem.Allocator, M: usize, N: usize, K: usize, iterations: usize) !struct { avg: f64, min: f64, max: f64, std_dev: f64 } {
     const shape_a = [_]usize{ M, K };
     const shape_b = [_]usize{ K, N };
 
@@ -555,11 +555,11 @@ pub fn calculateGflops(allocator: std.mem.Allocator, M: usize, N: usize, K: usiz
     // Initialize with random data
     var prng = std.rand.DefaultPrng.init(0);
     var random = prng.random();
-    for (a.data) |*val| val.* = random.float(f32);
-    for (b.data) |*val| val.* = random.float(f32);
+    for (a.data) |*val| val.* = random.float(f32) * 2 - 1; // Range [-1, 1]
+    for (b.data) |*val| val.* = random.float(f32) * 2 - 1;
 
-    // Warmup run
-    {
+    // Warmup runs (2 iterations)
+    for (0..2) |_| {
         var warmup = try matmul(f32, a, b, allocator);
         defer warmup.deinit();
     }
@@ -567,6 +567,7 @@ pub fn calculateGflops(allocator: std.mem.Allocator, M: usize, N: usize, K: usiz
     var gflops_array = try allocator.alloc(f64, iterations);
     defer allocator.free(gflops_array);
 
+    // Main benchmark loop
     for (0..iterations) |i| {
         var timer = try std.time.Timer.start();
         var result = try matmul(f32, a, b, allocator);
@@ -578,12 +579,28 @@ pub fn calculateGflops(allocator: std.mem.Allocator, M: usize, N: usize, K: usiz
         gflops_array[i] = @as(f64, @floatFromInt(opers)) / seconds / 1e9;
     }
 
-    // Calculate average GFLOPS
-    var total_gflops: f64 = 0;
+    // Calculate statistics
+    var total: f64 = 0;
+    var min: f64 = gflops_array[0];
+    var max: f64 = gflops_array[0];
+
     for (gflops_array) |gflops| {
-        total_gflops += gflops;
+        total += gflops;
+        min = @min(min, gflops);
+        max = @max(max, gflops);
     }
-    return total_gflops / @as(f64, @floatFromInt(iterations));
+
+    const avg = total / @as(f64, @floatFromInt(iterations));
+
+    // Calculate standard deviation
+    var sum_squared_diff: f64 = 0;
+    for (gflops_array) |gflops| {
+        const diff = gflops - avg;
+        sum_squared_diff += diff * diff;
+    }
+    const std_dev = @sqrt(sum_squared_diff / @as(f64, @floatFromInt(iterations)));
+
+    return .{ .avg = avg, .min = min, .max = max, .std_dev = std_dev };
 }
 
 pub fn main() !void {
@@ -592,26 +609,48 @@ pub fn main() !void {
     const allocator = arena.allocator();
 
     // Define test sizes
-    const sizes = [_]struct { m: usize, n: usize, k: usize }{
-        .{ .m = 256, .n = 256, .k = 256 },
-        .{ .m = 512, .n = 512, .k = 512 },
-        .{ .m = 1024, .n = 1024, .k = 1024 },
-        .{ .m = 1024, .n = 2048, .k = 1024 },
-        .{ .m = 2048, .n = 2048, .k = 2048 },
-        .{ .m = 2048, .n = 4096, .k = 2048 },
-        .{ .m = 4096, .n = 4096, .k = 4096 },
-        .{ .m = 8192, .n = 2048, .k = 8192 },
-        .{ .m = 1152, .n = 4304, .k = 1152 },
+    const sizes = [_]struct { m: usize, n: usize, k: usize, desc: []const u8 }{
+        .{ .m = 800, .n = 6142, .k = 2048, .desc = "Actual scenario" },
+        .{ .m = 1, .n = 6142, .k = 2048, .desc = "Actual scenario 2" },
+        .{ .m = 256, .n = 256, .k = 256, .desc = "Small square" },
+        .{ .m = 512, .n = 512, .k = 512, .desc = "Medium square" },
+        .{ .m = 1024, .n = 1024, .k = 1024, .desc = "Large square" },
+        .{ .m = 1024, .n = 2048, .k = 1024, .desc = "Wide rectangle" },
+        .{ .m = 2048, .n = 2048, .k = 2048, .desc = "Very large square" },
+        .{ .m = 2048, .n = 4096, .k = 2048, .desc = "Large wide" },
+        .{ .m = 4096, .n = 4096, .k = 4096, .desc = "Huge square" },
+        .{ .m = 8192, .n = 2048, .k = 8192, .desc = "Tall large K" },
+        .{ .m = 1152, .n = 4304, .k = 1152, .desc = "Wide custom" },
+        .{ .m = 1, .n = 1, .k = 1, .desc = "Tiny 1x1" },
+        .{ .m = 1, .n = 1, .k = 2048, .desc = "Deep vector" },
+        .{ .m = 2048, .n = 1, .k = 1, .desc = "Tall vector" },
+        .{ .m = 2048, .n = 1, .k = 2048, .desc = "Tall deep vector" },
+        .{ .m = 1, .n = 2048, .k = 2048, .desc = "Wide deep vector" },
     };
 
     const iterations = 5;
+    var stdout = std.io.getStdOut().writer();
 
-    try std.io.getStdOut().writer().print("\nRunning MatMul Benchmark\n", .{});
-    try std.io.getStdOut().writer().print("T = {d} \nV = {d} \n", .{ Tile, Vec });
-    try std.io.getStdOut().writer().print("Number of threads = {d}\n", .{try std.Thread.getCpuCount()});
+    try stdout.print("\nMatMul Benchmark\n", .{});
+    try stdout.print("Configuration:\n", .{});
+    try stdout.print("  Tile size: {d}\n", .{Tile});
+    try stdout.print("  Vector size: {d}\n", .{Vec});
+    try stdout.print("  Number of threads: {d}\n", .{try std.Thread.getCpuCount()});
+    try stdout.print("  Iterations per test: {d}\n\n", .{iterations});
+
+    // Print header
+    try stdout.print("{s:<20} {s:<15} {s:<15} {s:<15} {s:<12} {s:<12} {s:<12} {s:<12}\n", .{ "Description", "Size", "Memory (MB)", "GFLOPS/iter", "Min", "Max", "StdDev", "GB/s" });
+    try stdout.print("{s}\n", .{"-" ** 110});
 
     for (sizes) |size| {
-        const avg_gflops = try calculateGflops(allocator, size.m, size.n, size.k, iterations);
-        try std.io.getStdOut().writer().print("Matrix size: {d}x{d}x{d}, GFLOPS: {d:.2}\n", .{ size.m, size.n, size.k, avg_gflops });
+        const memory_mb = @as(f64, @floatFromInt(size.m * size.n + size.n * size.k + size.m * size.k)) * 4.0 / (1024 * 1024);
+        const result = try calculateGflops(allocator, size.m, size.n, size.k, iterations);
+
+        // Calculate memory bandwidth (GB/s)
+        const elements_accessed = size.m * size.k + size.k * size.n + size.m * size.n;
+        const bytes_accessed = elements_accessed * @sizeOf(f32);
+        const gb_per_s = @as(f64, @floatFromInt(bytes_accessed)) * @as(f64, @floatFromInt(iterations)) / 1e9;
+
+        try stdout.print("{s:<20} {d}x{d}x{d:<7} {d:>8.1} {d:>14.1} {d:>11.1} {d:>11.1} {d:>11.2} {d:>11.1}\n", .{ size.desc, size.m, size.n, size.k, memory_mb, result.avg, result.min, result.max, result.std_dev, gb_per_s });
     }
 }
