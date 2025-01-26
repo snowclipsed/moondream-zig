@@ -1455,20 +1455,80 @@ pub fn TensorView(comptime DataType: type) type {
 
             const total_elements = calculateSize(self.shape);
             var i: usize = 0;
-            while (i < total_elements) : (i += 1) {
-                // Get source index using view's strides
-                const src_idx = self.getDataIndex(coords);
-                // Destination index is sequential
-                result.data[i] = self.data[src_idx];
 
-                // Update coordinates
-                var dim = self.shape.len;
-                while (dim > 0) {
-                    dim -= 1;
-                    coords[dim] += 1;
-                    if (coords[dim] < self.shape[dim]) break;
-                    coords[dim] = 0;
-                }
+            switch (self.shape.len) {
+                // Specialized for common tensor dimensions
+                1 => while (i < total_elements) : (i += 1) {
+                    const src_idx = self.offset + coords[0] * self.strides[0];
+                    result.data[i] = self.data[src_idx];
+                    coords[0] += 1;
+                },
+                2 => while (i < total_elements) : (i += 1) {
+                    const src_idx = self.offset +
+                        coords[0] * self.strides[0] +
+                        coords[1] * self.strides[1];
+                    result.data[i] = self.data[src_idx];
+
+                    coords[1] += 1;
+                    if (coords[1] >= self.shape[1]) {
+                        coords[1] = 0;
+                        coords[0] += 1;
+                    }
+                },
+                3 => while (i < total_elements) : (i += 1) {
+                    const src_idx = self.offset +
+                        coords[0] * self.strides[0] +
+                        coords[1] * self.strides[1] +
+                        coords[2] * self.strides[2];
+                    result.data[i] = self.data[src_idx];
+
+                    coords[2] += 1;
+                    if (coords[2] >= self.shape[2]) {
+                        coords[2] = 0;
+                        coords[1] += 1;
+                        if (coords[1] >= self.shape[1]) {
+                            coords[1] = 0;
+                            coords[0] += 1;
+                        }
+                    }
+                },
+                4 => while (i < total_elements) : (i += 1) {
+                    const src_idx = self.offset +
+                        coords[0] * self.strides[0] +
+                        coords[1] * self.strides[1] +
+                        coords[2] * self.strides[2] +
+                        coords[3] * self.strides[3];
+                    result.data[i] = self.data[src_idx];
+
+                    coords[3] += 1;
+                    if (coords[3] >= self.shape[3]) {
+                        coords[3] = 0;
+                        coords[2] += 1;
+                        if (coords[2] >= self.shape[2]) {
+                            coords[2] = 0;
+                            coords[1] += 1;
+                            if (coords[1] >= self.shape[1]) {
+                                coords[1] = 0;
+                                coords[0] += 1;
+                            }
+                        }
+                    }
+                },
+                else => {
+                    // Fallback for higher dimensions
+                    while (i < total_elements) : (i += 1) {
+                        const src_idx = self.getDataIndex(coords);
+                        result.data[i] = self.data[src_idx];
+
+                        var dim = self.shape.len;
+                        while (dim > 0) {
+                            dim -= 1;
+                            coords[dim] += 1;
+                            if (coords[dim] < self.shape[dim]) break;
+                            coords[dim] = 0;
+                        }
+                    }
+                },
             }
 
             return result;
