@@ -15,6 +15,14 @@ const displayImage = @import("imagedisplay.zig").displayImage;
 const print = std.debug.print;
 const Timer = std.time.Timer;
 
+const ENABLE_STREAMING = true; // Comptime flag to control token streaming
+
+fn writeToken(stdout: anytype, token: []const u8) !void {
+    if (ENABLE_STREAMING) {
+        try stdout.writeAll(token);
+    }
+}
+
 const mode = std.builtin.FloatMode.optimized;
 comptime {
     @setFloatMode(mode);
@@ -190,6 +198,14 @@ pub fn main() !void {
 
     try stdout.writeAll("\nGenerated text: ");
 
+    // Pre-allocate buffers that will be reused in the loop
+    var next_token_tensor = try Tensor(u32).init(allocator, &[_]usize{1});
+    defer next_token_tensor.deinit();
+
+    var next_token_list = std.ArrayList(u32).init(allocator);
+    defer next_token_list.deinit();
+    try next_token_list.ensureTotalCapacity(1);
+
     // Generation loop
     const generation_start = timer.read();
     var total_decoder_time: i128 = 0;
@@ -215,8 +231,7 @@ pub fn main() !void {
         if (next_token_id == tokenizer.eos_token) break;
 
         const embed_start = timer.read();
-        var next_token_tensor = try Tensor(u32).init(allocator, &[_]usize{1});
-        defer next_token_tensor.deinit();
+        // Reuse pre-allocated tensor instead of creating new one
         next_token_tensor.data[0] = @intCast(next_token_id);
 
         var new_embeds = try text_model.text_encoder(next_token_tensor);
@@ -225,24 +240,27 @@ pub fn main() !void {
         input_embeds = new_embeds;
         total_embedding_time += timer.read() - embed_start;
 
-        var next_token_list = std.ArrayList(u32).init(allocator);
-        defer next_token_list.deinit();
+        // Reuse pre-allocated list instead of creating new one
+        next_token_list.clearRetainingCapacity();
         try next_token_list.append(@intCast(next_token_id));
 
         const decoded = try tokenizer.decode(next_token_list);
         defer allocator.free(decoded);
 
         try output_buffer.appendSlice(decoded);
-        try stdout.writeAll(decoded);
+        try writeToken(stdout, decoded);
 
         pos += 1;
         token_count += 1;
     }
 
-    const generation_time = timer.read() - generation_start;
+    if (!ENABLE_STREAMING) {
+        try stdout.writeAll(output_buffer.items);
+    }
     try stdout.writeByte('\n');
 
-    // Print generation statistics
+    const generation_time = timer.read() - generation_start;
+
     try stdout.print("\n{s}Generation Statistics:{s}\n", .{ time_color, reset_color });
     try stdout.print("Total tokens generated: {d}\n", .{token_count});
     try stdout.print("Average time per token: {d:.2}ms\n", .{
