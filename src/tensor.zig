@@ -268,13 +268,19 @@ pub fn Tensor(comptime DataType: type) type {
         /// ```
         // Shape operations
         pub fn reshape(self: *Self, new_shape: []const usize) !void {
+            // Calculate new size
             var new_size: usize = 1;
             for (new_shape) |dim| {
                 new_size *= dim;
             }
 
+            // Calculate current size from shape
+            var current_size: usize = 1;
+            for (self.shape) |dim| {
+                current_size *= dim;
+            }
+
             // Verify that the new shape is compatible
-            const current_size = @as(usize, @intCast(self.data.len));
             if (new_size != current_size) {
                 return error.IncompatibleShape;
             }

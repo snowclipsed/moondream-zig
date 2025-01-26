@@ -483,16 +483,18 @@ pub fn KVCache(comptime model_config: Config) type {
     return struct {
         const Self = @This();
         const config = model_config;
-        // Compile-time constants from config
-        const max_seq_len: usize = 2048; // Keep original hardcoded value
+        const max_seq_len: usize = 2048;
         const n_layers: usize = config.n_layers;
         const n_heads: usize = config.n_heads;
         const head_dim: usize = config.head_dim;
 
+        // SIMD optimization constants
+        const SimdVec = @Vector(8, f16);
+        const simd_width = 8;
+
         layers: []LayerCache,
         allocator: Allocator,
 
-        // Updated to use comptime dimensions
         pub fn init(allocator: Allocator) !Self {
             var layers = try allocator.alloc(LayerCache, n_layers);
             errdefer allocator.free(layers);
@@ -520,6 +522,23 @@ pub fn KVCache(comptime model_config: Config) type {
             value: Tensor(f16),
             current_len: usize,
 
+            fn simdCopySlice(dst: []f16, src: []const f16, length: usize) void {
+                const aligned_len = length - (length % simd_width);
+                var i: usize = 0;
+
+                // SIMD copy for aligned chunks
+                while (i < aligned_len) : (i += simd_width) {
+                    const src_aligned = @as(*align(2) const [simd_width]f16, @ptrCast(src[i..].ptr));
+                    const vec = @as(SimdVec, @bitCast(src_aligned.*));
+                    @as(*SimdVec, @alignCast(@ptrCast(dst[i..].ptr))).* = vec;
+                }
+
+                // Copy remaining elements
+                while (i < length) : (i += 1) {
+                    dst[i] = src[i];
+                }
+            }
+
             pub fn init(allocator: Allocator) !LayerCache {
                 return LayerCache{
                     .key = try Tensor(f16).init(allocator, &[_]usize{ n_heads, max_seq_len, head_dim }),
@@ -528,7 +547,6 @@ pub fn KVCache(comptime model_config: Config) type {
                 };
             }
 
-            // Rest of LayerCache implementation remains the same
             pub fn reset(self: *LayerCache) void {
                 self.current_len = 0;
             }
@@ -536,26 +554,39 @@ pub fn KVCache(comptime model_config: Config) type {
             pub fn deinit(self: *LayerCache) void {
                 self.key.deinit();
                 self.value.deinit();
-                self.* = undefined; // Add this
+                self.* = undefined;
             }
 
             pub fn getActiveCache(self: *LayerCache) !struct { key: Tensor(f16), value: Tensor(f16) } {
-                var key_slice = try self.key.getSliceRange(&[_]Slice{
-                    Slice.full(),
-                    Slice.from(0, self.current_len),
-                    Slice.full(),
-                });
-                errdefer key_slice.deinit();
+                // Create new tensors with active dimensions
+                var key_active = try Tensor(f16).init(self.key.allocator, &[_]usize{ n_heads, self.current_len, head_dim });
+                errdefer key_active.deinit();
 
-                var value_slice = try self.value.getSliceRange(&[_]Slice{
-                    Slice.full(),
-                    Slice.from(0, self.current_len),
-                    Slice.full(),
-                });
+                var value_active = try Tensor(f16).init(self.value.allocator, &[_]usize{ n_heads, self.current_len, head_dim });
+                errdefer value_active.deinit();
 
-                errdefer value_slice.deinit();
+                // Calculate strides for proper memory layout
+                const src_head_stride = max_seq_len * head_dim;
+                const dst_head_stride = self.current_len * head_dim;
 
-                return .{ .key = key_slice, .value = value_slice };
+                // Copy data maintaining exact memory layout
+                for (0..n_heads) |h| {
+                    // Process each head
+                    const src_head_offset = h * src_head_stride;
+                    const dst_head_offset = h * dst_head_stride;
+
+                    // Copy data for each sequence position
+                    for (0..self.current_len) |s| {
+                        const src_offset = src_head_offset + s * head_dim;
+                        const dst_offset = dst_head_offset + s * head_dim;
+
+                        // Use SIMD copy for the head dimension
+                        simdCopySlice(key_active.data[dst_offset..][0..head_dim], self.key.data[src_offset..][0..head_dim], head_dim);
+                        simdCopySlice(value_active.data[dst_offset..][0..head_dim], self.value.data[src_offset..][0..head_dim], head_dim);
+                    }
+                }
+
+                return .{ .key = key_active, .value = value_active };
             }
         };
 
@@ -564,7 +595,7 @@ pub fn KVCache(comptime model_config: Config) type {
                 layer.deinit();
             }
             self.allocator.free(self.layers);
-            self.* = undefined; // Add this
+            self.* = undefined;
         }
 
         pub fn reset(self: *Self) void {
