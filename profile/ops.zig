@@ -1627,6 +1627,8 @@ const Vec8f32 = @Vector(8, f32);
 pub fn applyRotaryEmb(
     allocator: Allocator,
     x: Tensor(f16),
+    n_heads: usize,
+    head_dim: usize,
     freqs_cis: Tensor(f32),
     position_ids: Tensor(usize),
     rot_dim: usize,
@@ -1637,9 +1639,9 @@ pub fn applyRotaryEmb(
         return error.InvalidRotationDimension;
     }
 
-    const n_heads = x.shape[0];
+    // const n_heads = x.shape[0];
     const seq_len = x.shape[1];
-    const head_dim = x.shape[2];
+    // const head_dim = x.shape[2];
     const half_rot = rot_dim / 2;
 
     // Allocate single output buffer
@@ -3352,17 +3354,28 @@ pub fn multiscaledDotProductAttention(
     key: Tensor(f16),
     value: Tensor(f16),
     mask: Tensor(bool),
+    n_heads: usize,
+    head_dim: usize,
     allocator: Allocator,
 ) !Tensor(f16) {
-    const n_heads = query.shape[0];
+    // const n_heads = query.shape[0];
     const q_len = query.shape[1];
     const kv_len = key.shape[1];
-    const head_dim = query.shape[2];
+    // const head_dim = query.shape[2];
+    var timer = try Timer.start();
+    const total_start = timer.read();
 
+    if (q_len == 1) {
+        return try singleTokenAttention(query, key, value, mask, allocator);
+    }
+
+    const scale_time = timer.read();
     // Scale factor
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    try printTimeDiff(&timer, scale_time, "Scale Time");
 
     // Initialize output tensor
+    const init_and_cast_time = timer.read();
     var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
     errdefer out.deinit();
 
@@ -3378,6 +3391,10 @@ pub fn multiscaledDotProductAttention(
     var key_transpose = try Tensor(f32).init(allocator, &[_]usize{ n_heads, head_dim, kv_len });
     defer key_transpose.deinit();
 
+    try printTimeDiff(&timer, init_and_cast_time, "Init and Query and Value tensors");
+
+    const transpose_time = timer.read();
+    //TODO: CHANGE THIS!!
     // Manual transpose since we know the exact layout
     for (0..n_heads) |h| {
         for (0..kv_len) |k| {
@@ -3388,8 +3405,11 @@ pub fn multiscaledDotProductAttention(
             }
         }
     }
+    try printTimeDiff(&timer, transpose_time, "Transpose key");
 
     // Initialize thread pool and workspaces with correct dimensions
+
+    const pool_init_time = timer.read();
     const thread_count = @min(n_heads, try Thread.getCpuCount());
     var thread_pool = try MaskedThreadPoolContext.init(allocator, thread_count, q_len, kv_len, head_dim);
     defer thread_pool.deinit();
@@ -3404,14 +3424,19 @@ pub fn multiscaledDotProductAttention(
     var current_head: usize = 0;
     var thread_contexts = try allocator.alloc(MaskedAttnThreadContext, thread_count);
     defer allocator.free(thread_contexts);
+    try printTimeDiff(&timer, pool_init_time, "Init thread pool");
 
     // Thread worker function
     const worker = struct {
         fn process(ctx: MaskedAttnThreadContext) !void {
+            var processtimer = try Timer.start();
+            const workertime = processtimer.read();
             const workspace = ctx.workspace;
 
             for (ctx.start_head..ctx.end_head) |h| {
                 // Get query slice
+
+                const slice_copy_time = processtimer.read();
                 const query_slice = h * ctx.q_len * ctx.head_dim;
                 @memcpy(workspace.query_head.data, ctx.query.data[query_slice..][0 .. ctx.q_len * ctx.head_dim]);
 
@@ -3422,19 +3447,22 @@ pub fn multiscaledDotProductAttention(
                 // Get value slice
                 const value_slice = h * ctx.kv_len * ctx.head_dim;
                 @memcpy(workspace.value_head.data, ctx.value.data[value_slice..][0 .. ctx.kv_len * ctx.head_dim]);
+                try printTimeDiff(&processtimer, slice_copy_time, "Copy head data");
 
                 if (workspace.attn_weights.data.len > 0) {
                     workspace.attn_weights.deinit();
                 }
                 // Calculate QK^T using sgemm
+                const matmul_time = processtimer.read();
                 workspace.attn_weights = try sgemm(f32, workspace.query_head, workspace.key_head, ctx.workspace.allocator);
-
+                try printTimeDiff(&processtimer, matmul_time, "Matmul QK^T");
                 // Apply scaling
                 for (workspace.attn_weights.data) |*w| {
                     w.* *= ctx.scale;
                 }
 
                 // Apply attention mask
+                const mask_time = processtimer.read();
                 for (0..ctx.q_len) |i| {
                     for (0..ctx.kv_len) |j| {
                         const mask_idx = i * ctx.mask.shape[2] + j;
@@ -3444,21 +3472,30 @@ pub fn multiscaledDotProductAttention(
                         }
                     }
                 }
+                try printTimeDiff(&processtimer, mask_time, "Apply mask");
 
+                const softmax_time = processtimer.read();
                 try softmax(&workspace.attn_weights, 1, ctx.workspace.allocator);
                 if (workspace.out_head.data.len > 0) {
                     workspace.out_head.deinit();
                 }
+                try printTimeDiff(&processtimer, softmax_time, "Softmax");
 
+                const attn_time = processtimer.read();
                 // Compute attention output using sgemm
                 workspace.out_head = try sgemm(f32, workspace.attn_weights, workspace.value_head, ctx.workspace.allocator);
 
+                try printTimeDiff(&processtimer, attn_time, "Matmul attention output");
+
+                const copy_out_time = processtimer.read();
                 // Copy to output tensor with casting
                 const out_slice = h * ctx.q_len * ctx.head_dim;
                 for (0..ctx.q_len * ctx.head_dim) |i| {
                     ctx.out.data[out_slice + i] = @floatCast(workspace.out_head.data[i]);
                 }
+                try printTimeDiff(&processtimer, copy_out_time, "Copy output data");
             }
+            try printTimeDiff(&processtimer, workertime, "Worker Time");
         }
     }.process;
 
@@ -3491,5 +3528,173 @@ pub fn multiscaledDotProductAttention(
         thread.join();
     }
 
+    try printTimeDiff(&timer, total_start, "Total Masked Attention");
     return out;
 }
+
+fn singleTokenAttention(
+    query: Tensor(f16),
+    key: Tensor(f16),
+    value: Tensor(f16),
+    mask: Tensor(bool),
+    allocator: Allocator,
+) !Tensor(f16) {
+    const n_heads = query.shape[0];
+    const kv_len = key.shape[1];
+    const head_dim = query.shape[2];
+    //
+    // Pre-allocate output tensor (n_heads x 1 x head_dim)
+    var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, 1, head_dim });
+    errdefer out.deinit();
+    //
+    // Scale factor
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    //
+    // Process each head in parallel
+    const thread_count = @min(n_heads, try Thread.getCpuCount());
+    var threads = try allocator.alloc(Thread, thread_count);
+    defer allocator.free(threads);
+    //
+    // Simplified workspace for single token processing
+    const SingleTokenWorkspace = struct {
+        attn_weights: []f32,
+        out_head: []f32,
+        allocator: Allocator,
+        //
+        fn init(ally: Allocator, in_kv_len: usize, in_head_dim: usize) !@This() {
+            return .{
+                .attn_weights = try ally.alloc(f32, in_kv_len),
+                .out_head = try ally.alloc(f32, in_head_dim),
+                .allocator = ally,
+            };
+        }
+        //
+        fn deinit(self: *@This()) void {
+            self.allocator.free(self.attn_weights);
+            self.allocator.free(self.out_head);
+        }
+    };
+    //
+    // Simplified context for single token processing
+    const SingleTokenContext = struct {
+        start_head: usize,
+        end_head: usize,
+        query: Tensor(f16),
+        key: Tensor(f16),
+        value: Tensor(f16),
+        mask: Tensor(bool),
+        out: *Tensor(f16),
+        scale: f32,
+        kv_len: usize,
+        head_dim: usize,
+        workspace: *SingleTokenWorkspace,
+    };
+    //
+    // Allocate workspaces
+    var workspaces = try allocator.alloc(SingleTokenWorkspace, thread_count);
+    defer {
+        for (workspaces) |*workspace| {
+            workspace.deinit();
+        }
+        allocator.free(workspaces);
+    }
+    //
+    for (0..thread_count) |i| {
+        workspaces[i] = try SingleTokenWorkspace.init(allocator, kv_len, head_dim);
+    }
+    //
+    // Worker function optimized for single token
+    const worker = struct {
+        fn process(ctx: SingleTokenContext) !void {
+            const workspace = ctx.workspace;
+            //
+            for (ctx.start_head..ctx.end_head) |h| {
+                // Direct computation of attention scores without intermediate allocations
+                for (0..ctx.kv_len) |j| {
+                    var score: f32 = 0;
+                    for (0..ctx.head_dim) |d| {
+                        const q_val = @as(f32, @floatCast(ctx.query.data[h * ctx.head_dim + d]));
+                        const k_val = @as(f32, @floatCast(ctx.key.data[h * ctx.kv_len * ctx.head_dim + j * ctx.head_dim + d]));
+                        score += q_val * k_val;
+                    }
+                    workspace.attn_weights[j] = score * ctx.scale;
+                    //
+                    // Apply mask inline
+                    if (!ctx.mask.data[j]) {
+                        workspace.attn_weights[j] = -std.math.inf(f32);
+                    }
+                }
+                //
+                // Inline softmax for better cache utilization
+                var max_val: f32 = -std.math.inf(f32);
+                for (workspace.attn_weights[0..ctx.kv_len]) |w| {
+                    max_val = @max(max_val, w);
+                }
+                //
+                var sum: f32 = 0;
+                for (workspace.attn_weights[0..ctx.kv_len]) |*w| {
+                    w.* = @exp(w.* - max_val);
+                    sum += w.*;
+                }
+                //
+                const inv_sum = 1.0 / sum;
+                for (workspace.attn_weights[0..ctx.kv_len]) |*w| {
+                    w.* *= inv_sum;
+                }
+                //
+                // Compute output directly
+                @memset(workspace.out_head, 0);
+                for (0..ctx.kv_len) |j| {
+                    const weight = workspace.attn_weights[j];
+                    for (0..ctx.head_dim) |d| {
+                        const v_val = @as(f32, @floatCast(ctx.value.data[h * ctx.kv_len * ctx.head_dim + j * ctx.head_dim + d]));
+                        workspace.out_head[d] += weight * v_val;
+                    }
+                }
+                //
+                // Copy to output with casting
+                for (0..ctx.head_dim) |d| {
+                    ctx.out.data[h * ctx.head_dim + d] = @floatCast(workspace.out_head[d]);
+                }
+            }
+        }
+    }.process;
+    //
+    // Launch threads
+    var contexts = try allocator.alloc(SingleTokenContext, thread_count);
+    defer allocator.free(contexts);
+    //
+    const heads_per_thread = n_heads / thread_count;
+    const remaining_heads = n_heads % thread_count;
+    var current_head: usize = 0;
+    //
+    for (0..thread_count) |t| {
+        const start_head = current_head;
+        const extra_head: usize = if (t < remaining_heads) 1 else 0;
+        current_head += heads_per_thread + extra_head;
+        //
+        contexts[t] = SingleTokenContext{
+            .start_head = start_head,
+            .end_head = current_head,
+            .query = query,
+            .key = key,
+            .value = value,
+            .mask = mask,
+            .out = &out,
+            .scale = scale,
+            .kv_len = kv_len,
+            .head_dim = head_dim,
+            .workspace = &workspaces[t],
+        };
+        //
+        threads[t] = try Thread.spawn(.{}, worker, .{contexts[t]});
+    }
+    //
+    for (threads) |thread| {
+        thread.join();
+    }
+    //
+    return out;
+}
+
+// TODO : take kv len and head dim as comptime params!

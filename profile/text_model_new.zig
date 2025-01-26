@@ -259,21 +259,35 @@ pub fn TextModel(comptime model_config: Config) type {
             defer qkv_view.deinit();
 
             // Get chunks using views and convert to contiguous tensors
+            const q_split_time = timer.read();
             var q_chunk_view = try qkv_view.getChunkView(1, 0, num_chunks);
             defer q_chunk_view.deinit();
+            try printTimeDiff(&timer, q_split_time, "QKV Split Q");
+
+            const q_contig_time = timer.read();
             var q = try q_chunk_view.toContiguousTensor();
             defer q.deinit();
+            try printTimeDiff(&timer, q_contig_time, "Q Contiguous");
 
+            const k_split_time = timer.read();
             var k_chunk_view = try qkv_view.getChunkView(1, 1, num_chunks);
             defer k_chunk_view.deinit();
+            try printTimeDiff(&timer, k_split_time, "QKV Split K");
+
+            const k_contig_time = timer.read();
             var k = try k_chunk_view.toContiguousTensor();
             defer k.deinit();
+            try printTimeDiff(&timer, k_contig_time, "K Contiguous");
 
+            const v_split_time = timer.read();
             var v_chunk_view = try qkv_view.getChunkView(1, 2, num_chunks);
             defer v_chunk_view.deinit();
+            try printTimeDiff(&timer, v_split_time, "QKV Split V");
+            const v_contig_time = timer.read();
             var v = try v_chunk_view.toContiguousTensor();
             defer v.deinit();
-            try printTimeDiff(&timer, split_start, "QKV Split");
+            try printTimeDiff(&timer, v_contig_time, "V Contiguous");
+            try printTimeDiff(&timer, split_start, "TOTAL QKV Split");
 
             // Reshape and transpose operations
             const reshape_start = timer.read();
@@ -299,6 +313,8 @@ pub fn TextModel(comptime model_config: Config) type {
             var qr = try ops.applyRotaryEmb(
                 self.allocator,
                 q,
+                n_heads,
+                head_dim,
                 self.freqs_cis,
                 position_ids,
                 rot_dim,
@@ -308,6 +324,8 @@ pub fn TextModel(comptime model_config: Config) type {
             var kr = try ops.applyRotaryEmb(
                 self.allocator,
                 k,
+                n_heads,
+                head_dim,
                 self.freqs_cis,
                 position_ids,
                 rot_dim,
@@ -373,7 +391,7 @@ pub fn TextModel(comptime model_config: Config) type {
             var attn_mask = try ops.createAttentionMask(self.allocator, pos, seq_len);
             defer attn_mask.deinit();
 
-            var attn_output = try ops.multiscaledDotProductAttention(qr, k_final, v_final, attn_mask, self.allocator);
+            var attn_output = try ops.multiscaledDotProductAttention(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
             defer attn_output.deinit();
 
             try ops.transposeAxes(f16, &attn_output, 0, 1);
