@@ -1,5 +1,37 @@
 const std = @import("std");
 
+pub const MODEL_CONFIG = Config{
+    // Text Model params
+    .vocab = 51200,
+    .dim = 2048,
+    .hidden_dim = 8192,
+    .n_layers = 24,
+    .n_heads = 32,
+    .head_dim = 64,
+    .seq_len = 2048,
+    .rope_theta = 10000.0,
+    .max_pos_embeddings = 2048,
+    .partial_rotary_factor = 0.5,
+
+    // Vision Model params
+    .img_channels = 3,
+    .img_dim = 378,
+    .patch_size = 14,
+    .num_patches = (378 / 14) * (378 / 14), // Computed at compile time
+    .vit_embed_len = 729,
+    .vit_dim = 1152,
+    .n_vit_layers = 27,
+    .n_vit_heads = 16,
+    .vit_head_dim = 72,
+    .hidden_features = 4304,
+};
+
+comptime {
+    if (MODEL_CONFIG.vit_head_dim * MODEL_CONFIG.n_vit_heads != MODEL_CONFIG.vit_dim) {
+        @compileError("Invalid head dimensions");
+    }
+}
+
 pub const ConfigReader = extern struct {
     const Self = @This();
 

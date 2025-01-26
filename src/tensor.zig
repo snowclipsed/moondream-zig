@@ -199,7 +199,156 @@ pub fn Tensor(comptime DataType: type) type {
 
             return result;
         }
+        pub fn castWithSimd(self: Self, comptime TargetType: type) !Tensor(TargetType) {
+            // First create the shape copy
+            const shape_copy = try self.allocator.alloc(usize, self.shape.len);
+            errdefer self.allocator.free(shape_copy);
+            @memcpy(shape_copy, self.shape);
 
+            // Calculate total size
+            var size: usize = 1;
+            for (self.shape) |dim| {
+                size *= dim;
+            }
+
+            // Allocate data array
+            const data = try self.allocator.alignedAlloc(TargetType, 32, size);
+            errdefer self.allocator.free(data);
+
+            // Create result tensor
+            const result = Tensor(TargetType){
+                .allocator = self.allocator,
+                .shape = shape_copy,
+                .data = data,
+            };
+
+            if (hasAVX2() and self.data.len >= 8) {
+                if (DataType == f16 and TargetType == f32) {
+                    convertF16ToF32Simd(self.data, result.data);
+                    return result;
+                } else if (DataType == f32 and TargetType == f16) {
+                    convertF32ToF16Simd(self.data, result.data);
+                    return result;
+                }
+            }
+
+            // Fallback to scalar conversion
+            for (self.data, 0..) |val, i| {
+                result.data[i] = @floatCast(val);
+            }
+
+            return result;
+        }
+
+        /// Convert 8 f32 values to f16 using AVX2
+        inline fn convertF32ToF16Batch(src: *const [8]f32, dst: *[8]f16) void {
+            asm volatile (
+                \\vmovups (%[src]), %%ymm0
+                \\vcvtps2ph $0, %%ymm0, %%xmm1
+                \\vmovups %%xmm1, (%[dst])
+                :
+                : [dst] "r" (dst),
+                  [src] "r" (src),
+                : "ymm0", "xmm1", "memory"
+            );
+        }
+
+        /// Convert 8 f16 values to f32 using AVX2
+        inline fn convertF16ToF32Batch(src: *const [8]f16, dst: *[8]f32) void {
+            asm volatile (
+                \\vmovups (%[src]), %%xmm0
+                \\vcvtph2ps %%xmm0, %%ymm1
+                \\vmovups %%ymm1, (%[dst])
+                :
+                : [dst] "r" (dst),
+                  [src] "r" (src),
+                : "xmm0", "ymm1", "memory"
+            );
+        }
+
+        fn convertF32ToF16Simd(src: []const f32, dst: []f16) void {
+            const size = src.len;
+            std.debug.assert(size == dst.len);
+
+            if (size < 8) {
+                // Handle small arrays with scalar operations
+                for (src, 0..) |val, i| {
+                    dst[i] = @floatCast(val);
+                }
+                return;
+            }
+
+            var src_batch: [8]f32 align(32) = undefined;
+            var dst_batch: [8]f16 align(32) = undefined;
+
+            const fullAlignedSize = size & ~@as(usize, 31); // Size aligned to 32
+            const partialAlignedSize = size & ~@as(usize, 7); // Size aligned to 8
+
+            var i: usize = 0;
+
+            // Process 32 elements at a time
+            while (i < fullAlignedSize) : (i += 32) {
+                inline for ([_]usize{ 0, 8, 16, 24 }) |offset| {
+                    @memcpy(&src_batch, src[i + offset ..][0..8]);
+                    convertF32ToF16Batch(&src_batch, &dst_batch);
+                    @memcpy(dst[i + offset ..][0..8], &dst_batch);
+                }
+            }
+
+            // Process remaining aligned chunks of 8
+            while (i < partialAlignedSize) : (i += 8) {
+                @memcpy(&src_batch, src[i..][0..8]);
+                convertF32ToF16Batch(&src_batch, &dst_batch);
+                @memcpy(dst[i..][0..8], &dst_batch);
+            }
+
+            // Handle remaining elements with scalar operations
+            while (i < size) : (i += 1) {
+                dst[i] = @floatCast(src[i]);
+            }
+        }
+
+        fn convertF16ToF32Simd(src: []const f16, dst: []f32) void {
+            const size = src.len;
+            std.debug.assert(size == dst.len);
+
+            if (size < 8) {
+                // Handle small arrays with scalar operations
+                for (src, 0..) |val, i| {
+                    dst[i] = @floatCast(val);
+                }
+                return;
+            }
+
+            var src_batch: [8]f16 align(32) = undefined;
+            var dst_batch: [8]f32 align(32) = undefined;
+
+            const fullAlignedSize = size & ~@as(usize, 31);
+            const partialAlignedSize = size & ~@as(usize, 7);
+
+            var i: usize = 0;
+
+            // Process 32 elements at a time
+            while (i < fullAlignedSize) : (i += 32) {
+                inline for ([_]usize{ 0, 8, 16, 24 }) |offset| {
+                    @memcpy(&src_batch, src[i + offset ..][0..8]);
+                    convertF16ToF32Batch(&src_batch, &dst_batch);
+                    @memcpy(dst[i + offset ..][0..8], &dst_batch);
+                }
+            }
+
+            // Process remaining aligned chunks of 8
+            while (i < partialAlignedSize) : (i += 8) {
+                @memcpy(&src_batch, src[i..][0..8]);
+                convertF16ToF32Batch(&src_batch, &dst_batch);
+                @memcpy(dst[i..][0..8], &dst_batch);
+            }
+
+            // Handle remaining elements with scalar operations
+            while (i < size) : (i += 1) {
+                dst[i] = @floatCast(src[i]);
+            }
+        }
         // CPU feature detection helper
         inline fn hasAVX2() bool {
             if (!builtin.cpu.arch.isX86()) return false;
@@ -268,19 +417,13 @@ pub fn Tensor(comptime DataType: type) type {
         /// ```
         // Shape operations
         pub fn reshape(self: *Self, new_shape: []const usize) !void {
-            // Calculate new size
             var new_size: usize = 1;
             for (new_shape) |dim| {
                 new_size *= dim;
             }
 
-            // Calculate current size from shape
-            var current_size: usize = 1;
-            for (self.shape) |dim| {
-                current_size *= dim;
-            }
-
             // Verify that the new shape is compatible
+            const current_size = @as(usize, @intCast(self.data.len));
             if (new_size != current_size) {
                 return error.IncompatibleShape;
             }
@@ -291,6 +434,22 @@ pub fn Tensor(comptime DataType: type) type {
 
             self.allocator.free(self.shape);
             self.shape = new_shape_copy;
+        }
+
+        // Add to your Tensor struct:
+        pub fn asView(self: *const Self) !TensorView(DataType) {
+            return TensorView(DataType).fromTensor(self);
+        }
+
+        // Optional: Add a convenience wrapper that uses views internally
+        pub fn getChunkFast(self: *const Self, dim: usize, chunk_idx: usize, num_chunks: usize) !Self {
+            var view = try self.asView();
+            defer view.deinit();
+
+            var chunk_view = try view.getChunkView(dim, chunk_idx, num_chunks);
+            defer chunk_view.deinit();
+
+            return chunk_view.toTensor();
         }
 
         // Inside the Tensor struct definition:
@@ -540,6 +699,19 @@ pub fn Tensor(comptime DataType: type) type {
             return new_tensor;
         }
 
+        fn calculateStrides(shape: []const usize, allocator: Allocator) ![]usize {
+            var strides = try allocator.alloc(usize, shape.len);
+            errdefer allocator.free(strides);
+
+            if (shape.len == 0) return strides;
+
+            strides[shape.len - 1] = 1;
+            var i = shape.len - 1;
+            while (i > 0) : (i -= 1) {
+                strides[i - 1] = strides[i] * shape[i];
+            }
+            return strides;
+        }
         /// Format a single value with proper precision
         pub fn printF16WithFullPrecision(self: Self) void {
             if (DataType != f16) {
@@ -661,20 +833,7 @@ pub fn Tensor(comptime DataType: type) type {
                 },
             }
         }
-        /// Calculate strides for each dimension
-        fn calculateStrides(shape: []const usize, allocator: Allocator) ![]usize {
-            var strides = try allocator.alloc(usize, shape.len);
-            errdefer allocator.free(strides);
-
-            if (shape.len == 0) return strides;
-
-            strides[shape.len - 1] = 1;
-            var i = shape.len - 1;
-            while (i > 0) : (i -= 1) {
-                strides[i - 1] = strides[i] * shape[i];
-            }
-            return strides;
-        }
+        // Calculate strides for each dimension - using original implementation
 
         /// Format tensor recursively
         fn formatRecursive(
@@ -1095,3 +1254,284 @@ pub const CastError = error{
     LossyConversion, // When precision would be lost (e.g., float to int with decimals)
     OutOfRange, // When value is outside the target type's range
 };
+
+/// A view into a tensor that doesn't own its data
+pub fn TensorView(comptime DataType: type) type {
+    return struct {
+        const Self = @This();
+
+        data: []align(32) DataType, // Reference to original aligned data
+        shape: []usize, // View dimensions
+        strides: []usize, // Stride for each dimension
+        offset: usize, // Offset into original data
+        allocator: Allocator, // For managing shape/strides arrays
+
+        /// Create a view from an existing tensor
+        pub fn fromTensor(tensor: *const Tensor(DataType)) !Self {
+            const strides = try calculateStrides(tensor.shape, tensor.allocator);
+            errdefer tensor.allocator.free(strides);
+
+            const shape = try tensor.allocator.alloc(usize, tensor.shape.len);
+            errdefer tensor.allocator.free(shape);
+            @memcpy(shape, tensor.shape);
+
+            return Self{
+                .data = tensor.data,
+                .shape = shape,
+                .strides = strides,
+                .offset = 0,
+                .allocator = tensor.allocator,
+            };
+        }
+
+        /// Get a chunk view without copying data
+        pub fn getChunkView(self: *const Self, dim: usize, chunk_idx: usize, num_chunks: usize) !Self {
+            if (dim >= self.shape.len) return error.InvalidDimension;
+
+            const dim_size = self.shape[dim];
+            if (num_chunks == 0 or dim_size < num_chunks) return error.InvalidNumChunks;
+            if (chunk_idx >= num_chunks) return error.InvalidChunkIndex;
+
+            const chunk_size = dim_size / num_chunks;
+            if (chunk_size * num_chunks != dim_size) return error.UnevenChunkSize;
+
+            const start_idx = chunk_idx * chunk_size;
+
+            // Create new shape array
+            var new_shape = try self.allocator.alloc(usize, self.shape.len);
+            errdefer self.allocator.free(new_shape);
+            @memcpy(new_shape, self.shape);
+            new_shape[dim] = chunk_size;
+
+            // Calculate new strides (reuse existing ones)
+            const new_strides = try self.allocator.alloc(usize, self.strides.len);
+            errdefer self.allocator.free(new_strides);
+            @memcpy(new_strides, self.strides);
+
+            // Calculate new offset
+            const new_offset = self.offset + start_idx * self.strides[dim];
+
+            return Self{
+                .data = self.data,
+                .shape = new_shape,
+                .strides = new_strides,
+                .offset = new_offset,
+                .allocator = self.allocator,
+            };
+        }
+
+        /// Convert view back to owned tensor (copies data)
+        pub fn toTensor(self: Self) !Tensor(DataType) {
+            var result = try Tensor(DataType).init(self.allocator, self.shape);
+            errdefer result.deinit();
+
+            // Copy data using view's layout
+            var coords = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(coords);
+            @memset(coords, 0);
+
+            const total_elements = calculateSize(self.shape);
+            var i: usize = 0;
+            while (i < total_elements) : (i += 1) {
+                const src_idx = self.getIndex(coords);
+                result.data[i] = self.data[src_idx];
+
+                // Update coordinates
+                var dim = self.shape.len;
+                while (dim > 0) {
+                    dim -= 1;
+                    coords[dim] += 1;
+                    if (coords[dim] < self.shape[dim]) break;
+                    coords[dim] = 0;
+                }
+            }
+
+            return result;
+        }
+
+        /// Calculate actual data index from coordinates
+        pub inline fn getIndex(self: Self, coords: []const usize) usize {
+            var index = self.offset;
+            for (coords, 0..) |coord, dim| {
+                index += coord * self.strides[dim];
+            }
+            return index;
+        }
+
+        /// Free allocated memory
+        pub fn deinit(self: *Self) void {
+            self.allocator.free(self.shape);
+            self.allocator.free(self.strides);
+        }
+
+        /// Calculate strides for given shape
+        fn calculateStrides(shape: []const usize, allocator: Allocator) ![]usize {
+            var strides = try allocator.alloc(usize, shape.len);
+            errdefer allocator.free(strides);
+
+            if (shape.len == 0) return strides;
+
+            strides[shape.len - 1] = 1;
+            var i = shape.len - 1;
+            while (i > 0) : (i -= 1) {
+                strides[i - 1] = strides[i] * shape[i];
+            }
+            return strides;
+        }
+
+        /// Calculate total size from shape
+        fn calculateSize(shape: []const usize) usize {
+            var size: usize = 1;
+            for (shape) |dim| {
+                size *= dim;
+            }
+            return size;
+        }
+
+        pub fn transposeAxes(self: *Self, axis1: usize, axis2: usize) !void {
+            if (axis1 >= self.shape.len or axis2 >= self.shape.len) {
+                return error.InvalidDimension;
+            }
+
+            // Swap shapes
+            const temp_shape = self.shape[axis1];
+            self.shape[axis1] = self.shape[axis2];
+            self.shape[axis2] = temp_shape;
+
+            // Swap strides
+            const temp_stride = self.strides[axis1];
+            self.strides[axis1] = self.strides[axis2];
+            self.strides[axis2] = temp_stride;
+        }
+
+        /// Fast indexing for transposed/reshaped views
+        pub fn getDataIndex(self: Self, coords: []const usize) usize {
+            var index = self.offset;
+            for (coords, 0..) |coord, dim| {
+                index += coord * self.strides[dim];
+            }
+            return index;
+        }
+
+        pub fn reshape(self: *Self, new_shape: []const usize) !void {
+            // Calculate new size
+            var new_size: usize = 1;
+            for (new_shape) |dim| {
+                new_size *= dim;
+            }
+
+            // Verify compatible size
+            const current_size = calculateSize(self.shape);
+            if (new_size != current_size) {
+                return error.IncompatibleShape;
+            }
+
+            // Update shape array
+            if (new_shape.len != self.shape.len) {
+                const new_shape_copy = try self.allocator.alloc(usize, new_shape.len);
+                errdefer self.allocator.free(new_shape_copy);
+                @memcpy(new_shape_copy, new_shape);
+                self.allocator.free(self.shape);
+                self.shape = new_shape_copy;
+            } else {
+                @memcpy(self.shape, new_shape);
+            }
+
+            // Update strides for new shape
+            const new_strides = try calculateStrides(self.shape, self.allocator);
+            self.allocator.free(self.strides);
+            self.strides = new_strides;
+        }
+        /// Add to TensorView struct
+        pub fn toContiguousTensor(self: Self) !Tensor(DataType) {
+            // Create new tensor with current shape
+            var result = try Tensor(DataType).init(self.allocator, self.shape);
+            errdefer result.deinit();
+
+            // Copy data using view's layout
+            var coords = try self.allocator.alloc(usize, self.shape.len);
+            defer self.allocator.free(coords);
+            @memset(coords, 0);
+
+            const total_elements = calculateSize(self.shape);
+            var i: usize = 0;
+
+            switch (self.shape.len) {
+                // Specialized for common tensor dimensions
+                1 => while (i < total_elements) : (i += 1) {
+                    const src_idx = self.offset + coords[0] * self.strides[0];
+                    result.data[i] = self.data[src_idx];
+                    coords[0] += 1;
+                },
+                2 => while (i < total_elements) : (i += 1) {
+                    const src_idx = self.offset +
+                        coords[0] * self.strides[0] +
+                        coords[1] * self.strides[1];
+                    result.data[i] = self.data[src_idx];
+
+                    coords[1] += 1;
+                    if (coords[1] >= self.shape[1]) {
+                        coords[1] = 0;
+                        coords[0] += 1;
+                    }
+                },
+                3 => while (i < total_elements) : (i += 1) {
+                    const src_idx = self.offset +
+                        coords[0] * self.strides[0] +
+                        coords[1] * self.strides[1] +
+                        coords[2] * self.strides[2];
+                    result.data[i] = self.data[src_idx];
+
+                    coords[2] += 1;
+                    if (coords[2] >= self.shape[2]) {
+                        coords[2] = 0;
+                        coords[1] += 1;
+                        if (coords[1] >= self.shape[1]) {
+                            coords[1] = 0;
+                            coords[0] += 1;
+                        }
+                    }
+                },
+                4 => while (i < total_elements) : (i += 1) {
+                    const src_idx = self.offset +
+                        coords[0] * self.strides[0] +
+                        coords[1] * self.strides[1] +
+                        coords[2] * self.strides[2] +
+                        coords[3] * self.strides[3];
+                    result.data[i] = self.data[src_idx];
+
+                    coords[3] += 1;
+                    if (coords[3] >= self.shape[3]) {
+                        coords[3] = 0;
+                        coords[2] += 1;
+                        if (coords[2] >= self.shape[2]) {
+                            coords[2] = 0;
+                            coords[1] += 1;
+                            if (coords[1] >= self.shape[1]) {
+                                coords[1] = 0;
+                                coords[0] += 1;
+                            }
+                        }
+                    }
+                },
+                else => {
+                    // Fallback for higher dimensions
+                    while (i < total_elements) : (i += 1) {
+                        const src_idx = self.getDataIndex(coords);
+                        result.data[i] = self.data[src_idx];
+
+                        var dim = self.shape.len;
+                        while (dim > 0) {
+                            dim -= 1;
+                            coords[dim] += 1;
+                            if (coords[dim] < self.shape[dim]) break;
+                            coords[dim] = 0;
+                        }
+                    }
+                },
+            }
+
+            return result;
+        }
+    };
+}

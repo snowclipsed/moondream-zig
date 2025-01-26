@@ -13,6 +13,13 @@ const Pixel = struct {
 };
 
 pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale: f32) !void {
+    // Create null-terminated path for C
+    var path_buffer = try allocator.alloc(u8, image_path.len + 1);
+    defer allocator.free(path_buffer);
+
+    @memcpy(path_buffer[0..image_path.len], image_path);
+    path_buffer[image_path.len] = 0; // Null terminator
+
     // Load image using stb_image
     var width: c_int = undefined;
     var height: c_int = undefined;
@@ -20,17 +27,19 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
     const desired_channels = 3; // RGB
 
     const image_data = c.stbi_load(
-        image_path.ptr,
+        path_buffer.ptr,
         &width,
         &height,
         &channels,
         desired_channels,
     );
-    defer c.stbi_image_free(image_data);
 
     if (image_data == null) {
+        const err_str = c.stbi_failure_reason();
+        std.debug.print("[DEBUG] STB Error: {s}\n", .{err_str});
         return error.ImageLoadFailed;
     }
+    defer c.stbi_image_free(image_data);
 
     // Calculate terminal dimensions with scale factor
     const base_term_width: usize = 80;
@@ -85,6 +94,7 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
 
     // Reset terminal colors
     try std.io.getStdOut().writer().print("\x1b[0m", .{});
+    std.debug.print("Displaying image at scale {d:3}x.\n", .{scale});
 }
 
 fn printColorBlock(upper: Pixel, lower: Pixel) !void {

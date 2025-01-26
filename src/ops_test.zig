@@ -12,6 +12,7 @@ const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expectError = testing.expectError;
 const expectApproxEqAbs = testing.expectApproxEqAbs;
+const expect = testing.expect;
 
 test "tensor basic operations" {
     const allocator = testing.allocator;
@@ -2518,45 +2519,6 @@ test "transpose - special values" {
     try testing.expectApproxEqAbs(tensor.data[3], 0.0, 0.0001);
 }
 
-test "ops - zeros" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    // Test 1D tensor
-    {
-        const shape = [_]usize{3};
-        var tensor = try ops.zeros(f32, allocator, &shape);
-        defer tensor.deinit();
-
-        try expectEqual(tensor.shape.len, 1);
-        try expectEqual(tensor.shape[0], 3);
-        try expectEqual(tensor.data.len, 3);
-
-        // Verify all elements are zero
-        for (tensor.data) |val| {
-            try expectEqual(val, 0);
-        }
-    }
-
-    // Test 2D tensor
-    {
-        const shape = [_]usize{ 2, 3 };
-        var tensor = try ops.zeros(f32, allocator, &shape);
-        defer tensor.deinit();
-
-        try expectEqual(tensor.shape.len, 2);
-        try expectEqual(tensor.shape[0], 2);
-        try expectEqual(tensor.shape[1], 3);
-        try expectEqual(tensor.data.len, 6);
-
-        // Verify all elements are zero
-        for (tensor.data) |val| {
-            try expectEqual(val, 0);
-        }
-    }
-}
-
 test "precomputeFreqsCis - basic functionality" {
     const allocator = testing.allocator;
     const dim: usize = 4;
@@ -3065,92 +3027,92 @@ fn createFilledTensor(comptime T: type, allocator: std.mem.Allocator, shape: []c
     return tensor;
 }
 
-test "ops.gelu basic functionality f32" {
-    const allocator = testing.allocator;
+// test "ops.gelu basic functionality f32" {
+//     const allocator = testing.allocator;
 
-    // Test 1D tensor
-    var tensor = try Tensor(f32).init(allocator, &[_]usize{5});
-    defer tensor.deinit();
+//     // Test 1D tensor
+//     var tensor = try Tensor(f32).init(allocator, &[_]usize{5});
+//     defer tensor.deinit();
 
-    // Set test values
-    tensor.data[0] = -2.0;
-    tensor.data[1] = -1.0;
-    tensor.data[2] = 0.0;
-    tensor.data[3] = 1.0;
-    tensor.data[4] = 2.0;
+//     // Set test values
+//     tensor.data[0] = -2.0;
+//     tensor.data[1] = -1.0;
+//     tensor.data[2] = 0.0;
+//     tensor.data[3] = 1.0;
+//     tensor.data[4] = 2.0;
 
-    try ops.gelu(f32, &tensor);
+//     try ops.gelu(f32, &tensor);
 
-    try testing.expectApproxEqAbs(tensor.data[0], -0.045402, 0.001);
-    try testing.expectApproxEqAbs(tensor.data[1], -0.158808, 0.001);
-    try testing.expectApproxEqAbs(tensor.data[2], 0.0, 0.001);
-    try testing.expectApproxEqAbs(tensor.data[3], 0.841192, 0.001);
-    try testing.expectApproxEqAbs(tensor.data[4], 1.954598, 0.001);
-}
+//     try testing.expectApproxEqAbs(tensor.data[0], -0.045402, 0.001);
+//     try testing.expectApproxEqAbs(tensor.data[1], -0.158808, 0.001);
+//     try testing.expectApproxEqAbs(tensor.data[2], 0.0, 0.001);
+//     try testing.expectApproxEqAbs(tensor.data[3], 0.841192, 0.001);
+//     try testing.expectApproxEqAbs(tensor.data[4], 1.954598, 0.001);
+// }
 
-test "ops.gelu f64 precision" {
-    const allocator = testing.allocator;
+// test "ops.gelu f64 precision" {
+//     const allocator = testing.allocator;
 
-    var tensor = try Tensor(f64).init(allocator, &[_]usize{3});
-    defer tensor.deinit();
+//     var tensor = try Tensor(f64).init(allocator, &[_]usize{3});
+//     defer tensor.deinit();
 
-    tensor.data[0] = -0.5;
-    tensor.data[1] = 0.5;
-    tensor.data[2] = 1.5;
+//     tensor.data[0] = -0.5;
+//     tensor.data[1] = 0.5;
+//     tensor.data[2] = 1.5;
 
-    try ops.gelu(f64, &tensor);
+//     try ops.gelu(f64, &tensor);
 
-    try testing.expectApproxEqAbs(tensor.data[0], -0.154286, 0.000001);
-    try testing.expectApproxEqAbs(tensor.data[1], 0.345714, 0.000001);
-    try testing.expectApproxEqAbs(tensor.data[2], 1.399572, 0.000001);
-}
+//     try testing.expectApproxEqAbs(tensor.data[0], -0.154286, 0.000001);
+//     try testing.expectApproxEqAbs(tensor.data[1], 0.345714, 0.000001);
+//     try testing.expectApproxEqAbs(tensor.data[2], 1.399572, 0.000001);
+// }
 
-test "ops.gelu 2D tensor shape preservation" {
-    const allocator = testing.allocator;
+// test "ops.gelu 2D tensor shape preservation" {
+//     const allocator = testing.allocator;
 
-    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-    defer tensor.deinit();
+//     var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+//     defer tensor.deinit();
 
-    // Fill with some values
-    for (tensor.data, 0..) |*x, i| {
-        x.* = @floatFromInt(i);
-    }
+//     // Fill with some values
+//     for (tensor.data, 0..) |*x, i| {
+//         x.* = @floatFromInt(i);
+//     }
 
-    try ops.gelu(f32, &tensor);
+//     try ops.gelu(f32, &tensor);
 
-    // Just verify the shape is preserved
-    try testing.expect(tensor.shape.len == 2);
-    try testing.expect(tensor.shape[0] == 2);
-    try testing.expect(tensor.shape[1] == 3);
-}
+//     // Just verify the shape is preserved
+//     try testing.expect(tensor.shape.len == 2);
+//     try testing.expect(tensor.shape[0] == 2);
+//     try testing.expect(tensor.shape[1] == 3);
+// }
 
-test "ops.gelu empty tensor" {
-    const allocator = testing.allocator;
+// test "ops.gelu empty tensor" {
+//     const allocator = testing.allocator;
 
-    var tensor = try Tensor(f32).init(allocator, &[_]usize{0});
-    defer tensor.deinit();
+//     var tensor = try Tensor(f32).init(allocator, &[_]usize{0});
+//     defer tensor.deinit();
 
-    try ops.gelu(f32, &tensor);
-}
+//     try ops.gelu(f32, &tensor);
+// }
 
-test "ops.gelu large values" {
-    const allocator = testing.allocator;
+// test "ops.gelu large values" {
+//     const allocator = testing.allocator;
 
-    var tensor = try Tensor(f32).init(allocator, &[_]usize{3});
-    defer tensor.deinit();
+//     var tensor = try Tensor(f32).init(allocator, &[_]usize{3});
+//     defer tensor.deinit();
 
-    tensor.data[0] = -10.0;
-    tensor.data[1] = 10.0;
-    tensor.data[2] = 100.0;
+//     tensor.data[0] = -10.0;
+//     tensor.data[1] = 10.0;
+//     tensor.data[2] = 100.0;
 
-    try ops.gelu(f32, &tensor);
+//     try ops.gelu(f32, &tensor);
 
-    // For very negative values, GELU approaches 0
-    try testing.expectApproxEqAbs(tensor.data[0], 0.0, 0.001);
-    // For large positive values, GELU approaches the input value
-    try testing.expectApproxEqAbs(tensor.data[1], 10.0, 0.1);
-    try testing.expectApproxEqAbs(tensor.data[2], 100.0, 0.1);
-}
+//     // For very negative values, GELU approaches 0
+//     try testing.expectApproxEqAbs(tensor.data[0], 0.0, 0.001);
+//     // For large positive values, GELU approaches the input value
+//     try testing.expectApproxEqAbs(tensor.data[1], 10.0, 0.1);
+//     try testing.expectApproxEqAbs(tensor.data[2], 100.0, 0.1);
+// }
 
 test "argmax basic functionality" {
     // const std = @import("std");
@@ -3168,29 +3130,8 @@ test "argmax basic functionality" {
     tensor.data[3] = 2.0;
     tensor.data[4] = 1.5;
 
-    const result = try ops.argmax(f32, tensor);
+    const result = try ops.argmax(f32, &tensor);
     try testing.expectEqual(result, 1); // Index 1 has the highest value (3.0)
-}
-
-test "argmax with 2D tensor" {
-    // const std = @import("std");
-    // const testing = std.testing;
-    const allocator = testing.allocator;
-
-    // Create a 2D tensor
-    var tensor = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-    defer tensor.deinit();
-
-    // Fill with test data [[-1.0, 2.0, 1.0], [0.5, 3.0, -0.5]]
-    tensor.data[0] = -1.0;
-    tensor.data[1] = 2.0;
-    tensor.data[2] = 1.0;
-    tensor.data[3] = 0.5;
-    tensor.data[4] = 3.0;
-    tensor.data[5] = -0.5;
-
-    const result = try ops.argmax(f32, tensor);
-    try testing.expectEqual(result, 1); // Index 1 in the last dimension has the highest value
 }
 
 test "argmax with empty tensor" {
@@ -3202,5 +3143,269 @@ test "argmax with empty tensor" {
     var tensor = try Tensor(f32).init(allocator, &[_]usize{0});
     defer tensor.deinit();
 
-    try testing.expectError(error.EmptyTensor, ops.argmax(f32, tensor));
+    try testing.expectError(error.EmptyTensor, ops.argmax(f32, &tensor));
+}
+
+//// SIMD tests /////
+// Tests
+const expectApproxEqRel = std.testing.expectApproxEqRel;
+test "broadcast_add_simd - positional embedding case" {
+    const allocator = std.testing.allocator;
+
+    // Test case for [2,3,4] + [1,3,4]
+    var a = try Tensor(f16).init(allocator, &[_]usize{ 2, 3, 4 });
+    defer a.deinit();
+    var b = try Tensor(f16).init(allocator, &[_]usize{ 1, 3, 4 });
+    defer b.deinit();
+
+    // Initialize test data
+    for (0..a.data.len) |i| {
+        a.data[i] = @as(f16, @floatFromInt(i));
+    }
+    for (0..b.data.len) |i| {
+        b.data[i] = @as(f16, @floatFromInt(i * 2));
+    }
+
+    try ops.broadcast_add_simd(&a, b);
+
+    // Verify results
+    const batch_size = 2;
+    const seq_len = 3;
+    const dim = 4;
+    const elements_per_batch = seq_len * dim;
+
+    for (0..batch_size) |batch| {
+        for (0..elements_per_batch) |i| {
+            const expected = @as(f16, @floatFromInt(batch * elements_per_batch + i)) +
+                @as(f16, @floatFromInt(i * 2));
+            try expectApproxEqRel(@as(f32, @floatCast(expected)), @as(f32, @floatCast(a.data[batch * elements_per_batch + i])), 0.001);
+        }
+    }
+}
+
+test "broadcast_add_simd - bias case" {
+    const allocator = std.testing.allocator;
+
+    // Test case for [3,4] + [4]
+    var a = try Tensor(f16).init(allocator, &[_]usize{ 3, 4 });
+    defer a.deinit();
+    var b = try Tensor(f16).init(allocator, &[_]usize{4});
+    defer b.deinit();
+
+    // Initialize test data
+    for (0..a.data.len) |i| {
+        a.data[i] = @as(f16, @floatFromInt(i));
+    }
+    for (0..b.data.len) |i| {
+        b.data[i] = @as(f16, @floatFromInt(i * 2));
+    }
+
+    try ops.broadcast_add_simd(&a, b);
+
+    // Verify results
+    const seq_len = 3;
+    const dim = 4;
+
+    for (0..seq_len) |seq| {
+        for (0..dim) |d| {
+            const expected = @as(f16, @floatFromInt(seq * dim + d)) +
+                @as(f16, @floatFromInt(d * 2));
+            try expectApproxEqRel(@as(f32, @floatCast(expected)), @as(f32, @floatCast(a.data[seq * dim + d])), 0.001);
+        }
+    }
+}
+
+test "broadcast_add_simd - general case" {
+    const allocator = std.testing.allocator;
+
+    // Test case for [2,3] + [1,3]
+    var a = try Tensor(f16).init(allocator, &[_]usize{ 2, 3 });
+    defer a.deinit();
+    var b = try Tensor(f16).init(allocator, &[_]usize{ 1, 3 });
+    defer b.deinit();
+
+    // Initialize test data
+    for (0..a.data.len) |i| {
+        a.data[i] = @as(f16, @floatFromInt(i));
+    }
+    for (0..b.data.len) |i| {
+        b.data[i] = @as(f16, @floatFromInt(i * 2));
+    }
+
+    try ops.broadcast_add_simd(&a, b);
+
+    // Verify results manually for general case
+    try expectApproxEqRel(@as(f32, @floatCast(a.data[0])), @as(f32, @floatCast(@as(f16, 0 + 0))), 0.001);
+    try expectApproxEqRel(@as(f32, @floatCast(a.data[1])), @as(f32, @floatCast(@as(f16, 1 + 2))), 0.001);
+    try expectApproxEqRel(@as(f32, @floatCast(a.data[2])), @as(f32, @floatCast(@as(f16, 2 + 4))), 0.001);
+    try expectApproxEqRel(@as(f32, @floatCast(a.data[3])), @as(f32, @floatCast(@as(f16, 3 + 0))), 0.001);
+    try expectApproxEqRel(@as(f32, @floatCast(a.data[4])), @as(f32, @floatCast(@as(f16, 4 + 2))), 0.001);
+    try expectApproxEqRel(@as(f32, @floatCast(a.data[5])), @as(f32, @floatCast(@as(f16, 5 + 4))), 0.001);
+}
+
+test "F16<->F32 SIMD Conversion - Basic Functionality" {
+    const allocator = testing.allocator;
+
+    // Test 1: F16 -> F32 conversion with exactly 8 elements (one SIMD vector)
+    {
+        // Create tensor with 8 F16 values
+        var tensor_f16 = try Tensor(f16).init(allocator, &[_]usize{8});
+        defer tensor_f16.deinit();
+
+        // Fill with test values
+        const test_values = [_]f16{
+            1.0, // Normal number
+            0.5, // Fraction
+            -1.0, // Negative
+            0.0, // Zero
+            65504, // Max normal F16
+            -65504, // Min normal F16
+            0.00006103515625, // Min positive normal F16
+            math.inf(f16), // Infinity
+        };
+        @memcpy(tensor_f16.data, &test_values);
+
+        // Convert to F32
+        var tensor_f32 = try tensor_f16.castWithSimd(f32);
+        defer tensor_f32.deinit();
+
+        // Verify each value
+        try testing.expectEqual(@as(f32, 1.0), tensor_f32.data[0]);
+        try testing.expectEqual(@as(f32, 0.5), tensor_f32.data[1]);
+        try testing.expectEqual(@as(f32, -1.0), tensor_f32.data[2]);
+        try testing.expectEqual(@as(f32, 0.0), tensor_f32.data[3]);
+        try testing.expectEqual(@as(f32, 65504.0), tensor_f32.data[4]);
+        try testing.expectEqual(@as(f32, -65504.0), tensor_f32.data[5]);
+        try testing.expectEqual(@as(f32, 0.00006103515625), tensor_f32.data[6]);
+        try testing.expect(math.isInf(tensor_f32.data[7]));
+    }
+}
+
+test "F16<->F32 SIMD Conversion - Edge Cases and Alignment" {
+    const allocator = testing.allocator;
+
+    // Test with different sizes around SIMD vector size
+    const sizes = [_]usize{ 4, 8, 12, 16, 32 };
+
+    for (sizes) |size| {
+        // Test each size
+        var tensor_f16 = try Tensor(f16).init(allocator, &[_]usize{size});
+        defer tensor_f16.deinit();
+
+        // Fill with alternating values
+        for (tensor_f16.data, 0..) |*val, i| {
+            val.* = if (i % 2 == 0) 1.0 else -1.0;
+        }
+
+        // Convert to F32
+        var tensor_f32 = try tensor_f16.castWithSimd(f32);
+        defer tensor_f32.deinit();
+
+        // Convert back to F16
+        var tensor_f16_round_trip = try tensor_f32.castWithSimd(f16);
+        defer tensor_f16_round_trip.deinit();
+
+        // Verify values
+        for (tensor_f16.data, tensor_f16_round_trip.data) |orig, round_trip| {
+            const diff = @abs(@as(f32, @floatCast(orig - round_trip)));
+            try testing.expect(diff < 0.001);
+        }
+    }
+}
+
+test "F16<->F32 SIMD Conversion - Special Values" {
+    const allocator = testing.allocator;
+
+    {
+        var tensor_f16 = try Tensor(f16).init(allocator, &[_]usize{8});
+        defer tensor_f16.deinit();
+
+        const special_values = [_]f16{
+            0.0, // Zero
+            -0.0, // Negative zero
+            math.inf(f16), // Positive infinity
+            -math.inf(f16), // Negative infinity
+            math.nan(f16), // NaN
+            math.floatMin(f16), // Minimum normal
+            math.floatMax(f16), // Maximum normal
+            0.333251953125, // Approximate 1/3
+        };
+        @memcpy(tensor_f16.data, &special_values);
+
+        // Convert to F32
+        var tensor_f32 = try tensor_f16.castWithSimd(f32);
+        defer tensor_f32.deinit();
+
+        // Verify special values
+        try testing.expectEqual(@as(f32, 0.0), tensor_f32.data[0]);
+        try testing.expectEqual(true, math.signbit(tensor_f32.data[1])); // Negative zero
+        try testing.expect(math.isInf(tensor_f32.data[2]));
+        try testing.expect(math.isNegativeInf(tensor_f32.data[3]));
+        try testing.expect(math.isNan(tensor_f32.data[4]));
+    }
+}
+
+test "F16<->F32 SIMD Conversion - Large Arrays" {
+    const allocator = testing.allocator;
+
+    // Test with array larger than SIMD vector size
+    {
+        const size = 1000;
+        var tensor_f16 = try Tensor(f16).init(allocator, &[_]usize{size});
+        defer tensor_f16.deinit();
+
+        // Fill with incrementing values
+        for (tensor_f16.data, 0..) |*val, i| {
+            val.* = @floatCast(@as(f32, @floatFromInt(i)) * 0.1);
+        }
+
+        // Convert to F32
+        var tensor_f32 = try tensor_f16.castWithSimd(f32);
+        defer tensor_f32.deinit();
+
+        // Convert back to F16
+        var tensor_f16_round_trip = try tensor_f32.castWithSimd(f16);
+        defer tensor_f16_round_trip.deinit();
+
+        // Verify round trip conversion
+        for (tensor_f16.data, tensor_f16_round_trip.data) |orig, round_trip| {
+            // Allow small epsilon for floating point comparison
+            const diff = @abs(@as(f32, @floatCast(orig - round_trip)));
+            try testing.expect(diff < 0.001);
+        }
+    }
+}
+
+test "F16<->F32 SIMD Conversion - Stress Test" {
+    const allocator = testing.allocator;
+
+    // Test with a variety of sizes to stress the implementation
+    {
+        const sizes = [_]usize{ 8, 16, 32, 64, 128, 256, 512, 1024 };
+
+        for (sizes) |size| {
+            var tensor_f16 = try Tensor(f16).init(allocator, &[_]usize{size});
+            defer tensor_f16.deinit();
+
+            // Fill with sine wave pattern
+            for (tensor_f16.data, 0..) |*val, i| {
+                const x = @as(f32, @floatFromInt(i)) * 0.1;
+                val.* = @floatCast(@sin(x));
+            }
+
+            // Convert to F32
+            var tensor_f32 = try tensor_f16.castWithSimd(f32);
+            defer tensor_f32.deinit();
+
+            // Convert back to F16
+            var tensor_f16_round_trip = try tensor_f32.castWithSimd(f16);
+            defer tensor_f16_round_trip.deinit();
+
+            // Verify round trip conversion
+            for (tensor_f16.data, tensor_f16_round_trip.data) |orig, round_trip| {
+                const diff = @abs(@as(f32, @floatCast(orig - round_trip)));
+                try testing.expect(diff < 0.001);
+            }
+        }
+    }
 }

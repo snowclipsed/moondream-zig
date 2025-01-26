@@ -94,7 +94,8 @@ pub fn main() !void {
     // const config_path: []const u8 = "../model_config.json";
     const tokenizer_path: []const u8 = "../tokenizer.bin";
     const image_path: []const u8 = "../images/demo-1.jpg";
-    const max_tokens: usize = 200;
+    const max_tokens: usize = 2;
+    // const sampling_config = ops.SamplingConfig{ .method = .top_k, .top_k = 3, .temperature = 0.5 };
     const sampling_config = ops.SamplingConfig{ .method = .greedy };
 
     // Load tokenizer
@@ -102,20 +103,6 @@ pub fn main() !void {
     var tokenizer = try Tokenizer.fromFile(tokenizer_path, allocator);
     defer tokenizer.deinit();
     try printTimeDiff(tokenizer_start, timer.read(), "Tokenizer Loading");
-
-    // // Load and parse config
-    // const config_start = timer.read();
-    // const config_file = try std.fs.cwd().openFile(config_path, .{});
-    // defer config_file.close();
-    // const config_size = (try config_file.stat()).size;
-    // const config_buffer = try allocator.alloc(u8, config_size);
-    // defer allocator.free(config_buffer);
-    // _ = try config_file.readAll(config_buffer);
-
-    // var json_tree = try std.json.parseFromSlice(ConfigReader, allocator, config_buffer, .{});
-    // defer json_tree.deinit();
-    // const config = json_tree.value.config();
-    // try printTimeDiff(config_start, timer.read(), "Config Loading");
 
     const config = model_config;
 
@@ -132,6 +119,8 @@ pub fn main() !void {
     // Display and process image
     const image_start = timer.read();
     try displayImage(allocator, image_path, scale);
+    std.debug.print("\n \n", .{});
+
     try printTimeDiff(image_start, timer.read(), "Image Display");
 
     // Initialize vision model and encode image

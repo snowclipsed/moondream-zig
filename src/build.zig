@@ -4,56 +4,65 @@ const builtin = @import("builtin");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const exe = b.addExecutable(.{
-        .name = "moondream",
-        .root_source_file = b.path("moonprofile.zig"),
+
+    // First create the static libraries for STB
+    const stb_image = b.addStaticLibrary(.{
+        .name = "stb_image",
         .target = target,
         .optimize = optimize,
     });
 
-    // Start of adding image libraries //
+    const stb_resize = b.addStaticLibrary(.{
+        .name = "stb_image_resize2",
+        .target = target,
+        .optimize = optimize,
+    });
 
-    // Add dependencies folder as library path to search for your libstb_image.so and libstb_resize2.c file
+    // Add C source files
+    stb_image.addCSourceFile(.{
+        .file = .{ .cwd_relative = "dependencies/stb_image.c" },
+        .flags = &[_][]const u8{
+            "-Wall",
+            "-Wextra",
+            "-O3",
+            "-DSTB_IMAGE_IMPLEMENTATION",
+        },
+    });
 
-    exe.addLibraryPath(std.Build.LazyPath{ .src_path = .{
-        .owner = b,
-        .sub_path = "dependencies",
-    } });
-    exe.addIncludePath(std.Build.LazyPath{ .src_path = .{
-        .owner = b,
-        .sub_path = "dependencies",
-    } });
+    stb_resize.addCSourceFile(.{
+        .file = .{ .cwd_relative = "dependencies/stb_image_resize2.c" },
+        .flags = &[_][]const u8{
+            "-Wall",
+            "-Wextra",
+            "-O3",
+            "-DSTB_IMAGE_RESIZE_IMPLEMENTATION",
+        },
+    });
 
-    // Link the stb_image library
-    exe.linkSystemLibrary("stb_image");
-    exe.linkSystemLibrary("stb_image_resize2");
+    // Link with C standard library
+    stb_image.linkLibC();
+    stb_resize.linkLibC();
+
+    // Create the main executable
+    const exe = b.addExecutable(.{
+        .name = "moondream",
+        .root_source_file = .{ .cwd_relative = "moondream.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add dependencies folder for headers
+    exe.addIncludePath(.{ .cwd_relative = "dependencies" });
+
+    // Link with our static libraries
+    exe.linkLibrary(stb_image);
+    exe.linkLibrary(stb_resize);
     exe.linkLibC();
 
-    // End of adding image libraries //
-
-    // Linking GGML //
-
-    // exe.addIncludePath(b.path("./dependencies/ggml/include/"));
-    // exe.addIncludePath(b.path("./dependencies/ggml/include/ggml"));
-    // exe.addCSourceFiles(.{
-    //     .files = &.{
-    //         "./dependencies/ggml/src/ggml.c",
-    //         "./dependencies/ggml/src/ggml-alloc.c",
-    //         "./dependencies/ggml/src/ggml-backend.c",
-    //         "./dependencies/ggml/src/ggml-quants.c",
-    //     },
-    //     .flags = &.{
-    //         "-std=c11",
-    //         "-D_GNU_SOURCE",
-    //         "-D_XOPEN_SOURCE=600",
-    //     },
-    // });
-    // exe.linkLibC();
-    // exe.linkLibCpp();
-
-    // End of linking GGML //
-
     b.installArtifact(exe);
+    // Also install the static libraries if needed
+    b.installArtifact(stb_image);
+    b.installArtifact(stb_resize);
 
     const test_targets = [_]std.Target.Query{
         .{}, // native
@@ -70,9 +79,13 @@ pub fn build(b: *std.Build) void {
 
     for (test_targets) |test_target| {
         const ops_tests = b.addTest(.{
-            .root_source_file = b.path("ops_test.zig"),
+            .root_source_file = .{ .cwd_relative = "ops_test.zig" },
             .target = b.resolveTargetQuery(test_target),
         });
+
+        // Link with our static libraries for tests too
+        ops_tests.linkLibrary(stb_image);
+        ops_tests.linkLibrary(stb_resize);
         ops_tests.linkSystemLibrary("openblas");
         ops_tests.linkLibC();
 
