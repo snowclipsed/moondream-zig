@@ -240,17 +240,22 @@ pub fn TextModel(comptime model_config: Config) type {
             const pos = if (layer_cache) |cache| cache.current_len else 0;
 
             // QKV projection
-            const qkv_proj_start = timer.read();
+
+            const weight_start = timer.read();
             const layer_t_Wqkv_w = self.presliced_weights.t_Wqkv_w[layer];
             const layer_t_Wqkv_b = self.presliced_weights.t_Wqkv_b[layer];
             const layer_out_proj_w = self.presliced_weights.t_out_proj_w[layer];
             const layer_out_proj_b = self.presliced_weights.t_out_proj_b[layer];
+            try printTimeDiff(&timer, weight_start, "QKV and Output Projection Weights");
 
+            const qkv_proj_matmul = timer.read();
             var qkv = try hgemm.matmul(input, layer_t_Wqkv_w, self.allocator);
             defer qkv.deinit();
+            try printTimeDiff(&timer, qkv_proj_matmul, "QKV Projection Matmul");
 
+            const qkv_proj_add = timer.read();
             try ops.broadcast_add_simd(&qkv, layer_t_Wqkv_b);
-            try printTimeDiff(&timer, qkv_proj_start, "QKV Projection");
+            try printTimeDiff(&timer, qkv_proj_add, "QKV Projection Bias");
 
             // Split QKV and reshape
             const split_start = timer.read();
