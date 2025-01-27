@@ -178,7 +178,7 @@ pub fn TextModel(comptime model_config: Config) type {
             const n_heads = Self.config.n_heads;
             const seq_len = input.shape[0];
             const rot_dim = Self.config.head_dim / 2;
-            const pos = if (layer_cache) |cache| cache.current_len else 0;
+            const pos = if (layer_cache) |cache| cache.getCurrentLen() else 0;
 
             const layer_t_Wqkv_w = self.presliced_weights.t_Wqkv_w[layer];
             const layer_t_Wqkv_b = self.presliced_weights.t_Wqkv_b[layer];
@@ -253,33 +253,7 @@ pub fn TextModel(comptime model_config: Config) type {
             var v_final: Tensor(f16) = undefined;
 
             if (layer_cache) |cache| {
-                const new_len = cache.current_len + seq_len;
-                if (new_len > 2048) {
-                    return error.SequenceTooLong;
-                }
-
-                for (0..n_heads) |h| {
-                    const k_src_start = h * seq_len * head_dim;
-                    const k_dst_start = h * 2048 * head_dim + cache.current_len * head_dim;
-                    const k_len = seq_len * head_dim;
-
-                    @memcpy(
-                        cache.key.data[k_dst_start .. k_dst_start + k_len],
-                        kr.data[k_src_start .. k_src_start + k_len],
-                    );
-
-                    const v_src_start = h * seq_len * head_dim;
-                    const v_dst_start = h * 2048 * head_dim + cache.current_len * head_dim;
-                    const v_len = seq_len * head_dim;
-
-                    @memcpy(
-                        cache.value.data[v_dst_start .. v_dst_start + v_len],
-                        v.data[v_src_start .. v_src_start + v_len],
-                    );
-                }
-
-                cache.current_len = new_len;
-
+                try cache.updateCache(kr, v, seq_len);
                 const active_cache = try cache.getActiveCache();
                 errdefer {
                     active_cache.key.deinit();
@@ -287,7 +261,6 @@ pub fn TextModel(comptime model_config: Config) type {
                 }
                 k_final = active_cache.key;
                 v_final = active_cache.value;
-
                 kr.deinit();
             } else {
                 k_final = try kr.copy();
@@ -365,12 +338,8 @@ pub fn KVCache(comptime model_config: Config) type {
         const config = model_config;
         const max_seq_len: usize = 2048;
         const n_layers: usize = config.n_layers;
-        const n_heads: usize = config.n_heads;
-        const head_dim: usize = config.head_dim;
-
-        // SIMD optimization constants
-        const SimdVec = @Vector(8, f16);
-        const simd_width = 8;
+        const n_heads: usize = config.n_heads; // 32
+        const head_dim: usize = config.head_dim; // 64
 
         layers: []LayerCache,
         allocator: Allocator,
@@ -398,33 +367,30 @@ pub fn KVCache(comptime model_config: Config) type {
         }
 
         pub const LayerCache = struct {
-            key: Tensor(f16),
-            value: Tensor(f16),
+            // Store data as 32-byte aligned arrays for SIMD
+            key: []align(32) f16,
+            value: []align(32) f16,
             current_len: usize,
-
-            fn simdCopySlice(dst: []f16, src: []const f16, length: usize) void {
-                const aligned_len = length - (length % simd_width);
-                var i: usize = 0;
-
-                // SIMD copy for aligned chunks
-                while (i < aligned_len) : (i += simd_width) {
-                    const src_aligned = @as(*align(2) const [simd_width]f16, @ptrCast(src[i..].ptr));
-                    const vec = @as(SimdVec, @bitCast(src_aligned.*));
-                    @as(*SimdVec, @alignCast(@ptrCast(dst[i..].ptr))).* = vec;
-                }
-
-                // Copy remaining elements
-                while (i < length) : (i += 1) {
-                    dst[i] = src[i];
-                }
-            }
+            allocator: Allocator,
 
             pub fn init(allocator: Allocator) !LayerCache {
+                // Flat allocation, we'll handle the layout ourselves
+                const total_size = n_heads * max_seq_len * head_dim;
+                const key = try allocator.alignedAlloc(f16, 32, total_size);
+                errdefer allocator.free(key);
+                const value = try allocator.alignedAlloc(f16, 32, total_size);
+                errdefer allocator.free(value);
+
                 return LayerCache{
-                    .key = try Tensor(f16).init(allocator, &[_]usize{ n_heads, max_seq_len, head_dim }),
-                    .value = try Tensor(f16).init(allocator, &[_]usize{ n_heads, max_seq_len, head_dim }),
+                    .key = key,
+                    .value = value,
                     .current_len = 0,
+                    .allocator = allocator,
                 };
+            }
+
+            pub fn getCurrentLen(self: *const LayerCache) usize {
+                return self.current_len;
             }
 
             pub fn reset(self: *LayerCache) void {
@@ -432,41 +398,106 @@ pub fn KVCache(comptime model_config: Config) type {
             }
 
             pub fn deinit(self: *LayerCache) void {
-                self.key.deinit();
-                self.value.deinit();
+                self.allocator.free(self.key);
+                self.allocator.free(self.value);
                 self.* = undefined;
             }
 
-            pub fn getActiveCache(self: *LayerCache) !struct { key: Tensor(f16), value: Tensor(f16) } {
-                // Create new tensors with active dimensions
-                var key_active = try Tensor(f16).init(self.key.allocator, &[_]usize{ n_heads, self.current_len, head_dim });
-                errdefer key_active.deinit();
+            // Ultra-optimized for head_dim=64
+            inline fn copyHead(dst: [*]align(32) f16, src: [*]const f16) void {
+                // Copy 64 f16s = 128 bytes in 4 AVX chunks of 32 bytes each
+                const chunk = @Vector(16, f16);
+                const src_arr = src[0..64];
+                const dst_arr = dst[0..64];
 
-                var value_active = try Tensor(f16).init(self.value.allocator, &[_]usize{ n_heads, self.current_len, head_dim });
+                // 4 chunks of 16 f16s each = 64 total f16s
+                inline for (0..4) |i| {
+                    const offset = i * 16;
+                    const src_ptr = @as(*const [16]f16, @ptrCast(&src_arr[offset]));
+                    const vec = @as(chunk, @bitCast(src_ptr.*));
+                    @as(*align(32) chunk, @alignCast(@ptrCast(&dst_arr[offset]))).* = vec;
+                }
+            }
+
+            pub fn getActiveCache(self: *LayerCache) !struct { key: Tensor(f16), value: Tensor(f16) } {
+                var key_active = try Tensor(f16).init(self.allocator, &[_]usize{ n_heads, self.current_len, head_dim });
+                errdefer key_active.deinit();
+                var value_active = try Tensor(f16).init(self.allocator, &[_]usize{ n_heads, self.current_len, head_dim });
                 errdefer value_active.deinit();
 
-                // Calculate strides for proper memory layout
-                const src_head_stride = max_seq_len * head_dim;
-                const dst_head_stride = self.current_len * head_dim;
-
-                // Copy data maintaining exact memory layout
-                for (0..n_heads) |h| {
-                    // Process each head
-                    const src_head_offset = h * src_head_stride;
-                    const dst_head_offset = h * dst_head_stride;
-
-                    // Copy data for each sequence position
-                    for (0..self.current_len) |s| {
-                        const src_offset = src_head_offset + s * head_dim;
-                        const dst_offset = dst_head_offset + s * head_dim;
-
-                        // Use SIMD copy for the head dimension
-                        simdCopySlice(key_active.data[dst_offset..][0..head_dim], self.key.data[src_offset..][0..head_dim], head_dim);
-                        simdCopySlice(value_active.data[dst_offset..][0..head_dim], self.value.data[src_offset..][0..head_dim], head_dim);
+                if (self.current_len == 1) {
+                    // Single token fast path - each head is exactly 64 f16s
+                    for (0..n_heads) |h| {
+                        const src_offset = h * max_seq_len * head_dim;
+                        const dst_offset = h * head_dim;
+                        @memcpy(
+                            key_active.data[dst_offset..][0..head_dim],
+                            self.key[src_offset..][0..head_dim],
+                        );
+                        @memcpy(
+                            value_active.data[dst_offset..][0..head_dim],
+                            self.value[src_offset..][0..head_dim],
+                        );
+                    }
+                } else {
+                    // Multi-token path
+                    const elements_per_head = self.current_len * head_dim;
+                    for (0..n_heads) |h| {
+                        const src_offset = h * max_seq_len * head_dim;
+                        const dst_offset = h * elements_per_head;
+                        @memcpy(
+                            key_active.data[dst_offset..][0..elements_per_head],
+                            self.key[src_offset..][0..elements_per_head],
+                        );
+                        @memcpy(
+                            value_active.data[dst_offset..][0..elements_per_head],
+                            self.value[src_offset..][0..elements_per_head],
+                        );
                     }
                 }
 
                 return .{ .key = key_active, .value = value_active };
+            }
+
+            pub fn updateCache(self: *LayerCache, kr: Tensor(f16), v: Tensor(f16), seq_len: usize) !void {
+                const new_len = self.current_len + seq_len;
+                if (new_len > max_seq_len) return error.SequenceTooLong;
+
+                // Ultra-optimized single token path
+                if (seq_len == 1) {
+                    // We know each head is exactly 64 f16s = 128 bytes
+                    inline for (0..n_heads) |h| {
+                        const k_src_ptr: [*]const f16 = @ptrCast(&kr.data[h * head_dim]);
+                        const k_dst_ptr: [*]align(32) f16 = @alignCast(@ptrCast(&self.key[h * max_seq_len * head_dim + self.current_len * head_dim]));
+                        copyHead(k_dst_ptr, k_src_ptr);
+
+                        const v_src_ptr: [*]const f16 = @ptrCast(&v.data[h * head_dim]);
+                        const v_dst_ptr: [*]align(32) f16 = @alignCast(@ptrCast(&self.value[h * max_seq_len * head_dim + self.current_len * head_dim]));
+                        copyHead(v_dst_ptr, v_src_ptr);
+                    }
+                } else {
+                    // Standard multi-token path (not optimized since not used in inference)
+                    for (0..n_heads) |h| {
+                        const src_base = h * seq_len * head_dim;
+                        const dst_base = h * max_seq_len * head_dim + self.current_len * head_dim;
+
+                        var token: usize = 0;
+                        while (token < seq_len) : (token += 1) {
+                            const src_offset = src_base + token * head_dim;
+                            const dst_offset = dst_base + token * head_dim;
+                            @memcpy(
+                                self.key[dst_offset..][0..head_dim],
+                                kr.data[src_offset..][0..head_dim],
+                            );
+                            @memcpy(
+                                self.value[dst_offset..][0..head_dim],
+                                v.data[src_offset..][0..head_dim],
+                            );
+                        }
+                    }
+                }
+
+                self.current_len = new_len;
             }
         };
 
