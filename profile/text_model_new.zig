@@ -135,28 +135,28 @@ pub fn TextModel(comptime model_config: Config) type {
         }
 
         pub fn text_decoder(self: Self, input_embeds: Tensor(f16), kv_cache: ?*KVCacheType) !struct { output: Tensor(f16), cache: KVCacheType } {
-            // var timer = try Timer.start();
-            // const total_start = timer.read();
+            var timer = try Timer.start();
+            const total_start = timer.read();
 
             // Initialize timing tracking variables
-            // var total_ln_time: i128 = 0;
-            // var total_attention_time: i128 = 0;
-            // var total_mlp_time: i128 = 0;
-            // var total_residual_time: i128 = 0;
+            var total_ln_time: i128 = 0;
+            var total_attention_time: i128 = 0;
+            var total_mlp_time: i128 = 0;
+            var total_residual_time: i128 = 0;
 
-            // var block_label_buf: [64]u8 = undefined;
+            var block_label_buf: [64]u8 = undefined;
 
             // Copy input embeddings
-            // const hidden_start = timer.read();
+            const hidden_start = timer.read();
             var hidden = try input_embeds.copy();
             defer hidden.deinit();
-            // try printTimeDiff(&timer, hidden_start, "Input Copy");
+            try printTimeDiff(&timer, hidden_start, "Input Copy");
 
             // Initialize new KV cache
-            // const cache_start = timer.read();
+            const cache_start = timer.read();
             var new_cache = try KVCacheType.init(self.allocator);
             errdefer new_cache.deinit();
-            // try printTimeDiff(&timer, cache_start, "Cache Initialization");
+            try printTimeDiff(&timer, cache_start, "Cache Initialization");
 
             // Add shape verification
             if (hidden.shape.len != 2) {
@@ -164,12 +164,12 @@ pub fn TextModel(comptime model_config: Config) type {
             }
 
             // Process transformer blocks
-            // const blocks_start = timer.read();
+            const blocks_start = timer.read();
             for (0..Self.config.n_layers) |layer| {
-                // const block_start = timer.read();
+                const block_start = timer.read();
 
                 // Layer normalization
-                // const ln_start = timer.read();
+                const ln_start = timer.read();
                 const layer_ln_w = self.presliced_weights.t_ln_w[layer];
                 const layer_ln_b = self.presliced_weights.t_ln_b[layer];
 
@@ -181,45 +181,45 @@ pub fn TextModel(comptime model_config: Config) type {
                     eps,
                 );
                 defer ln_in.deinit();
-                // total_ln_time += timer.read() - ln_start;
+                total_ln_time += timer.read() - ln_start;
 
                 // Attention block
-                // const attn_start = timer.read();
+                const attn_start = timer.read();
                 const layer_kv_cache = if (kv_cache) |cache| try cache.getLayerCache(layer) else null;
                 var attn_out = try self.attention_block(ln_in, layer, layer_kv_cache);
                 defer attn_out.deinit();
-                // total_attention_time += timer.read() - attn_start;
+                total_attention_time += timer.read() - attn_start;
 
                 // MLP block
-                // const mlp_start = timer.read();
+                const mlp_start = timer.read();
                 var mlp_out = try self.mlp(ln_in, layer);
                 defer mlp_out.deinit();
-                // total_mlp_time += timer.read() - mlp_start;
+                total_mlp_time += timer.read() - mlp_start;
 
                 // Residual connections
-                // const residual_start = timer.read();
+                const residual_start = timer.read();
                 try ops.add(f16, &attn_out, mlp_out);
                 try ops.add(f16, &hidden, attn_out);
 
-                // total_residual_time += timer.read() - residual_start;
+                total_residual_time += timer.read() - residual_start;
 
                 // Print block timing
-                // const block_label = try std.fmt.bufPrint(&block_label_buf, "Transformer Block {d}", .{layer});
-                // try printTimeDiff(&timer, block_start, block_label);
+                const block_label = try std.fmt.bufPrint(&block_label_buf, "Transformer Block {d}", .{layer});
+                try printTimeDiff(&timer, block_start, block_label);
             }
-            // try printTimeDiff(&timer, blocks_start, "Total Transformer Blocks");
+            try printTimeDiff(&timer, blocks_start, "Total Transformer Blocks");
 
             // Print average times per block
-            // const blocks_f64 = @as(f64, @floatFromInt(Self.config.n_layers));
-            // const stdout = std.io.getStdOut().writer();
-            // try stdout.print("\x1b[93m [TEXT PROFILE] Average times per transformer block:\x1b[0m\n", .{});
-            // try stdout.print("\x1b[93m Layer Norm: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_ln_time)) / blocks_f64 / 1_000_000.0});
-            // try stdout.print("\x1b[93m Attention: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_attention_time)) / blocks_f64 / 1_000_000.0});
-            // try stdout.print("\x1b[93m MLP: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_mlp_time)) / blocks_f64 / 1_000_000.0});
-            // try stdout.print("\x1b[93m Residual Connections: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_residual_time)) / blocks_f64 / 1_000_000.0});
+            const blocks_f64 = @as(f64, @floatFromInt(Self.config.n_layers));
+            const stdout = std.io.getStdOut().writer();
+            try stdout.print("\x1b[93m [TEXT PROFILE] Average times per transformer block:\x1b[0m\n", .{});
+            try stdout.print("\x1b[93m Layer Norm: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_ln_time)) / blocks_f64 / 1_000_000.0});
+            try stdout.print("\x1b[93m Attention: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_attention_time)) / blocks_f64 / 1_000_000.0});
+            try stdout.print("\x1b[93m MLP: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_mlp_time)) / blocks_f64 / 1_000_000.0});
+            try stdout.print("\x1b[93m Residual Connections: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_residual_time)) / blocks_f64 / 1_000_000.0});
 
             // Print total execution time
-            // try printTimeDiff(&timer, total_start, "Total Text Decoder");
+            try printTimeDiff(&timer, total_start, "Total Text Decoder");
 
             var final_output = try hidden.copy();
             errdefer final_output.deinit();
@@ -233,14 +233,11 @@ pub fn TextModel(comptime model_config: Config) type {
             const total_start = timer.read();
 
             const n_heads = Self.config.n_heads;
-
             const seq_len = input.shape[0];
             const rot_dim = Self.config.head_dim / 2;
-
             const pos = if (layer_cache) |cache| cache.getCurrentLen() else 0;
 
             // QKV projection
-
             const weight_start = timer.read();
             const layer_t_Wqkv_w = self.presliced_weights.t_Wqkv_w[layer];
             const layer_t_Wqkv_b = self.presliced_weights.t_Wqkv_b[layer];
@@ -257,7 +254,7 @@ pub fn TextModel(comptime model_config: Config) type {
             try ops.broadcast_add_simd(&qkv, layer_t_Wqkv_b);
             try printTimeDiff(&timer, qkv_proj_add, "QKV Projection Bias");
 
-            // Split QKV and reshape
+            // Split QKV and reshape - optimized for both paths
             const split_start = timer.read();
             const num_chunks = 3;
             var qkv_view = try qkv.asView();
@@ -288,6 +285,7 @@ pub fn TextModel(comptime model_config: Config) type {
             var v_chunk_view = try qkv_view.getChunkView(1, 2, num_chunks);
             defer v_chunk_view.deinit();
             try printTimeDiff(&timer, v_split_time, "QKV Split V");
+
             const v_contig_time = timer.read();
             var v = try v_chunk_view.toContiguousTensor();
             defer v.deinit();
@@ -299,7 +297,8 @@ pub fn TextModel(comptime model_config: Config) type {
             try q.reshape(&[_]usize{ seq_len, n_heads, head_dim });
             try k.reshape(&[_]usize{ seq_len, n_heads, head_dim });
             try v.reshape(&[_]usize{ seq_len, n_heads, head_dim });
-            try printTimeDiff(&timer, reshape_start, "QKV Reshape ");
+            try printTimeDiff(&timer, reshape_start, "QKV Reshape");
+
             const transpose_start = timer.read();
             try ops.transposeAxes(f16, &q, 0, 1);
             try ops.transposeAxes(f16, &k, 0, 1);
@@ -363,24 +362,37 @@ pub fn TextModel(comptime model_config: Config) type {
             defer v_final.deinit();
             try printTimeDiff(&timer, cache_start, "KV Cache Operations");
 
-            // Attention mask and computation
-            const attn_start = timer.read();
+            // Attention mask
+            const mask_start = timer.read();
             var attn_mask = try ops.createAttentionMask(self.allocator, pos, seq_len);
             defer attn_mask.deinit();
+            try printTimeDiff(&timer, mask_start, "Create Attention Mask");
 
-            var attn_output = try ops.multiscaledDotProductAttention(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
+            // Choose attention path based on sequence length
+            const attn_start = timer.read();
+            var attn_output: Tensor(f16) = undefined;
+
+            if (seq_len == 1) {
+                // Single token fast path
+                attn_output = try ops.singleTokenAttentionFast(qr, k_final, v_final, attn_mask, self.allocator);
+            } else {
+                // Multi-token path
+                attn_output = try ops.multiscaledDotProductAttention(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
+            }
             defer attn_output.deinit();
 
+            try printTimeDiff(&timer, attn_start, "Attention Computation");
+
+            // Attention output processing
+            const out_process_start = timer.read();
             try ops.transposeAxes(f16, &attn_output, 0, 1);
             try attn_output.reshape(&[_]usize{ seq_len, n_heads * head_dim });
-            try printTimeDiff(&timer, attn_start, "Attention Computation");
+            try printTimeDiff(&timer, out_process_start, "Output Processing");
 
             // Output projection
             const proj_start = timer.read();
-
             var out_proj = try hgemm.matmul(attn_output, layer_out_proj_w, self.allocator);
             errdefer out_proj.deinit();
-
             try ops.broadcast_add_simd(&out_proj, layer_out_proj_b);
             try printTimeDiff(&timer, proj_start, "Output Projection");
 
@@ -391,49 +403,48 @@ pub fn TextModel(comptime model_config: Config) type {
         }
 
         fn mlp(self: Self, input: Tensor(f16), layer: usize) !Tensor(f16) {
-            // var timer = try Timer.start();
-            // const total_start = timer.read();
+            var timer = try Timer.start();
+            const total_start = timer.read();
 
-            // Weight loading
-            // const weight_start = timer.read();
+            const weight_start = timer.read();
             const layer_t_fc1_w = self.presliced_weights.t_fc1_w[layer];
             const layer_t_fc1_b = self.presliced_weights.t_fc1_b[layer];
             const layer_t_fc2_w = self.presliced_weights.t_fc2_w[layer];
             const layer_t_fc2_b = self.presliced_weights.t_fc2_b[layer];
-            // try printTimeDiff(&timer, weight_start, "MLP Weight Loading");
+            try printTimeDiff(&timer, weight_start, "MLP Weight Loading");
 
             // First linear layer
-            // const fc1_start = timer.read();
+            const fc1_start = timer.read();
 
             var fc1 = try hgemm.matmul(input, layer_t_fc1_w, self.allocator);
             defer fc1.deinit();
 
             try ops.broadcast_add_simd(&fc1, layer_t_fc1_b);
-            // try printTimeDiff(&timer, fc1_start, "FC1 Layer");
+            try printTimeDiff(&timer, fc1_start, "FC1 Layer");
 
             // GELU activation
-            // const gelu_start = timer.read();
+            const gelu_start = timer.read();
             try ops.gelu(f16, &fc1);
-            // try printTimeDiff(&timer, gelu_start, "GELU Activation");
+            try printTimeDiff(&timer, gelu_start, "GELU Activation");
 
-            // Second linear layer
-            // const fc2_start = timer.read();
+            // Second linear layer - same pattern
+            const fc2_start = timer.read();
 
             var fc2 = try hgemm.matmul(fc1, layer_t_fc2_w, self.allocator);
             errdefer fc2.deinit();
 
             try ops.broadcast_add_simd(&fc2, layer_t_fc2_b);
-            // try printTimeDiff(&timer, fc2_start, "FC2 Layer");
+            try printTimeDiff(&timer, fc2_start, "FC2 Layer");
 
             // Print total time
-            // try printTimeDiff(&timer, total_start, "Total MLP Block");
+            try printTimeDiff(&timer, total_start, "Total MLP Block");
 
             return fc2;
         }
 
         pub fn lm_head(self: Self, hidden: Tensor(f16)) !Tensor(f16) {
-            // var timer = try Timer.start();
-            // const total_start = timer.read();
+            var timer = try Timer.start();
+            const total_start = timer.read();
 
             // Input validation
             if (hidden.shape.len != 2) {
@@ -441,33 +452,33 @@ pub fn TextModel(comptime model_config: Config) type {
             }
 
             // Get last hidden state
-            // const slice_start = timer.read();
+            const slice_start = timer.read();
             const seq_len = hidden.shape[0];
             var last_hidden = try hidden.getDimensionSlice(0, seq_len - 1);
             defer last_hidden.deinit();
-            // try printTimeDiff(&timer, slice_start, "Hidden State Slice");
+            try printTimeDiff(&timer, slice_start, "Hidden State Slice");
 
             // Layer normalization
-            // const norm_start = timer.read();
+            const norm_start = timer.read();
             var normalized = try ops.layerNorm(f16, last_hidden, self.weights.t_ln_out_w, self.weights.t_ln_out_b, 1e-5);
             defer normalized.deinit();
-            // try printTimeDiff(&timer, norm_start, "Layer Normalization");
+            try printTimeDiff(&timer, norm_start, "Layer Normalization");
 
             // Reshape
-            // const reshape_start = timer.read();
+            const reshape_start = timer.read();
             try normalized.reshape(&[_]usize{ 1, Self.config.dim });
-            // try printTimeDiff(&timer, reshape_start, "Reshape");
+            try printTimeDiff(&timer, reshape_start, "Reshape");
 
             // Linear projection
-            // const proj_start = timer.read();
+            const proj_start = timer.read();
             var logits = try hgemm.matmul(normalized, self.weights.t_linear_w, self.allocator);
             errdefer logits.deinit();
 
             try ops.broadcast_add_simd(&logits, self.weights.t_linear_b);
-            // try printTimeDiff(&timer, proj_start, "Linear Projection");
+            try printTimeDiff(&timer, proj_start, "Linear Projection");
 
             // Print total time
-            // try printTimeDiff(&timer, total_start, "Total LM Head");
+            try printTimeDiff(&timer, total_start, "Total LM Head");
 
             return logits;
         }

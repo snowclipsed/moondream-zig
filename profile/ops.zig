@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
+const Atomic = std.atomic.Value;
 
 const Tensor = @import("tensor.zig").Tensor;
 const TensorView = @import("tensor.zig").TensorView;
@@ -289,6 +290,132 @@ pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: us
     tensor.data = new_data;
     tensor.allocator.free(tensor.shape);
     tensor.shape = new_shape;
+}
+
+pub fn transposeAxesMutable(comptime T: type, tensor: *const Tensor(T), dim0: usize, dim1: usize) !Tensor(T) {
+    if (dim0 >= tensor.shape.len or dim1 >= tensor.shape.len) {
+        return error.InvalidDimension;
+    }
+
+    // Allocator for creating a new tensor
+    var allocator = tensor.allocator;
+
+    // Calculate strides for the current shape
+    var strides = try allocator.alloc(usize, tensor.shape.len);
+    defer allocator.free(strides);
+
+    strides[tensor.shape.len - 1] = 1;
+    var i: usize = tensor.shape.len - 1;
+    while (i > 0) : (i -= 1) {
+        strides[i - 1] = strides[i] * tensor.shape[i];
+    }
+
+    // Create new shape with swapped dimensions
+    var new_shape = try allocator.alloc(usize, tensor.shape.len);
+    errdefer allocator.free(new_shape);
+
+    for (tensor.shape, 0..) |dim, idx| {
+        new_shape[idx] = if (idx == dim0) tensor.shape[dim1] else if (idx == dim1) tensor.shape[dim0] else dim;
+    }
+
+    // Allocate memory for transposed data
+    var new_data = try allocator.alignedAlloc(T, 32, tensor.data.len);
+    errdefer allocator.free(new_data);
+
+    // Calculate new strides
+    var new_strides = try allocator.alloc(usize, tensor.shape.len);
+    defer allocator.free(new_strides);
+
+    new_strides[tensor.shape.len - 1] = 1;
+    i = tensor.shape.len - 1;
+    while (i > 0) : (i -= 1) {
+        new_strides[i - 1] = new_strides[i] * new_shape[i];
+    }
+
+    // SIMD optimization block (similar to original implementation)
+    {
+        if (tensor.shape.len == 3 and dim0 == 0 and dim1 == 1 and
+            (T == f16 or T == f32))
+        {
+            const batch_size = tensor.shape[0];
+            const rows = tensor.shape[1];
+            const cols = tensor.shape[2];
+            const vector_size = if (T == f16) 16 else 8;
+
+            if (cols >= vector_size) {
+                const Vector = @Vector(vector_size, T);
+
+                var col: usize = 0;
+                while (col < cols) : (col += vector_size) {
+                    const vec_size = @min(vector_size, cols - col);
+
+                    for (0..batch_size) |b| {
+                        for (0..rows) |r| {
+                            const src_idx = b * rows * cols + r * cols + col;
+                            var vec: Vector = undefined;
+
+                            if (vec_size == vector_size) {
+                                vec = tensor.data[src_idx..][0..vector_size].*;
+                            } else {
+                                var temp: [vector_size]T = undefined;
+                                @memcpy(temp[0..vec_size], tensor.data[src_idx..][0..vec_size]);
+                                vec = temp;
+                            }
+
+                            const dst_idx = r * batch_size * cols + b * cols + col;
+                            if (vec_size == vector_size) {
+                                new_data[dst_idx..][0..vector_size].* = vec;
+                            } else {
+                                @memcpy(new_data[dst_idx..][0..vec_size], @as([vector_size]T, vec)[0..vec_size]);
+                            }
+                        }
+                    }
+                }
+
+                // Return a new tensor instead of modifying the original
+                return Tensor(T){
+                    .data = new_data,
+                    .shape = new_shape,
+                    .allocator = allocator,
+                };
+            }
+        }
+    }
+
+    // General case implementation
+    var coords = try allocator.alloc(usize, tensor.shape.len);
+    defer allocator.free(coords);
+    @memset(coords, 0);
+
+    const total_elements = tensor.data.len;
+    var idx: usize = 0;
+    while (idx < total_elements) : (idx += 1) {
+        var remaining = idx;
+        for (0..tensor.shape.len) |dim| {
+            coords[dim] = remaining / new_strides[dim];
+            remaining %= new_strides[dim];
+        }
+
+        // Swap coordinates
+        const temp = coords[dim0];
+        coords[dim0] = coords[dim1];
+        coords[dim1] = temp;
+
+        // Calculate source index
+        var src_idx: usize = 0;
+        for (0..tensor.shape.len) |dim| {
+            src_idx += coords[dim] * strides[dim];
+        }
+
+        new_data[idx] = tensor.data[src_idx];
+    }
+
+    // Return a new tensor
+    return Tensor(T){
+        .data = new_data,
+        .shape = new_shape,
+        .allocator = allocator,
+    };
 }
 pub fn transposeF16SIMD(tensor: *Tensor(f16), batch_size: usize, rows: usize, cols: usize, new_data: []align(32) f16) void {
     const vec_size = 8;
@@ -3362,12 +3489,9 @@ pub fn multiscaledDotProductAttention(
     const q_len = query.shape[1];
     const kv_len = key.shape[1];
     // const head_dim = query.shape[2];
+
     var timer = try Timer.start();
     const total_start = timer.read();
-
-    if (q_len == 1) {
-        return try singleTokenAttention(query, key, value, mask, allocator);
-    }
 
     const scale_time = timer.read();
     // Scale factor
@@ -3532,148 +3656,148 @@ pub fn multiscaledDotProductAttention(
     return out;
 }
 
-fn singleTokenAttention(
+const SimdF16x8 = @Vector(8, f16);
+const SimdF32x8 = @Vector(8, f32);
+
+// Model constants
+const MODEL_HEAD_DIM: usize = 64;
+const MODEL_N_HEADS: usize = 32;
+const SIMD_WIDTH: usize = 8;
+const HEAD_DIM_CHUNKS: usize = MODEL_HEAD_DIM / SIMD_WIDTH;
+const MAX_KV_LEN: usize = 2048; // Maximum sequence length
+const MAX_THREADS: usize = 32; // Maximum number of threads (same as MODEL_N_HEADS)
+
+// Static workspace for each thread
+const SingleHeadWorkspace = struct {
+    scores: [MAX_KV_LEN]f32 align(32),
+    out_head: [MODEL_HEAD_DIM]f32 align(32),
+};
+
+// Static global workspaces
+var global_workspaces: [MAX_THREADS]SingleHeadWorkspace = undefined;
+
+const HeadContext = struct {
+    start_head: usize,
+    end_head: usize,
+    query: Tensor(f16),
+    key: Tensor(f16),
+    value: Tensor(f16),
+    mask: Tensor(bool),
+    out: *Tensor(f16),
+    kv_len: usize,
+    workspace: *SingleHeadWorkspace,
+};
+
+// Worker function
+fn processHeads(ctx: HeadContext) void {
+    const scores = &ctx.workspace.scores;
+    const out_head = &ctx.workspace.out_head;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(MODEL_HEAD_DIM)));
+
+    // Process each head in this thread's range
+    for (ctx.start_head..ctx.end_head) |h| {
+        const query_offset = h * MODEL_HEAD_DIM;
+        const key_offset = h * ctx.kv_len * MODEL_HEAD_DIM;
+        const value_offset = key_offset;
+
+        // Compute attention scores with SIMD
+        for (0..ctx.kv_len) |j| {
+            var sum: f32 = 0;
+            const k_base = key_offset + j * MODEL_HEAD_DIM;
+
+            // Process in chunks of 8 elements
+            inline for (0..HEAD_DIM_CHUNKS) |chunk| {
+                const q_ptr = @as(*const SimdF16x8, @ptrCast(@alignCast(&ctx.query.data[query_offset + chunk * SIMD_WIDTH])));
+                const k_ptr = @as(*const SimdF16x8, @ptrCast(@alignCast(&ctx.key.data[k_base + chunk * SIMD_WIDTH])));
+
+                const q_f32: SimdF32x8 = @as(SimdF32x8, @floatCast(q_ptr.*));
+                const k_f32: SimdF32x8 = @as(SimdF32x8, @floatCast(k_ptr.*));
+
+                const mul = q_f32 * k_f32;
+                sum += @reduce(.Add, mul);
+            }
+
+            scores[j] = sum * scale;
+            if (!ctx.mask.data[j]) {
+                scores[j] = -std.math.inf(f32);
+            }
+        }
+
+        // Optimized softmax with branchless operations
+        var max_val: f32 = scores[0];
+        for (scores[1..ctx.kv_len]) |s| {
+            max_val = @max(max_val, s);
+        }
+
+        var sum: f32 = 0;
+        for (scores[0..ctx.kv_len]) |*s| {
+            s.* = @exp(s.* - max_val);
+            sum += s.*;
+        }
+
+        const inv_sum = 1.0 / sum;
+        for (scores[0..ctx.kv_len]) |*s| {
+            s.* *= inv_sum;
+        }
+
+        // Clear output accumulator
+        @memset(out_head, 0);
+
+        // Weighted sum with SIMD
+        for (0..ctx.kv_len) |j| {
+            const weight = scores[j];
+            const v_base = value_offset + j * MODEL_HEAD_DIM;
+
+            inline for (0..HEAD_DIM_CHUNKS) |chunk| {
+                const v_ptr = @as(*const SimdF16x8, @ptrCast(@alignCast(&ctx.value.data[v_base + chunk * SIMD_WIDTH])));
+                const out_ptr = @as(*SimdF32x8, @ptrCast(@alignCast(&out_head[chunk * SIMD_WIDTH])));
+
+                const v_f32: SimdF32x8 = @as(SimdF32x8, @floatCast(v_ptr.*));
+                out_ptr.* += v_f32 * @as(SimdF32x8, @splat(weight));
+            }
+        }
+
+        // Copy to output with casting
+        inline for (0..HEAD_DIM_CHUNKS) |chunk| {
+            const src = @as(*align(32) const SimdF32x8, @alignCast(@ptrCast(&out_head[chunk * SIMD_WIDTH])));
+            const dst_ptr = ctx.out.data.ptr + h * MODEL_HEAD_DIM + chunk * SIMD_WIDTH;
+            const dst_vec: SimdF16x8 = @floatCast(src.*);
+            @as(*SimdF16x8, @alignCast(@ptrCast(dst_ptr))).* = dst_vec;
+        }
+    }
+}
+
+pub fn singleTokenAttentionFast(
     query: Tensor(f16),
     key: Tensor(f16),
     value: Tensor(f16),
     mask: Tensor(bool),
     allocator: Allocator,
 ) !Tensor(f16) {
-    const n_heads = query.shape[0];
     const kv_len = key.shape[1];
-    const head_dim = query.shape[2];
-    //
-    // Pre-allocate output tensor (n_heads x 1 x head_dim)
-    var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, 1, head_dim });
+    if (kv_len > MAX_KV_LEN) return error.SequenceTooLong;
+
+    // Initialize output tensor (only allocation we need)
+    var out = try Tensor(f16).init(allocator, &[_]usize{ MODEL_N_HEADS, 1, MODEL_HEAD_DIM });
     errdefer out.deinit();
-    //
-    // Scale factor
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-    //
-    // Process each head in parallel
-    const thread_count = @min(n_heads, try Thread.getCpuCount());
-    var threads = try allocator.alloc(Thread, thread_count);
-    defer allocator.free(threads);
-    //
-    // Simplified workspace for single token processing
-    const SingleTokenWorkspace = struct {
-        attn_weights: []f32,
-        out_head: []f32,
-        allocator: Allocator,
-        //
-        fn init(ally: Allocator, in_kv_len: usize, in_head_dim: usize) !@This() {
-            return .{
-                .attn_weights = try ally.alloc(f32, in_kv_len),
-                .out_head = try ally.alloc(f32, in_head_dim),
-                .allocator = ally,
-            };
-        }
-        //
-        fn deinit(self: *@This()) void {
-            self.allocator.free(self.attn_weights);
-            self.allocator.free(self.out_head);
-        }
-    };
-    //
-    // Simplified context for single token processing
-    const SingleTokenContext = struct {
-        start_head: usize,
-        end_head: usize,
-        query: Tensor(f16),
-        key: Tensor(f16),
-        value: Tensor(f16),
-        mask: Tensor(bool),
-        out: *Tensor(f16),
-        scale: f32,
-        kv_len: usize,
-        head_dim: usize,
-        workspace: *SingleTokenWorkspace,
-    };
-    //
-    // Allocate workspaces
-    var workspaces = try allocator.alloc(SingleTokenWorkspace, thread_count);
-    defer {
-        for (workspaces) |*workspace| {
-            workspace.deinit();
-        }
-        allocator.free(workspaces);
-    }
-    //
-    for (0..thread_count) |i| {
-        workspaces[i] = try SingleTokenWorkspace.init(allocator, kv_len, head_dim);
-    }
-    //
-    // Worker function optimized for single token
-    const worker = struct {
-        fn process(ctx: SingleTokenContext) !void {
-            const workspace = ctx.workspace;
-            //
-            for (ctx.start_head..ctx.end_head) |h| {
-                // Direct computation of attention scores without intermediate allocations
-                for (0..ctx.kv_len) |j| {
-                    var score: f32 = 0;
-                    for (0..ctx.head_dim) |d| {
-                        const q_val = @as(f32, @floatCast(ctx.query.data[h * ctx.head_dim + d]));
-                        const k_val = @as(f32, @floatCast(ctx.key.data[h * ctx.kv_len * ctx.head_dim + j * ctx.head_dim + d]));
-                        score += q_val * k_val;
-                    }
-                    workspace.attn_weights[j] = score * ctx.scale;
-                    //
-                    // Apply mask inline
-                    if (!ctx.mask.data[j]) {
-                        workspace.attn_weights[j] = -std.math.inf(f32);
-                    }
-                }
-                //
-                // Inline softmax for better cache utilization
-                var max_val: f32 = -std.math.inf(f32);
-                for (workspace.attn_weights[0..ctx.kv_len]) |w| {
-                    max_val = @max(max_val, w);
-                }
-                //
-                var sum: f32 = 0;
-                for (workspace.attn_weights[0..ctx.kv_len]) |*w| {
-                    w.* = @exp(w.* - max_val);
-                    sum += w.*;
-                }
-                //
-                const inv_sum = 1.0 / sum;
-                for (workspace.attn_weights[0..ctx.kv_len]) |*w| {
-                    w.* *= inv_sum;
-                }
-                //
-                // Compute output directly
-                @memset(workspace.out_head, 0);
-                for (0..ctx.kv_len) |j| {
-                    const weight = workspace.attn_weights[j];
-                    for (0..ctx.head_dim) |d| {
-                        const v_val = @as(f32, @floatCast(ctx.value.data[h * ctx.kv_len * ctx.head_dim + j * ctx.head_dim + d]));
-                        workspace.out_head[d] += weight * v_val;
-                    }
-                }
-                //
-                // Copy to output with casting
-                for (0..ctx.head_dim) |d| {
-                    ctx.out.data[h * ctx.head_dim + d] = @floatCast(workspace.out_head[d]);
-                }
-            }
-        }
-    }.process;
-    //
-    // Launch threads
-    var contexts = try allocator.alloc(SingleTokenContext, thread_count);
-    defer allocator.free(contexts);
-    //
-    const heads_per_thread = n_heads / thread_count;
-    const remaining_heads = n_heads % thread_count;
+
+    // Set up threads
+    const thread_count = @min(MODEL_N_HEADS, try Thread.getCpuCount());
+    var threads: [MAX_THREADS]Thread = undefined;
+    var contexts: [MAX_THREADS]HeadContext = undefined;
+
+    // Distribute work
+    const heads_per_thread = MODEL_N_HEADS / thread_count;
+    const remaining_heads = MODEL_N_HEADS % thread_count;
     var current_head: usize = 0;
-    //
+
+    // Launch threads
     for (0..thread_count) |t| {
         const start_head = current_head;
         const extra_head: usize = if (t < remaining_heads) 1 else 0;
         current_head += heads_per_thread + extra_head;
-        //
-        contexts[t] = SingleTokenContext{
+
+        contexts[t] = HeadContext{
             .start_head = start_head,
             .end_head = current_head,
             .query = query,
@@ -3681,20 +3805,17 @@ fn singleTokenAttention(
             .value = value,
             .mask = mask,
             .out = &out,
-            .scale = scale,
             .kv_len = kv_len,
-            .head_dim = head_dim,
-            .workspace = &workspaces[t],
+            .workspace = &global_workspaces[t],
         };
-        //
-        threads[t] = try Thread.spawn(.{}, worker, .{contexts[t]});
+
+        threads[t] = try Thread.spawn(.{}, processHeads, .{contexts[t]});
     }
-    //
-    for (threads) |thread| {
+
+    // Wait for completion
+    for (threads[0..thread_count]) |thread| {
         thread.join();
     }
-    //
+
     return out;
 }
-
-// TODO : take kv len and head dim as comptime params!
