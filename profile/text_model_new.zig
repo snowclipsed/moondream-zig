@@ -8,6 +8,7 @@ const TensorView = @import("tensor.zig").TensorView;
 const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
 const hgemm = @import("hgemm.zig");
+const hgemmtrans = @import("hgemmtrans.zig");
 const Timer = std.time.Timer;
 const printTimeDiff = @import("timedifftext.zig").printTimeDiff;
 const TextPreSlicedWeights = @import("preslice_text.zig").TextPreSlicedWeights;
@@ -47,6 +48,11 @@ pub fn TextModel(comptime model_config: Config) type {
             const attention: [3]usize = .{ config.n_heads, max_seq_len, config.head_dim };
             const hidden: [2]usize = .{ max_seq_len, config.dim };
             const mlp_intermediate: [2]usize = .{ max_seq_len, config.hidden_dim };
+        };
+
+        const mlp_shapes = struct {
+            const fc1: [2]usize = .{ 1, config.hidden_dim };
+            const fc2: [2]usize = .{ 1, config.dim };
         };
 
         // Pre-computed rotary embedding dimensions
@@ -210,13 +216,13 @@ pub fn TextModel(comptime model_config: Config) type {
             try printTimeDiff(&timer, blocks_start, "Total Transformer Blocks");
 
             // Print average times per block
-            const blocks_f64 = @as(f64, @floatFromInt(Self.config.n_layers));
-            const stdout = std.io.getStdOut().writer();
-            try stdout.print("\x1b[93m [TEXT PROFILE] Average times per transformer block:\x1b[0m\n", .{});
-            try stdout.print("\x1b[93m Layer Norm: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_ln_time)) / blocks_f64 / 1_000_000.0});
-            try stdout.print("\x1b[93m Attention: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_attention_time)) / blocks_f64 / 1_000_000.0});
-            try stdout.print("\x1b[93m MLP: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_mlp_time)) / blocks_f64 / 1_000_000.0});
-            try stdout.print("\x1b[93m Residual Connections: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_residual_time)) / blocks_f64 / 1_000_000.0});
+            // const blocks_f64 = @as(f64, @floatFromInt(Self.config.n_layers));
+            // const stdout = std.io.getStdOut().writer();
+            // try stdout.print("\x1b[93m [TEXT PROFILE] Average times per transformer block:\x1b[0m\n", .{});
+            // try stdout.print("\x1b[93m Layer Norm: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_ln_time)) / blocks_f64 / 1_000_000.0});
+            // try stdout.print("\x1b[93m Attention: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_attention_time)) / blocks_f64 / 1_000_000.0});
+            // try stdout.print("\x1b[93m MLP: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_mlp_time)) / blocks_f64 / 1_000_000.0});
+            // try stdout.print("\x1b[93m Residual Connections: {d:.2}ms\x1b[0m\n", .{@as(f64, @floatFromInt(total_residual_time)) / blocks_f64 / 1_000_000.0});
 
             // Print total execution time
             try printTimeDiff(&timer, total_start, "Total Text Decoder");
@@ -414,13 +420,27 @@ pub fn TextModel(comptime model_config: Config) type {
             try printTimeDiff(&timer, weight_start, "MLP Weight Loading");
 
             // First linear layer
-            const fc1_start = timer.read();
+            const fc1_mul = timer.read();
 
-            var fc1 = try hgemm.matmul(input, layer_t_fc1_w, self.allocator);
+            var fc1 = try hgemmtrans.mul(input, layer_t_fc1_w, self.allocator);
             defer fc1.deinit();
+            try printTimeDiff(&timer, fc1_mul, "FC1 MUL");
 
+            const fc1_trans = timer.read();
+
+            if (fc1.shape[1] == 1) {
+                fc1.shape[0] = fc1.shape[0] ^ fc1.shape[1];
+                fc1.shape[1] = fc1.shape[0] ^ fc1.shape[1];
+                fc1.shape[0] = fc1.shape[0] ^ fc1.shape[1];
+            } else {
+                try ops.transposeAxes(f16, &fc1, 0, 1);
+            }
+
+            try printTimeDiff(&timer, fc1_trans, "FC1 Transpose");
+
+            const fc1_bias = timer.read();
             try ops.broadcast_add_simd(&fc1, layer_t_fc1_b);
-            try printTimeDiff(&timer, fc1_start, "FC1 Layer");
+            try printTimeDiff(&timer, fc1_bias, "FC1 Bias");
 
             // GELU activation
             const gelu_start = timer.read();
@@ -428,13 +448,27 @@ pub fn TextModel(comptime model_config: Config) type {
             try printTimeDiff(&timer, gelu_start, "GELU Activation");
 
             // Second linear layer - same pattern
-            const fc2_start = timer.read();
+            const fc2_mul = timer.read();
 
-            var fc2 = try hgemm.matmul(fc1, layer_t_fc2_w, self.allocator);
+            var fc2 = try hgemmtrans.mul(fc1, layer_t_fc2_w, self.allocator);
             errdefer fc2.deinit();
 
+            try printTimeDiff(&timer, fc2_mul, "FC2 MUL");
+            const fc2_trans = timer.read();
+
+            if (fc2.shape[0] == 1) {
+                fc2.shape[0] = fc2.shape[0] ^ fc2.shape[1];
+                fc2.shape[1] = fc2.shape[0] ^ fc2.shape[1];
+                fc2.shape[0] = fc2.shape[0] ^ fc2.shape[1];
+            } else {
+                try ops.transposeAxes(f16, &fc2, 0, 1);
+            }
+
+            try printTimeDiff(&timer, fc2_trans, "FC2 Transpose");
+
+            const fc2_bias = timer.read();
             try ops.broadcast_add_simd(&fc2, layer_t_fc2_b);
-            try printTimeDiff(&timer, fc2_start, "FC2 Layer");
+            try printTimeDiff(&timer, fc2_bias, "FC2 Bias");
 
             // Print total time
             try printTimeDiff(&timer, total_start, "Total MLP Block");
@@ -471,8 +505,12 @@ pub fn TextModel(comptime model_config: Config) type {
 
             // Linear projection
             const proj_start = timer.read();
-            var logits = try hgemm.matmul(normalized, self.weights.t_linear_w, self.allocator);
+            var logits = try hgemmtrans.mul(normalized, self.weights.t_linear_w, self.allocator);
             errdefer logits.deinit();
+
+            logits.shape[0] = logits.shape[0] ^ logits.shape[1];
+            logits.shape[1] = logits.shape[0] ^ logits.shape[1];
+            logits.shape[0] = logits.shape[0] ^ logits.shape[1];
 
             try ops.broadcast_add_simd(&logits, self.weights.t_linear_b);
             try printTimeDiff(&timer, proj_start, "Linear Projection");

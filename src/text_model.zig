@@ -7,6 +7,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
 const hgemm = @import("hgemm.zig");
+const hgemmtrans = @import("hgemmtrans.zig");
 const TextPreSlicedWeights = @import("preslice_text.zig").TextPreSlicedWeights;
 
 const mode = std.builtin.FloatMode.optimized;
@@ -274,7 +275,15 @@ pub fn TextModel(comptime model_config: Config) type {
             var attn_mask = try ops.createAttentionMask(self.allocator, pos, seq_len);
             defer attn_mask.deinit();
 
-            var attn_output = try ops.multiscaledDotProductAttention(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
+            var attn_output: Tensor(f16) = undefined;
+
+            if (seq_len == 1) {
+                // Single token fast path
+                attn_output = try ops.singleTokenAttentionFast(qr, k_final, v_final, attn_mask, self.allocator);
+            } else {
+                // Multi-token path
+                attn_output = try ops.multiscaledDotProductAttention(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
+            }
             defer attn_output.deinit();
 
             try ops.transposeAxes(f16, &attn_output, 0, 1);
@@ -294,15 +303,31 @@ pub fn TextModel(comptime model_config: Config) type {
             const layer_t_fc2_w = self.presliced_weights.t_fc2_w[layer];
             const layer_t_fc2_b = self.presliced_weights.t_fc2_b[layer];
 
-            var fc1 = try hgemm.matmul(input, layer_t_fc1_w, self.allocator);
+            var fc1 = try hgemmtrans.mul(input, layer_t_fc1_w, self.allocator);
             defer fc1.deinit();
+
+            if (fc1.shape[1] == 1) {
+                fc1.shape[0] = fc1.shape[0] ^ fc1.shape[1];
+                fc1.shape[1] = fc1.shape[0] ^ fc1.shape[1];
+                fc1.shape[0] = fc1.shape[0] ^ fc1.shape[1];
+            } else {
+                try ops.transposeAxes(f16, &fc1, 0, 1);
+            }
 
             try ops.broadcast_add_simd(&fc1, layer_t_fc1_b);
 
             try ops.gelu(f16, &fc1);
 
-            var fc2 = try hgemm.matmul(fc1, layer_t_fc2_w, self.allocator);
+            var fc2 = try hgemmtrans.mul(fc1, layer_t_fc2_w, self.allocator);
             errdefer fc2.deinit();
+
+            if (fc2.shape[0] == 1) {
+                fc2.shape[0] = fc2.shape[0] ^ fc2.shape[1];
+                fc2.shape[1] = fc2.shape[0] ^ fc2.shape[1];
+                fc2.shape[0] = fc2.shape[0] ^ fc2.shape[1];
+            } else {
+                try ops.transposeAxes(f16, &fc2, 0, 1);
+            }
 
             try ops.broadcast_add_simd(&fc2, layer_t_fc2_b);
 
@@ -322,8 +347,12 @@ pub fn TextModel(comptime model_config: Config) type {
 
             try normalized.reshape(&[_]usize{ 1, Self.config.dim });
 
-            var logits = try hgemm.matmul(normalized, self.weights.t_linear_w, self.allocator);
+            var logits = try hgemmtrans.mul(normalized, self.weights.t_linear_w, self.allocator);
             errdefer logits.deinit();
+
+            logits.shape[0] = logits.shape[0] ^ logits.shape[1];
+            logits.shape[1] = logits.shape[0] ^ logits.shape[1];
+            logits.shape[0] = logits.shape[0] ^ logits.shape[1];
 
             try ops.broadcast_add_simd(&logits, self.weights.t_linear_b);
 

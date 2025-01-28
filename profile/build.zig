@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const exe = b.addExecutable(.{
         .name = "moondream",
-        .root_source_file = b.path("moonprofile.zig"),
+        .root_source_file = b.path("moondream.zig"),
         .target = target,
         .optimize = optimize,
     });

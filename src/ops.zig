@@ -2817,10 +2817,6 @@ pub fn multiscaledDotProductAttention(
     const q_len = query.shape[1];
     const kv_len = key.shape[1];
 
-    if (q_len == 1) {
-        return try singleTokenAttention(query, key, value, mask, allocator);
-    }
-
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
     var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, q_len, head_dim });
@@ -2939,148 +2935,148 @@ pub fn multiscaledDotProductAttention(
     return out;
 }
 
-fn singleTokenAttention(
+const SimdF16x8 = @Vector(8, f16);
+const SimdF32x8 = @Vector(8, f32);
+
+// Model constants
+const MODEL_HEAD_DIM: usize = 64;
+const MODEL_N_HEADS: usize = 32;
+const SIMD_WIDTH: usize = 8;
+const HEAD_DIM_CHUNKS: usize = MODEL_HEAD_DIM / SIMD_WIDTH;
+const MAX_KV_LEN: usize = 2048; // Maximum sequence length
+const MAX_THREADS: usize = 32; // Maximum number of threads (same as MODEL_N_HEADS)
+
+// Static workspace for each thread
+const SingleHeadWorkspace = struct {
+    scores: [MAX_KV_LEN]f32 align(32),
+    out_head: [MODEL_HEAD_DIM]f32 align(32),
+};
+
+// Static global workspaces
+var global_workspaces: [MAX_THREADS]SingleHeadWorkspace = undefined;
+
+const HeadContext = struct {
+    start_head: usize,
+    end_head: usize,
+    query: Tensor(f16),
+    key: Tensor(f16),
+    value: Tensor(f16),
+    mask: Tensor(bool),
+    out: *Tensor(f16),
+    kv_len: usize,
+    workspace: *SingleHeadWorkspace,
+};
+
+// Worker function
+fn processHeads(ctx: HeadContext) void {
+    const scores = &ctx.workspace.scores;
+    const out_head = &ctx.workspace.out_head;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(MODEL_HEAD_DIM)));
+
+    // Process each head in this thread's range
+    for (ctx.start_head..ctx.end_head) |h| {
+        const query_offset = h * MODEL_HEAD_DIM;
+        const key_offset = h * ctx.kv_len * MODEL_HEAD_DIM;
+        const value_offset = key_offset;
+
+        // Compute attention scores with SIMD
+        for (0..ctx.kv_len) |j| {
+            var sum: f32 = 0;
+            const k_base = key_offset + j * MODEL_HEAD_DIM;
+
+            // Process in chunks of 8 elements
+            inline for (0..HEAD_DIM_CHUNKS) |chunk| {
+                const q_ptr = @as(*const SimdF16x8, @ptrCast(@alignCast(&ctx.query.data[query_offset + chunk * SIMD_WIDTH])));
+                const k_ptr = @as(*const SimdF16x8, @ptrCast(@alignCast(&ctx.key.data[k_base + chunk * SIMD_WIDTH])));
+
+                const q_f32: SimdF32x8 = @as(SimdF32x8, @floatCast(q_ptr.*));
+                const k_f32: SimdF32x8 = @as(SimdF32x8, @floatCast(k_ptr.*));
+
+                const mul = q_f32 * k_f32;
+                sum += @reduce(.Add, mul);
+            }
+
+            scores[j] = sum * scale;
+            if (!ctx.mask.data[j]) {
+                scores[j] = -std.math.inf(f32);
+            }
+        }
+
+        // Optimized softmax with branchless operations
+        var max_val: f32 = scores[0];
+        for (scores[1..ctx.kv_len]) |s| {
+            max_val = @max(max_val, s);
+        }
+
+        var sum: f32 = 0;
+        for (scores[0..ctx.kv_len]) |*s| {
+            s.* = @exp(s.* - max_val);
+            sum += s.*;
+        }
+
+        const inv_sum = 1.0 / sum;
+        for (scores[0..ctx.kv_len]) |*s| {
+            s.* *= inv_sum;
+        }
+
+        // Clear output accumulator
+        @memset(out_head, 0);
+
+        // Weighted sum with SIMD
+        for (0..ctx.kv_len) |j| {
+            const weight = scores[j];
+            const v_base = value_offset + j * MODEL_HEAD_DIM;
+
+            inline for (0..HEAD_DIM_CHUNKS) |chunk| {
+                const v_ptr = @as(*const SimdF16x8, @ptrCast(@alignCast(&ctx.value.data[v_base + chunk * SIMD_WIDTH])));
+                const out_ptr = @as(*SimdF32x8, @ptrCast(@alignCast(&out_head[chunk * SIMD_WIDTH])));
+
+                const v_f32: SimdF32x8 = @as(SimdF32x8, @floatCast(v_ptr.*));
+                out_ptr.* += v_f32 * @as(SimdF32x8, @splat(weight));
+            }
+        }
+
+        // Copy to output with casting
+        inline for (0..HEAD_DIM_CHUNKS) |chunk| {
+            const src = @as(*align(32) const SimdF32x8, @alignCast(@ptrCast(&out_head[chunk * SIMD_WIDTH])));
+            const dst_ptr = ctx.out.data.ptr + h * MODEL_HEAD_DIM + chunk * SIMD_WIDTH;
+            const dst_vec: SimdF16x8 = @floatCast(src.*);
+            @as(*SimdF16x8, @alignCast(@ptrCast(dst_ptr))).* = dst_vec;
+        }
+    }
+}
+
+pub fn singleTokenAttentionFast(
     query: Tensor(f16),
     key: Tensor(f16),
     value: Tensor(f16),
     mask: Tensor(bool),
     allocator: Allocator,
 ) !Tensor(f16) {
-    const n_heads = query.shape[0];
     const kv_len = key.shape[1];
-    const head_dim = query.shape[2];
-    //
-    // Pre-allocate output tensor (n_heads x 1 x head_dim)
-    var out = try Tensor(f16).init(allocator, &[_]usize{ n_heads, 1, head_dim });
+    if (kv_len > MAX_KV_LEN) return error.SequenceTooLong;
+
+    // Initialize output tensor (only allocation we need)
+    var out = try Tensor(f16).init(allocator, &[_]usize{ MODEL_N_HEADS, 1, MODEL_HEAD_DIM });
     errdefer out.deinit();
-    //
-    // Scale factor
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-    //
-    // Process each head in parallel
-    const thread_count = @min(n_heads, try Thread.getCpuCount());
-    var threads = try allocator.alloc(Thread, thread_count);
-    defer allocator.free(threads);
-    //
-    // Simplified workspace for single token processing
-    const SingleTokenWorkspace = struct {
-        attn_weights: []f32,
-        out_head: []f32,
-        allocator: Allocator,
-        //
-        fn init(ally: Allocator, in_kv_len: usize, in_head_dim: usize) !@This() {
-            return .{
-                .attn_weights = try ally.alloc(f32, in_kv_len),
-                .out_head = try ally.alloc(f32, in_head_dim),
-                .allocator = ally,
-            };
-        }
-        //
-        fn deinit(self: *@This()) void {
-            self.allocator.free(self.attn_weights);
-            self.allocator.free(self.out_head);
-        }
-    };
-    //
-    // Simplified context for single token processing
-    const SingleTokenContext = struct {
-        start_head: usize,
-        end_head: usize,
-        query: Tensor(f16),
-        key: Tensor(f16),
-        value: Tensor(f16),
-        mask: Tensor(bool),
-        out: *Tensor(f16),
-        scale: f32,
-        kv_len: usize,
-        head_dim: usize,
-        workspace: *SingleTokenWorkspace,
-    };
-    //
-    // Allocate workspaces
-    var workspaces = try allocator.alloc(SingleTokenWorkspace, thread_count);
-    defer {
-        for (workspaces) |*workspace| {
-            workspace.deinit();
-        }
-        allocator.free(workspaces);
-    }
-    //
-    for (0..thread_count) |i| {
-        workspaces[i] = try SingleTokenWorkspace.init(allocator, kv_len, head_dim);
-    }
-    //
-    // Worker function optimized for single token
-    const worker = struct {
-        fn process(ctx: SingleTokenContext) !void {
-            const workspace = ctx.workspace;
-            //
-            for (ctx.start_head..ctx.end_head) |h| {
-                // Direct computation of attention scores without intermediate allocations
-                for (0..ctx.kv_len) |j| {
-                    var score: f32 = 0;
-                    for (0..ctx.head_dim) |d| {
-                        const q_val = @as(f32, @floatCast(ctx.query.data[h * ctx.head_dim + d]));
-                        const k_val = @as(f32, @floatCast(ctx.key.data[h * ctx.kv_len * ctx.head_dim + j * ctx.head_dim + d]));
-                        score += q_val * k_val;
-                    }
-                    workspace.attn_weights[j] = score * ctx.scale;
-                    //
-                    // Apply mask inline
-                    if (!ctx.mask.data[j]) {
-                        workspace.attn_weights[j] = -std.math.inf(f32);
-                    }
-                }
-                //
-                // Inline softmax for better cache utilization
-                var max_val: f32 = -std.math.inf(f32);
-                for (workspace.attn_weights[0..ctx.kv_len]) |w| {
-                    max_val = @max(max_val, w);
-                }
-                //
-                var sum: f32 = 0;
-                for (workspace.attn_weights[0..ctx.kv_len]) |*w| {
-                    w.* = @exp(w.* - max_val);
-                    sum += w.*;
-                }
-                //
-                const inv_sum = 1.0 / sum;
-                for (workspace.attn_weights[0..ctx.kv_len]) |*w| {
-                    w.* *= inv_sum;
-                }
-                //
-                // Compute output directly
-                @memset(workspace.out_head, 0);
-                for (0..ctx.kv_len) |j| {
-                    const weight = workspace.attn_weights[j];
-                    for (0..ctx.head_dim) |d| {
-                        const v_val = @as(f32, @floatCast(ctx.value.data[h * ctx.kv_len * ctx.head_dim + j * ctx.head_dim + d]));
-                        workspace.out_head[d] += weight * v_val;
-                    }
-                }
-                //
-                // Copy to output with casting
-                for (0..ctx.head_dim) |d| {
-                    ctx.out.data[h * ctx.head_dim + d] = @floatCast(workspace.out_head[d]);
-                }
-            }
-        }
-    }.process;
-    //
-    // Launch threads
-    var contexts = try allocator.alloc(SingleTokenContext, thread_count);
-    defer allocator.free(contexts);
-    //
-    const heads_per_thread = n_heads / thread_count;
-    const remaining_heads = n_heads % thread_count;
+
+    // Set up threads
+    const thread_count = @min(MODEL_N_HEADS, try Thread.getCpuCount());
+    var threads: [MAX_THREADS]Thread = undefined;
+    var contexts: [MAX_THREADS]HeadContext = undefined;
+
+    // Distribute work
+    const heads_per_thread = MODEL_N_HEADS / thread_count;
+    const remaining_heads = MODEL_N_HEADS % thread_count;
     var current_head: usize = 0;
-    //
+
+    // Launch threads
     for (0..thread_count) |t| {
         const start_head = current_head;
         const extra_head: usize = if (t < remaining_heads) 1 else 0;
         current_head += heads_per_thread + extra_head;
-        //
-        contexts[t] = SingleTokenContext{
+
+        contexts[t] = HeadContext{
             .start_head = start_head,
             .end_head = current_head,
             .query = query,
@@ -3088,18 +3084,17 @@ fn singleTokenAttention(
             .value = value,
             .mask = mask,
             .out = &out,
-            .scale = scale,
             .kv_len = kv_len,
-            .head_dim = head_dim,
-            .workspace = &workspaces[t],
+            .workspace = &global_workspaces[t],
         };
-        //
-        threads[t] = try Thread.spawn(.{}, worker, .{contexts[t]});
+
+        threads[t] = try Thread.spawn(.{}, processHeads, .{contexts[t]});
     }
-    //
-    for (threads) |thread| {
+
+    // Wait for completion
+    for (threads[0..thread_count]) |thread| {
         thread.join();
     }
-    //
+
     return out;
 }
