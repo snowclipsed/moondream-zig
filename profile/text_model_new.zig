@@ -7,7 +7,6 @@ const Tensor = @import("tensor.zig").Tensor;
 const TensorView = @import("tensor.zig").TensorView;
 const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
-const hgemm = @import("hgemm.zig");
 const hgemmtrans = @import("hgemmtrans.zig");
 const Timer = std.time.Timer;
 const printTimeDiff = @import("timedifftext.zig").printTimeDiff;
@@ -252,7 +251,7 @@ pub fn TextModel(comptime model_config: Config) type {
             try printTimeDiff(&timer, weight_start, "QKV and Output Projection Weights");
 
             const qkv_proj_matmul = timer.read();
-            var qkv = try hgemm.matmul(input, layer_t_Wqkv_w, self.allocator);
+            var qkv = try hgemmtrans.matmul(input, layer_t_Wqkv_w, self.allocator);
             defer qkv.deinit();
             try printTimeDiff(&timer, qkv_proj_matmul, "QKV Projection Matmul");
 
@@ -397,7 +396,7 @@ pub fn TextModel(comptime model_config: Config) type {
 
             // Output projection
             const proj_start = timer.read();
-            var out_proj = try hgemm.matmul(attn_output, layer_out_proj_w, self.allocator);
+            var out_proj = try hgemmtrans.matmul(attn_output, layer_out_proj_w, self.allocator);
             errdefer out_proj.deinit();
             try ops.broadcast_add_simd(&out_proj, layer_out_proj_b);
             try printTimeDiff(&timer, proj_start, "Output Projection");
@@ -422,21 +421,9 @@ pub fn TextModel(comptime model_config: Config) type {
             // First linear layer
             const fc1_mul = timer.read();
 
-            var fc1 = try hgemmtrans.mul(input, layer_t_fc1_w, self.allocator);
+            var fc1 = try hgemmtrans.matmul(input, layer_t_fc1_w, self.allocator);
             defer fc1.deinit();
             try printTimeDiff(&timer, fc1_mul, "FC1 MUL");
-
-            const fc1_trans = timer.read();
-
-            if (fc1.shape[1] == 1) {
-                fc1.shape[0] = fc1.shape[0] ^ fc1.shape[1];
-                fc1.shape[1] = fc1.shape[0] ^ fc1.shape[1];
-                fc1.shape[0] = fc1.shape[0] ^ fc1.shape[1];
-            } else {
-                try ops.transposeAxes(f16, &fc1, 0, 1);
-            }
-
-            try printTimeDiff(&timer, fc1_trans, "FC1 Transpose");
 
             const fc1_bias = timer.read();
             try ops.broadcast_add_simd(&fc1, layer_t_fc1_b);
@@ -450,21 +437,10 @@ pub fn TextModel(comptime model_config: Config) type {
             // Second linear layer - same pattern
             const fc2_mul = timer.read();
 
-            var fc2 = try hgemmtrans.mul(fc1, layer_t_fc2_w, self.allocator);
+            var fc2 = try hgemmtrans.matmul(fc1, layer_t_fc2_w, self.allocator);
             errdefer fc2.deinit();
 
             try printTimeDiff(&timer, fc2_mul, "FC2 MUL");
-            const fc2_trans = timer.read();
-
-            if (fc2.shape[0] == 1) {
-                fc2.shape[0] = fc2.shape[0] ^ fc2.shape[1];
-                fc2.shape[1] = fc2.shape[0] ^ fc2.shape[1];
-                fc2.shape[0] = fc2.shape[0] ^ fc2.shape[1];
-            } else {
-                try ops.transposeAxes(f16, &fc2, 0, 1);
-            }
-
-            try printTimeDiff(&timer, fc2_trans, "FC2 Transpose");
 
             const fc2_bias = timer.read();
             try ops.broadcast_add_simd(&fc2, layer_t_fc2_b);
@@ -505,12 +481,8 @@ pub fn TextModel(comptime model_config: Config) type {
 
             // Linear projection
             const proj_start = timer.read();
-            var logits = try hgemmtrans.mul(normalized, self.weights.t_linear_w, self.allocator);
+            var logits = try hgemmtrans.matmul(normalized, self.weights.t_linear_w, self.allocator);
             errdefer logits.deinit();
-
-            logits.shape[0] = logits.shape[0] ^ logits.shape[1];
-            logits.shape[1] = logits.shape[0] ^ logits.shape[1];
-            logits.shape[0] = logits.shape[0] ^ logits.shape[1];
 
             try ops.broadcast_add_simd(&logits, self.weights.t_linear_b);
             try printTimeDiff(&timer, proj_start, "Linear Projection");

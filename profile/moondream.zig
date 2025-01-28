@@ -8,6 +8,8 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const VisionModel = @import("vision_model_new.zig").VisionModel;
 const TextModel = @import("text_model_new.zig").TextModel;
 const KVCache = @import("text_model_new.zig").KVCache;
+const EMBEDDED_MODEL = @embedFile("../moondream.bin");
+const EMBEDDED_TOKENIZER = @embedFile("../tokenizer.bin");
 
 const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
@@ -19,7 +21,7 @@ const Timer = std.time.Timer;
 
 // CONSTANTS //
 
-const ENABLE_STREAMING = false; // Comptime flag to control token streaming
+const ENABLE_STREAMING = true; // Comptime flag to control token streaming
 
 const HEADER_ART =
     \\███╗   ███╗ ██████╗  ██████╗ ███╗   ██╗██████╗ ██████╗ ███████╗ █████╗ ███╗   ███╗ ▪    ███████╗██╗ ██████╗ 

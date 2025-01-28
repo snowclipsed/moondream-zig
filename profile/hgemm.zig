@@ -1,3 +1,4 @@
+//normal gemm
 const std = @import("std");
 const testing = std.testing;
 const atomic = std.atomic;

@@ -186,7 +186,7 @@ pub fn TextModel(comptime model_config: Config) type {
             const layer_out_proj_w = self.presliced_weights.t_out_proj_w[layer];
             const layer_out_proj_b = self.presliced_weights.t_out_proj_b[layer];
 
-            var qkv = try hgemm.matmul(input, layer_t_Wqkv_w, self.allocator);
+            var qkv = try hgemmtrans.matmul(input, layer_t_Wqkv_w, self.allocator);
             defer qkv.deinit();
 
             try ops.broadcast_add_simd(&qkv, layer_t_Wqkv_b);
@@ -289,7 +289,7 @@ pub fn TextModel(comptime model_config: Config) type {
             try ops.transposeAxes(f16, &attn_output, 0, 1);
             try attn_output.reshape(&[_]usize{ seq_len, n_heads * head_dim });
 
-            var out_proj = try hgemm.matmul(attn_output, layer_out_proj_w, self.allocator);
+            var out_proj = try hgemmtrans.matmul(attn_output, layer_out_proj_w, self.allocator);
             errdefer out_proj.deinit();
 
             try ops.broadcast_add_simd(&out_proj, layer_out_proj_b);
@@ -303,31 +303,15 @@ pub fn TextModel(comptime model_config: Config) type {
             const layer_t_fc2_w = self.presliced_weights.t_fc2_w[layer];
             const layer_t_fc2_b = self.presliced_weights.t_fc2_b[layer];
 
-            var fc1 = try hgemmtrans.mul(input, layer_t_fc1_w, self.allocator);
+            var fc1 = try hgemmtrans.matmul(input, layer_t_fc1_w, self.allocator);
             defer fc1.deinit();
-
-            if (fc1.shape[1] == 1) {
-                fc1.shape[0] = fc1.shape[0] ^ fc1.shape[1];
-                fc1.shape[1] = fc1.shape[0] ^ fc1.shape[1];
-                fc1.shape[0] = fc1.shape[0] ^ fc1.shape[1];
-            } else {
-                try ops.transposeAxes(f16, &fc1, 0, 1);
-            }
 
             try ops.broadcast_add_simd(&fc1, layer_t_fc1_b);
 
             try ops.gelu(f16, &fc1);
 
-            var fc2 = try hgemmtrans.mul(fc1, layer_t_fc2_w, self.allocator);
+            var fc2 = try hgemmtrans.matmul(fc1, layer_t_fc2_w, self.allocator);
             errdefer fc2.deinit();
-
-            if (fc2.shape[0] == 1) {
-                fc2.shape[0] = fc2.shape[0] ^ fc2.shape[1];
-                fc2.shape[1] = fc2.shape[0] ^ fc2.shape[1];
-                fc2.shape[0] = fc2.shape[0] ^ fc2.shape[1];
-            } else {
-                try ops.transposeAxes(f16, &fc2, 0, 1);
-            }
 
             try ops.broadcast_add_simd(&fc2, layer_t_fc2_b);
 
@@ -347,12 +331,8 @@ pub fn TextModel(comptime model_config: Config) type {
 
             try normalized.reshape(&[_]usize{ 1, Self.config.dim });
 
-            var logits = try hgemmtrans.mul(normalized, self.weights.t_linear_w, self.allocator);
+            var logits = try hgemmtrans.matmul(normalized, self.weights.t_linear_w, self.allocator);
             errdefer logits.deinit();
-
-            logits.shape[0] = logits.shape[0] ^ logits.shape[1];
-            logits.shape[1] = logits.shape[0] ^ logits.shape[1];
-            logits.shape[0] = logits.shape[0] ^ logits.shape[1];
 
             try ops.broadcast_add_simd(&logits, self.weights.t_linear_b);
 

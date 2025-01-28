@@ -57,7 +57,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         .image_path = DEFAULT_IMAGE_PATH,
         .prompt = DEFAULT_PROMPT,
         .max_tokens = DEFAULT_MAX_TOKENS,
-        .show_stats = false,
+        .show_stats = true,
         .sampling_method = "greedy",
         .temperature = 0.5,
         .top_k = 3,

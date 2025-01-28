@@ -104,9 +104,9 @@ def convert_safetensors_to_binary(input_file, output_file):
                 # (path, should_transpose)
                 "t_ln_w": ("ln.weight", False),
                 "t_ln_b": ("ln.bias", False),
-                "t_Wqkv_w": ("attn.qkv.weight", True),
+                "t_Wqkv_w": ("attn.qkv.weight", False),
                 "t_Wqkv_b": ("attn.qkv.bias", False),
-                "t_out_proj_w": ("attn.proj.weight", True),
+                "t_out_proj_w": ("attn.proj.weight", False),
                 "t_out_proj_bias": ("attn.proj.bias", False),
                 "t_fc1_w": ("mlp.fc1.weight", False),  # Changed to False
                 "t_fc1_b": ("mlp.fc1.bias", False),
@@ -182,6 +182,6 @@ def convert_safetensors_to_binary(input_file, output_file):
                         f.get_tensor("model.vision.proj_mlp.fc2.bias"))
 
 if __name__ == "__main__":
-    input_file = 'modelnew.safetensors'
-    output_file = 'moondream_mlp.bin'
+    input_file = 'model.safetensors'
+    output_file = 'moondream.bin'
     convert_safetensors_to_binary(input_file, output_file)
