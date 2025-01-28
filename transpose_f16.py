@@ -68,8 +68,6 @@ def write_tensor(f, name, tensor, transpose=False):
     print(f"  Shape info size: {len(shape_bytes)}")
     print(f"  Data size: {len(data_bytes)}")
     print(f"  Current file position: {current_pos}\n")
-    """Write a single tensor with its header and data."""
-
 
 def collect_and_stack_layer_tensors(f, n_layers, prefix_template, components):
     """Collect tensors across layers and stack them."""
@@ -110,9 +108,9 @@ def convert_safetensors_to_binary(input_file, output_file):
                 "t_Wqkv_b": ("attn.qkv.bias", False),
                 "t_out_proj_w": ("attn.proj.weight", True),
                 "t_out_proj_bias": ("attn.proj.bias", False),
-                "t_fc1_w": ("mlp.fc1.weight", True),
+                "t_fc1_w": ("mlp.fc1.weight", False),  # Changed to False
                 "t_fc1_b": ("mlp.fc1.bias", False),
-                "t_fc2_w": ("mlp.fc2.weight", True),
+                "t_fc2_w": ("mlp.fc2.weight", False),  # Changed to False
                 "t_fc2_b": ("mlp.fc2.bias", False),
             }
             
@@ -126,7 +124,7 @@ def convert_safetensors_to_binary(input_file, output_file):
 
             # Write text model end layers (with transpose for weights)
             write_tensor(out_f, "t_linear_w", 
-                        f.get_tensor("model.text.lm_head.weight"), transpose=True)
+                        f.get_tensor("model.text.lm_head.weight"), transpose=False)
             write_tensor(out_f, "t_linear_b", 
                         f.get_tensor("model.text.lm_head.bias"))
             write_tensor(out_f, "t_ln_out_w", 
@@ -149,9 +147,9 @@ def convert_safetensors_to_binary(input_file, output_file):
                 "v_Wqkv_b": ("attn.qkv.bias", False),
                 "v_out_proj_w": ("attn.proj.weight", True),
                 "v_out_proj_b": ("attn.proj.bias", False),
-                "v_fc1_w": ("mlp.fc1.weight", True),
+                "v_fc1_w": ("mlp.fc1.weight", True), 
                 "v_fc1_b": ("mlp.fc1.bias", False),
-                "v_fc2_w": ("mlp.fc2.weight", True),
+                "v_fc2_w": ("mlp.fc2.weight", True),  
                 "v_fc2_b": ("mlp.fc2.bias", False),
                 "v_norm1_w": ("ln1.weight", False),
                 "v_norm1_b": ("ln1.bias", False),
@@ -184,6 +182,6 @@ def convert_safetensors_to_binary(input_file, output_file):
                         f.get_tensor("model.vision.proj_mlp.fc2.bias"))
 
 if __name__ == "__main__":
-    input_file = 'model.safetensors'
-    output_file = 'moondream.bin'  # Removed f32 from filename since we're not converting to float32
+    input_file = 'modelnew.safetensors'
+    output_file = 'moondream_mlp.bin'
     convert_safetensors_to_binary(input_file, output_file)
