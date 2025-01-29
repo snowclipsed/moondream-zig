@@ -76,4 +76,5 @@ src/tensor_log.py
 src/color
 profile/color
 profile/profile1.txt
-profile/profile_analysis/analysis_report.txt
+profile/profile_analysis/
+src/profile_analysis/
