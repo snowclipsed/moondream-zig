@@ -2574,7 +2574,9 @@ pub fn multimasklessDotProductAttention(
         fn process(ctx: AttnThreadContext) !void {
             var processtimer = try Timer.start();
             const workspace = ctx.workspace;
-            const matmul_threads = @max(1, @as(usize, @intCast(try Thread.getCpuCount() / 2)));
+            const cpu_count = try Thread.getCpuCount();
+            const n_threads: usize = @intCast(@min(8, try Thread.getCpuCount() / 2));
+            const matmul_threads = @as(usize, @max(cpu_count / 2, cpu_count - n_threads));
             for (ctx.start_head..ctx.end_head) |h| {
                 // Copy head slices
                 const copy_time = processtimer.read();
@@ -2806,7 +2808,8 @@ pub fn multiscaledDotProductAttention(
             const workertime = processtimer.read();
             const workspace = ctx.workspace;
             const cpu_count = try Thread.getCpuCount();
-            const matmul_threads = @as(usize, @intCast(cpu_count / 2));
+            const n_threads: usize = @intCast(@min(16, try Thread.getCpuCount() / 2));
+            const matmul_threads = @as(usize, @max(cpu_count / 2, cpu_count - n_threads));
 
             for (ctx.start_head..ctx.end_head) |h| {
                 const slice_copy_time = processtimer.read();

@@ -2655,7 +2655,9 @@ pub fn multimasklessDotProductAttention(
     const worker = struct {
         fn process(ctx: AttnThreadContext) !void {
             const workspace = ctx.workspace;
-            const matmul_threads = @max(1, @as(usize, @intCast(try Thread.getCpuCount() / 2)));
+            const cpu_count = try Thread.getCpuCount();
+            const n_threads: usize = @intCast(@min(n_heads / 2, try Thread.getCpuCount() / 2));
+            const matmul_threads = @as(usize, @max(cpu_count / 2, cpu_count - n_threads));
             for (ctx.start_head..ctx.end_head) |h| {
                 const query_slice = h * ctx.q_len * ctx.head_dim;
                 const key_slice = h * ctx.head_dim * ctx.kv_len;
@@ -2845,7 +2847,8 @@ pub fn multiscaledDotProductAttention(
         fn process(ctx: MaskedAttnThreadContext) !void {
             const workspace = ctx.workspace;
             const cpu_count = try Thread.getCpuCount();
-            const matmul_threads = @as(usize, @intCast(cpu_count / 2));
+            const n_threads: usize = @intCast(@min(n_heads / 2, try Thread.getCpuCount() / 2));
+            const matmul_threads = @as(usize, @max(cpu_count / 2, cpu_count - n_threads));
 
             for (ctx.start_head..ctx.end_head) |h| {
                 const query_slice = h * ctx.q_len * ctx.head_dim;
