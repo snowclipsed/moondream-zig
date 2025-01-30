@@ -313,7 +313,14 @@ pub fn VisionModel(comptime model_config: Config) type {
             try ops.transposeAxes(f16, &k, 0, 1);
             try ops.transposeAxes(f16, &v, 0, 1);
 
-            var attn_out = try ops.multimasklessDotProductAttention(q, k, v, self.allocator);
+            var attn_out = try ops.multimasklessDotProductAttention(
+                n_heads,
+                head_dim,
+                q,
+                k,
+                v,
+                self.allocator,
+            );
             defer attn_out.deinit();
 
             try ops.transposeAxes(f16, &attn_out, 0, 1);

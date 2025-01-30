@@ -561,6 +561,8 @@ fn calculateBandwidth(m: usize, n: usize, k: usize, elapsed_ns: u64) f64 {
 
 pub fn main() !void {
     const sizes = [_][3]usize{
+        .{ 72, 1468, 72 },
+        .{ 1468, 72, 1468 },
         .{ 1, 2048, 51200 },
         .{ 800, 2048, 51200 },
         .{ 1, 2048, 6144 }, // Vector

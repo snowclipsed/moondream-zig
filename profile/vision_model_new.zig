@@ -4,6 +4,7 @@ const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 const Weights = @import("weights.zig").Weights;
 const Config = @import("config.zig").Config;
+
 const Tensor = @import("tensor.zig").Tensor;
 const ops = @import("ops.zig");
 const hgemm = @import("hgemm.zig");
@@ -31,9 +32,11 @@ pub fn VisionModel(comptime model_config: Config) type {
         const eps: comptime_float = 1e-5;
         const batch_size: comptime_int = 2;
         const patches_per_image = (config.img_dim / config.patch_size) * (config.img_dim / config.patch_size);
-        const q_len = batch_size * patches_per_image;
-        const head_dim: usize = config.vit_head_dim;
+        const q_len: comptime_int = batch_size * patches_per_image;
+        const n_heads: comptime_int = config.n_vit_heads;
+        const head_dim: comptime_int = config.vit_head_dim;
         const d_model: usize = config.vit_dim;
+        const kv_len: comptime_int = config.vit_dim * 2;
 
         // Pre-computed attention dimensions
         const attention_dims = struct {
@@ -389,8 +392,6 @@ pub fn VisionModel(comptime model_config: Config) type {
             var timer = try Timer.start();
             const total_start = timer.read();
 
-            const n_heads = Self.config.n_vit_heads;
-
             // Get QKV weights and biases
             const weight_start = timer.read();
             const layer_v_Wqkv_w = self.presliced_weights.v_Wqkv_w[layer];
@@ -451,7 +452,15 @@ pub fn VisionModel(comptime model_config: Config) type {
 
             // Attention computation
             const attention_start = timer.read();
-            var attn_out = try ops.multimasklessDotProductAttention(q, k, v, self.allocator);
+            var attn_out = try ops.multimasklessDotProductAttention(
+                n_heads,
+                head_dim,
+                q,
+                k,
+                v,
+
+                self.allocator,
+            );
             defer attn_out.deinit();
             try printTimeDiff(&timer, attention_start, "Dot Product Attention");
 

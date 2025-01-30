@@ -2534,7 +2534,6 @@ pub fn broadcast_add_simd(a: *Tensor(f16), b: Tensor(f16)) !void {
     }
 }
 
-// Thread workspace pre-allocated for each thread
 const ThreadWorkspace = struct {
     allocator: Allocator,
     query_head: Tensor(f32),
@@ -2543,15 +2542,14 @@ const ThreadWorkspace = struct {
     attn_weights: Tensor(f32),
     out_head: Tensor(f32),
 
-    pub fn init(allocator: Allocator, max_seq_len: usize, head_dim: usize) !ThreadWorkspace {
+    pub fn init(allocator: Allocator, q_len: usize, kv_len: usize, head_dim: usize) !ThreadWorkspace {
         return ThreadWorkspace{
             .allocator = allocator,
-            // Pre-allocate tensors with maximum possible sizes
-            .query_head = try Tensor(f32).init(allocator, &[_]usize{ max_seq_len, head_dim }),
-            .key_head = try Tensor(f32).init(allocator, &[_]usize{ head_dim, max_seq_len }),
-            .value_head = try Tensor(f32).init(allocator, &[_]usize{ max_seq_len, head_dim }),
-            .attn_weights = try Tensor(f32).init(allocator, &[_]usize{ max_seq_len, max_seq_len }),
-            .out_head = try Tensor(f32).init(allocator, &[_]usize{ max_seq_len, head_dim }),
+            .query_head = try Tensor(f32).init(allocator, &[_]usize{ q_len, head_dim }),
+            .key_head = try Tensor(f32).init(allocator, &[_]usize{ head_dim, kv_len }),
+            .value_head = try Tensor(f32).init(allocator, &[_]usize{ kv_len, head_dim }),
+            .attn_weights = try Tensor(f32).init(allocator, &[_]usize{ q_len, kv_len }),
+            .out_head = try Tensor(f32).init(allocator, &[_]usize{ q_len, head_dim }),
         };
     }
 
@@ -2564,27 +2562,17 @@ const ThreadWorkspace = struct {
     }
 };
 
-// // Persistent thread pool context
+// Persistent thread pool context
 const ThreadPoolContext = struct {
     workspaces: []ThreadWorkspace,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, thread_count: usize, max_seq_len: usize, head_dim: usize) !ThreadPoolContext {
-        const workspaces = try allocator.alloc(ThreadWorkspace, thread_count);
+    pub fn init(allocator: Allocator, thread_count: usize, q_len: usize, kv_len: usize, head_dim: usize) !ThreadPoolContext {
+        var workspaces = try allocator.alloc(ThreadWorkspace, thread_count);
         errdefer allocator.free(workspaces);
 
-        var initialized: usize = 0;
-        errdefer {
-            // Clean up any successfully initialized workspaces
-            for (workspaces[0..initialized]) |*workspace| {
-                workspace.deinit();
-            }
-        }
-
-        // Initialize workspaces for each thread
-        for (workspaces) |*workspace| {
-            workspace.* = try ThreadWorkspace.init(allocator, max_seq_len, head_dim);
-            initialized += 1;
+        for (0..thread_count) |i| {
+            workspaces[i] = try ThreadWorkspace.init(allocator, q_len, kv_len, head_dim);
         }
 
         return ThreadPoolContext{
@@ -2601,7 +2589,7 @@ const ThreadPoolContext = struct {
     }
 };
 
-// // Updated thread context with workspace
+// Updated thread context with workspace
 const AttnThreadContext = struct {
     start_head: usize,
     end_head: usize,
@@ -2617,15 +2605,15 @@ const AttnThreadContext = struct {
 };
 
 pub fn multimasklessDotProductAttention(
+    n_heads: comptime_int,
+    head_dim: comptime_int,
     query: Tensor(f16),
     key: Tensor(f16),
     value: Tensor(f16),
     allocator: Allocator,
 ) !Tensor(f16) {
-    const n_heads = query.shape[0];
     const q_len = query.shape[1];
     const kv_len = key.shape[1];
-    const head_dim = query.shape[2];
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
@@ -2634,24 +2622,33 @@ pub fn multimasklessDotProductAttention(
 
     var query_f32 = try query.castWithSimd(f32);
     defer query_f32.deinit();
+    var key_f32 = try key.castWithSimd(f32);
+    defer key_f32.deinit();
     var value_f32 = try value.castWithSimd(f32);
     defer value_f32.deinit();
 
-    var key_transpose = try key.copy();
+    var key_transpose = try Tensor(f32).init(allocator, &[_]usize{ n_heads, head_dim, kv_len });
     defer key_transpose.deinit();
-    try transposeAxes(f16, &key_transpose, 1, 2);
-    var key_transpose_f32 = try key_transpose.castWithSimd(f32);
-    defer key_transpose_f32.deinit();
 
-    const thread_count = @min(n_heads, try Thread.getCpuCount());
-    var thread_pool = try ThreadPoolContext.init(allocator, thread_count, q_len, head_dim);
+    for (0..n_heads) |h| {
+        for (0..kv_len) |k| {
+            for (0..head_dim) |d| {
+                const src_idx = h * kv_len * head_dim + k * head_dim + d;
+                const dst_idx = h * head_dim * kv_len + d * kv_len + k;
+                key_transpose.data[dst_idx] = key_f32.data[src_idx];
+            }
+        }
+    }
+
+    const thread_count: usize = @intCast(@min(n_heads / 2, try Thread.getCpuCount() / 2));
+
+    var thread_pool = try ThreadPoolContext.init(allocator, thread_count, q_len, kv_len, head_dim);
     defer thread_pool.deinit();
-
-    var threads = try allocator.alloc(Thread, thread_count);
-    defer allocator.free(threads);
 
     const heads_per_thread = n_heads / thread_count;
     const remaining_heads = n_heads % thread_count;
+    var threads = try allocator.alloc(Thread, thread_count);
+    defer allocator.free(threads);
 
     var current_head: usize = 0;
     var thread_contexts = try allocator.alloc(AttnThreadContext, thread_count);
@@ -2660,34 +2657,24 @@ pub fn multimasklessDotProductAttention(
     const worker = struct {
         fn process(ctx: AttnThreadContext) !void {
             const workspace = ctx.workspace;
-
+            const matmul_threads = @max(1, @as(usize, @intCast(try Thread.getCpuCount() / 2)));
             for (ctx.start_head..ctx.end_head) |h| {
-                try copyHeadData(f32, &workspace.query_head, ctx.query, h);
-                try copyHeadData(f32, &workspace.key_head, ctx.key, h);
-                try copyHeadData(f32, &workspace.value_head, ctx.value, h);
+                const query_slice = h * ctx.q_len * ctx.head_dim;
+                const key_slice = h * ctx.head_dim * ctx.kv_len;
+                const value_slice = h * ctx.kv_len * ctx.head_dim;
 
-                workspace.query_head.shape[0] = ctx.q_len;
-                workspace.query_head.shape[1] = ctx.head_dim;
+                @memcpy(workspace.query_head.data, ctx.query.data[query_slice..][0 .. ctx.q_len * ctx.head_dim]);
+                @memcpy(workspace.key_head.data, ctx.key.data[key_slice..][0 .. ctx.head_dim * ctx.kv_len]);
+                @memcpy(workspace.value_head.data, ctx.value.data[value_slice..][0 .. ctx.kv_len * ctx.head_dim]);
 
-                workspace.key_head.shape[0] = ctx.head_dim;
-                workspace.key_head.shape[1] = ctx.kv_len;
+                try sgemminplace(f32, workspace.query_head, workspace.key_head, &workspace.attn_weights, workspace.allocator, matmul_threads);
 
-                workspace.value_head.shape[0] = ctx.kv_len;
-                workspace.value_head.shape[1] = ctx.head_dim;
-
-                workspace.attn_weights.shape[0] = ctx.q_len;
-                workspace.attn_weights.shape[1] = ctx.kv_len;
-                try sgemminplace(f32, workspace.query_head, workspace.key_head, &workspace.attn_weights, workspace.allocator);
-
-                for (workspace.attn_weights.data[0 .. ctx.q_len * ctx.kv_len]) |*w| {
+                for (workspace.attn_weights.data) |*w| {
                     w.* *= ctx.scale;
                 }
 
                 try softmax(&workspace.attn_weights, 1, workspace.allocator);
-
-                workspace.out_head.shape[0] = ctx.q_len;
-                workspace.out_head.shape[1] = ctx.head_dim;
-                try sgemminplace(f32, workspace.attn_weights, workspace.value_head, &workspace.out_head, workspace.allocator);
+                try sgemminplace(f32, workspace.attn_weights, workspace.value_head, &workspace.out_head, workspace.allocator, matmul_threads);
 
                 const out_slice = h * ctx.q_len * ctx.head_dim;
                 for (0..ctx.q_len * ctx.head_dim) |i| {
@@ -2706,7 +2693,7 @@ pub fn multimasklessDotProductAttention(
             .start_head = start_head,
             .end_head = current_head,
             .query = query_f32,
-            .key = key_transpose_f32,
+            .key = key_transpose,
             .value = value_f32,
             .out = &out,
             .scale = scale,
@@ -2725,8 +2712,7 @@ pub fn multimasklessDotProductAttention(
 
     return out;
 }
-
-// // Helper function to copy head data into workspace tensors
+// Helper function to copy head data
 fn copyHeadData(comptime T: type, dst: *Tensor(T), src: Tensor(T), head_idx: usize) !void {
     const slice_size = src.shape[1] * src.shape[2];
     const start_idx = head_idx * slice_size;
@@ -2842,7 +2828,8 @@ pub fn multiscaledDotProductAttention(
         }
     }
 
-    const thread_count = @min(n_heads, try Thread.getCpuCount());
+    const thread_count: usize = @intCast(@min(n_heads / 2, try Thread.getCpuCount() / 2));
+
     var thread_pool = try MaskedThreadPoolContext.init(allocator, thread_count, q_len, kv_len, head_dim);
     defer thread_pool.deinit();
 
@@ -2859,6 +2846,8 @@ pub fn multiscaledDotProductAttention(
     const worker = struct {
         fn process(ctx: MaskedAttnThreadContext) !void {
             const workspace = ctx.workspace;
+            const cpu_count = try Thread.getCpuCount();
+            const matmul_threads = @as(usize, @intCast(cpu_count / 2));
 
             for (ctx.start_head..ctx.end_head) |h| {
                 const query_slice = h * ctx.q_len * ctx.head_dim;
@@ -2870,11 +2859,7 @@ pub fn multiscaledDotProductAttention(
                 const value_slice = h * ctx.kv_len * ctx.head_dim;
                 @memcpy(workspace.value_head.data, ctx.value.data[value_slice..][0 .. ctx.kv_len * ctx.head_dim]);
 
-                if (workspace.attn_weights.data.len > 0) {
-                    workspace.attn_weights.deinit();
-                }
-
-                workspace.attn_weights = try sgemm(f32, workspace.query_head, workspace.key_head, ctx.workspace.allocator);
+                try sgemminplace(f32, workspace.query_head, workspace.key_head, &workspace.attn_weights, ctx.workspace.allocator, matmul_threads);
 
                 for (workspace.attn_weights.data) |*w| {
                     w.* *= ctx.scale;
@@ -2891,11 +2876,8 @@ pub fn multiscaledDotProductAttention(
                 }
 
                 try softmax(&workspace.attn_weights, 1, ctx.workspace.allocator);
-                if (workspace.out_head.data.len > 0) {
-                    workspace.out_head.deinit();
-                }
 
-                workspace.out_head = try sgemm(f32, workspace.attn_weights, workspace.value_head, ctx.workspace.allocator);
+                try sgemminplace(f32, workspace.attn_weights, workspace.value_head, &workspace.out_head, ctx.workspace.allocator, matmul_threads);
 
                 const out_slice = h * ctx.q_len * ctx.head_dim;
                 for (0..ctx.q_len * ctx.head_dim) |i| {
