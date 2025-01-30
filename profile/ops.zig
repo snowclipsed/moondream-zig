@@ -1948,8 +1948,8 @@ pub const SamplingMethod = enum {
 /// Configuration for sampling parameters
 pub const SamplingConfig = struct {
     method: SamplingMethod,
-    temperature: f32 = 1.0, // Temperature for softmax
-    top_k: ?usize = null, // Number of top tokens to consider (only for top_k)
+    temperature: f32 = 0.5, // Temperature for softmax
+    top_k: ?usize = 3, // Number of top tokens to consider (only for top_k)
 };
 
 /// Returns the index of the maximum value in the tensor

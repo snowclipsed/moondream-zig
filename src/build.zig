@@ -46,7 +46,7 @@ pub fn build(b: *std.Build) void {
     // Create the main executable
     const exe = b.addExecutable(.{
         .name = "moondream",
-        .root_source_file = .{ .cwd_relative = "moondream.zig" },
+        .root_source_file = .{ .cwd_relative = "moonchat.zig" },
         .target = target,
         .optimize = optimize,
     });
