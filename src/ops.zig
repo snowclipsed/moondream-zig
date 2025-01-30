@@ -12,8 +12,6 @@ const sgemm = @import("sgemm.zig").matmul;
 const sgemminplace = @import("sgemminplace.zig").matmul;
 const hgemminplace = @import("hgemminplace.zig").matmul;
 
-const Timer = std.time.Timer;
-
 const mode = std.builtin.FloatMode.optimized;
 comptime {
     @setFloatMode(mode);
