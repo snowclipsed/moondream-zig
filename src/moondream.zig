@@ -198,7 +198,7 @@ pub fn main() !void {
 
     // Load tokenizer
     const tokenizer_start = timer.read();
-    var tokenizer = try Tokenizer.fromFile(args.tokenizer_path, allocator);
+    var tokenizer = try Tokenizer.fromJson(args.tokenizer_path, allocator);
     defer tokenizer.deinit();
     try printTimeDiff(tokenizer_start, timer.read(), "Tokenizer Loading", args.show_stats);
 

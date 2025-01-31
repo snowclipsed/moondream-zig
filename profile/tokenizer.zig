@@ -1,5 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
+const json = std.json;
 const Allocator = mem.Allocator;
 
 // Special token handling constants
@@ -36,6 +37,80 @@ pub const Tokenizer = struct {
             .bos_token = 50257,
             .pad_token = 50258,
         };
+    }
+
+    pub fn fromJson(filename: []const u8, allocator: Allocator) !Tokenizer {
+        // Initialize tokenizer
+        var tokenizer = Tokenizer.init(allocator);
+        errdefer tokenizer.deinit();
+
+        // Read the file
+        const file_content = try std.fs.cwd().readFileAlloc(allocator, filename, 10 * 1024 * 1024);
+        defer allocator.free(file_content);
+
+        // Parse JSON
+        var tree = try std.json.parseFromSlice(std.json.Value, allocator, file_content, .{});
+        defer tree.deinit();
+        const root = tree.value;
+
+        // Load special tokens
+        const added_tokens = root.object.get("added_tokens").?.array;
+        for (added_tokens.items) |token_obj| {
+            const obj = token_obj.object;
+            const id: u32 = @intCast(obj.get("id").?.integer);
+            const content = obj.get("content").?.string;
+            const is_special = obj.get("special").?.bool;
+            const single_word = obj.get("single_word").?.bool;
+            const lstrip = obj.get("lstrip").?.bool;
+            const rstrip = obj.get("rstrip").?.bool;
+            const normalized = obj.get("normalized").?.bool;
+
+            // Allocate and copy content
+            const content_copy = try allocator.dupe(u8, content);
+            errdefer allocator.free(content_copy);
+
+            try tokenizer.special_tokens.append(.{
+                .id = id,
+                .content = content_copy,
+                .is_special = is_special,
+                .single_word = single_word,
+                .lstrip = lstrip,
+                .rstrip = rstrip,
+                .normalized = normalized,
+            });
+        }
+
+        // Load vocabulary
+        const model = root.object.get("model").?.object;
+        const vocab = model.get("vocab").?.object;
+        var vocab_it = vocab.iterator();
+        while (vocab_it.next()) |entry| {
+            const token = entry.key_ptr.*;
+            const id: u32 = @intCast(entry.value_ptr.*.integer);
+
+            // Allocate and copy token
+            const token_copy = try allocator.dupe(u8, token);
+            errdefer allocator.free(token_copy);
+
+            try tokenizer.tokens.put(token_copy, id);
+        }
+
+        // Load merges
+        const merges = model.get("merges").?.array;
+        for (merges.items) |merge| {
+            const merge_str = try allocator.dupe(u8, merge.string);
+            errdefer allocator.free(merge_str);
+
+            try tokenizer.merges.append(merge_str);
+        }
+
+        // Set special token IDs based on vocab
+        if (vocab.get("<|endoftext|>")) |eos_value| {
+            tokenizer.eos_token = @intCast(eos_value.integer);
+        }
+        // You might want to add other special tokens like bos_token and pad_token here
+
+        return tokenizer;
     }
 
     pub fn fromFile(filename: []const u8, allocator: Allocator) !Tokenizer {
@@ -168,166 +243,113 @@ pub const Tokenizer = struct {
 
     // Modified preprocessText to handle GPT-2 specific character encodings
     fn preprocessText(text: []const u8, allocator: Allocator) ![]u8 {
+        // Don't add any special prefixes here - we'll handle them during tokenization
+        return allocator.dupe(u8, text);
+    }
+
+    // Helper function to convert between Ġ and space
+    fn convertGpt2Space(text: []const u8, allocator: Allocator) ![]u8 {
         var result = std.ArrayList(u8).init(allocator);
         errdefer result.deinit();
 
         var i: usize = 0;
         while (i < text.len) {
-            const c = text[i];
-
-            // Handle different whitespace cases
-            if (std.ascii.isWhitespace(c)) {
-                if (c == ' ') {
-                    // Add GPT-2 space prefix (Ġ)
-                    try result.appendSlice(&GPT2_SPACE_PREFIX);
-                } else if (c == '\n') {
-                    // Add GPT-2 newline prefix (Ċ)
-                    try result.appendSlice(&GPT2_NEWLINE_PREFIX);
-                }
+            // Check for Ġ
+            if (i + 1 < text.len and text[i] == 0xC4 and text[i + 1] == 0xA0) {
+                try result.append(' '); // Replace with regular space
+                i += 2;
             } else {
-                if (i == 0 or (i > 0 and std.ascii.isWhitespace(text[i - 1]))) {
-                    // Add space prefix at the start of words
-                    try result.appendSlice(&GPT2_SPACE_PREFIX);
-                }
-                try result.append(c);
+                try result.append(text[i]);
+                i += 1;
             }
-            i += 1;
         }
-
         return result.toOwnedSlice();
     }
 
-    // Modified encode function to handle special tokens and UTF-8 properly
+    fn convertToGpt2Space(text: []const u8, allocator: Allocator) ![]u8 {
+        var result = std.ArrayList(u8).init(allocator);
+        errdefer result.deinit();
+
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] == ' ') {
+                try result.appendSlice(&GPT2_SPACE_PREFIX); // Replace space with Ġ
+            } else {
+                try result.append(text[i]);
+            }
+            i += 1;
+        }
+        return result.toOwnedSlice();
+    }
+
     pub fn encode(self: *const Tokenizer, text: []const u8) !std.ArrayList(u32) {
         var tokens = std.ArrayList(u32).init(self.allocator);
         errdefer tokens.deinit();
 
-        // First preprocess the text to handle GPT-2 special characters
-        const processed_text = try preprocessText(text, self.allocator);
-        defer self.allocator.free(processed_text);
+        // Convert spaces to Ġ for matching
+        const gpt2_text = try convertToGpt2Space(text, self.allocator);
+        defer self.allocator.free(gpt2_text);
 
         var current_pos: usize = 0;
-        while (current_pos < processed_text.len) {
-            // First check for special tokens
-            var special_token_found = false;
-            for (self.special_tokens.items) |special_token| {
-                if (current_pos + special_token.content.len <= processed_text.len) {
-                    if (mem.eql(u8, special_token.content, processed_text[current_pos .. current_pos + special_token.content.len])) {
-                        try tokens.append(special_token.id);
-                        current_pos += special_token.content.len;
-                        special_token_found = true;
-                        break;
-                    }
-                }
-            }
-            if (special_token_found) continue;
+        while (current_pos < gpt2_text.len) {
+            var longest_match: ?struct { id: u32, len: usize } = null;
+            var found = false;
 
-            // Try to match the longest token
-            var longest_match: ?struct { token: []const u8, id: u32, len: usize } = null;
-            var token_it = self.tokens.iterator();
-
-            while (token_it.next()) |entry| {
+            // Try to find the longest matching token
+            var it = self.tokens.iterator();
+            while (it.next()) |entry| {
                 const token = entry.key_ptr.*;
-                if (current_pos + token.len <= processed_text.len) {
-                    if (mem.eql(u8, token, processed_text[current_pos .. current_pos + token.len])) {
+                if (current_pos + token.len <= gpt2_text.len) {
+                    const text_slice = gpt2_text[current_pos .. current_pos + token.len];
+                    if (std.mem.eql(u8, token, text_slice)) {
                         if (longest_match == null or token.len > longest_match.?.len) {
                             longest_match = .{
-                                .token = token,
                                 .id = entry.value_ptr.*,
                                 .len = token.len,
                             };
+                            found = true;
                         }
                     }
                 }
             }
 
-            if (longest_match) |match| {
-                try tokens.append(match.id);
-                current_pos += match.len;
+            if (found) {
+                try tokens.append(longest_match.?.id);
+                current_pos += longest_match.?.len;
             } else {
-                // Handle unknown bytes
-                const byte = processed_text[current_pos];
-                if (byte >= 0x80) {
-                    const utf8_len = try std.unicode.utf8ByteSequenceLength(byte);
-                    if (current_pos + utf8_len <= processed_text.len) {
-                        // Create a byte-level token for each byte in the UTF-8 sequence
-                        var j: usize = 0;
-                        while (j < utf8_len) : (j += 1) {
-                            try tokens.append(processed_text[current_pos + j]);
-                        }
-                        current_pos += utf8_len;
-                    } else {
-                        try tokens.append(byte);
-                        current_pos += 1;
-                    }
-                } else {
-                    try tokens.append(byte);
-                    current_pos += 1;
-                }
+                // Handle byte fallback
+                try tokens.append(gpt2_text[current_pos]);
+                current_pos += 1;
             }
         }
 
         return tokens;
     }
 
-    fn info(self: *const Tokenizer) void {
-        std.debug.print("vocab size: {}\n", .{self.tokens.count()});
-        std.debug.print("merge list size: {}\n", .{self.merges.items.len});
-    }
-    // TODO: Write Decode Function Tests.
-    // Modified decode function to properly handle GPT-2 special characters
     pub fn decode(self: *const Tokenizer, tokens: std.ArrayList(u32)) ![]const u8 {
-        var decoded_text = std.ArrayList(u8).init(self.allocator);
-        errdefer decoded_text.deinit();
+        var decoded = std.ArrayList(u8).init(self.allocator);
+        errdefer decoded.deinit();
 
-        var last_was_space = false;
         for (tokens.items) |token_id| {
-            if (token_id == self.bos_token or token_id == self.eos_token or token_id == self.pad_token) {
+            if (token_id == self.eos_token or token_id == self.bos_token or token_id == self.pad_token) {
                 continue;
             }
 
-            // First check special tokens
-            var special_found = false;
-            for (self.special_tokens.items) |special_token| {
-                if (special_token.id == token_id) {
-                    try decoded_text.appendSlice(special_token.content);
-                    special_found = true;
-                    break;
-                }
-            }
-            if (special_found) continue;
-
-            // Then check regular tokens
             var found = false;
-            var token_it = self.tokens.iterator();
-            while (token_it.next()) |entry| {
+            var it = self.tokens.iterator();
+            while (it.next()) |entry| {
                 if (entry.value_ptr.* == token_id) {
-                    const token = entry.key_ptr.*;
-
-                    // Handle GPT-2 special prefixes
-                    if (token.len >= 2 and mem.eql(u8, token[0..2], &GPT2_SPACE_PREFIX)) {
-                        if (!last_was_space) {
-                            try decoded_text.append(' ');
-                        }
-                        try decoded_text.appendSlice(token[2..]);
-                        last_was_space = false;
-                    } else if (token.len >= 2 and mem.eql(u8, token[0..2], &GPT2_NEWLINE_PREFIX)) {
-                        try decoded_text.append('\n');
-                        try decoded_text.appendSlice(token[2..]);
-                        last_was_space = true;
-                    } else {
-                        try decoded_text.appendSlice(token);
-                        last_was_space = false;
-                    }
+                    // Convert Ġ to space when showing output
+                    const converted = try convertGpt2Space(entry.key_ptr.*, self.allocator);
+                    defer self.allocator.free(converted);
+                    try decoded.appendSlice(converted);
                     found = true;
                     break;
                 }
             }
 
             if (!found and token_id < 256) {
-                // Handle byte-level tokens
-                try decoded_text.append(@intCast(token_id));
-                last_was_space = false;
+                try decoded.append(@intCast(token_id));
                 found = true;
             }
 
@@ -336,7 +358,7 @@ pub const Tokenizer = struct {
             }
         }
 
-        return decoded_text.toOwnedSlice();
+        return decoded.toOwnedSlice();
     }
     pub fn deinit(self: *Self) void {
         var token_it = self.tokens.keyIterator();

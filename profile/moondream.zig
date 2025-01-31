@@ -34,7 +34,7 @@ const HEADER_ART =
 
 // Default paths and configurations
 const DEFAULT_MODEL_PATH = "../moondream.bin";
-const DEFAULT_TOKENIZER_PATH = "../tokenizer.bin";
+const DEFAULT_TOKENIZER_PATH = "../tokenizer.json";
 const DEFAULT_IMAGE_PATH = "../images/demo-1.jpg";
 const DEFAULT_PROMPT = "describe the image";
 const DEFAULT_MAX_TOKENS: usize = 200;
@@ -200,7 +200,7 @@ pub fn main() !void {
 
     // Load tokenizer
     const tokenizer_start = timer.read();
-    var tokenizer = try Tokenizer.fromFile(args.tokenizer_path, allocator);
+    var tokenizer = try Tokenizer.fromJson(args.tokenizer_path, allocator);
     defer tokenizer.deinit();
     try printTimeDiff(tokenizer_start, timer.read(), "Tokenizer Loading", args.show_stats);
 
