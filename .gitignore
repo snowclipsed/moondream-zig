@@ -66,6 +66,7 @@ zig-out/
 src/main
 .venv
 src/test.zig
+stats.csv
 
 OpenBLAS
 
@@ -78,3 +79,5 @@ profile/color
 profile/profile1.txt
 profile/profile_analysis/
 src/profile_analysis/
+
+.DS_Store

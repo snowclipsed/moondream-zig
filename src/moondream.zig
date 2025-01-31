@@ -44,6 +44,7 @@ const Args = struct {
     prompt: []const u8,
     max_tokens: usize,
     show_stats: bool,
+    save_stats_path: []const u8,
     sampling_method: []const u8,
     temperature: f32,
     top_k: usize,
@@ -57,7 +58,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         .image_path = DEFAULT_IMAGE_PATH,
         .prompt = DEFAULT_PROMPT,
         .max_tokens = DEFAULT_MAX_TOKENS,
-        .show_stats = true,
+        .show_stats = false,
+        .save_stats_path = undefined,
         .sampling_method = "greedy",
         .temperature = 0.5,
         .top_k = 3,
@@ -103,6 +105,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             args.show_header = false;
         } else if (std.mem.eql(u8, arg, "--stats")) {
             args.show_stats = true;
+        } else if (std.mem.eql(u8, arg, "--save-stats")) {
+            args.save_stats_path = arg_it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--help")) {
             try printUsage();
             std.process.exit(0);
@@ -124,11 +128,12 @@ fn printUsage() !void {
         \\  --prompt <text>      Prompt for the model (default: "describe the image")
         \\  --max-tokens <num>   Maximum number of tokens to generate (default: 200)
         \\  --sampling <method>  Sampling method: 'greedy' or 'topk' (default: greedy)
-        \\  --temperature <val> Temperature for top-k sampling (0-2.0, default: 0.5)
-        \\  --top-k <num>       Top-k value for sampling (default: 3)
-        \\  --noheader          Disable ASCII header display
-        \\  --stats             Enable timing statistics output (default: disabled)
-        \\  --help              Show this help message
+        \\  --temperature <val>  Temperature for top-k sampling (0-2.0, default: 0.5)
+        \\  --top-k <num>        Top-k value for sampling (default: 3)
+        \\  --noheader           Disable ASCII header display
+        \\  --stats              Enable timing statistics output (default: disabled)
+        \\  --save-stats <path>  Save or append timing statistics to a CSV file (default: disabled)
+        \\  --help               Show this help message
         \\
     );
 }
@@ -148,12 +153,15 @@ const main_color = "\x1b[95m";
 const reset_color = "\x1b[0m";
 const time_color = "\x1b[94m";
 
-fn printTimeDiff(start_time: i128, end_time: i128, step_name: []const u8, show_stats: bool) !void {
+fn getTimeDiff(start_time: i128, end_time: i128) f64 {
+    const diff_ns = end_time - start_time;
+    return @as(f64, @floatFromInt(diff_ns)) / 1_000_000.0;
+}
+
+fn printTimeDiff(diff_ms: f64, step_name: []const u8, show_stats: bool) !void {
     if (!show_stats) return;
 
     const stdout = std.io.getStdOut().writer();
-    const diff_ns = end_time - start_time;
-    const diff_ms = @as(f64, @floatFromInt(diff_ns)) / 1_000_000.0;
     try stdout.print("{s}\n[STATS] {s}: {d:.2}ms{s}\n", .{
         time_color, step_name, diff_ms, reset_color,
     });
@@ -184,7 +192,8 @@ pub fn main() !void {
     const seed: u64 = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
     var rng = std.rand.DefaultPrng.init(seed);
     const random = rng.random();
-    try printTimeDiff(init_start, timer.read(), "Initialization", args.show_stats);
+    const initialization_time = getTimeDiff(init_start, timer.read());
+    try printTimeDiff(initialization_time, "Initialization", args.show_stats);
 
     // Configure sampling based on arguments
     const sampling_config = if (std.mem.eql(u8, args.sampling_method, "greedy"))
@@ -200,7 +209,8 @@ pub fn main() !void {
     const tokenizer_start = timer.read();
     var tokenizer = try Tokenizer.fromFile(args.tokenizer_path, allocator);
     defer tokenizer.deinit();
-    try printTimeDiff(tokenizer_start, timer.read(), "Tokenizer Loading", args.show_stats);
+    const tokenizer_loading_time = getTimeDiff(tokenizer_start, timer.read());
+    try printTimeDiff(tokenizer_loading_time, "Tokenizer Loading", args.show_stats);
 
     const config = model_config;
 
@@ -208,7 +218,8 @@ pub fn main() !void {
     const weights_start = timer.read();
     var weights = try Weights.init(config, args.model_path, allocator);
     defer weights.deinit();
-    try printTimeDiff(weights_start, timer.read(), "Model Weights Loading", args.show_stats);
+    const model_weights_loading_time = getTimeDiff(weights_start, timer.read());
+    try printTimeDiff(model_weights_loading_time, "Model Weights Loading", args.show_stats);
 
     std.debug.print("\n\n", .{});
     const scale = 0.75;
@@ -217,8 +228,8 @@ pub fn main() !void {
     const image_start = timer.read();
     try displayImage(allocator, args.image_path, scale);
     std.debug.print("\n \n", .{});
-
-    try printTimeDiff(image_start, timer.read(), "Image Display", args.show_stats);
+    const image_display_time = getTimeDiff(image_start, timer.read());
+    try printTimeDiff(image_display_time, "Image Display", args.show_stats);
 
     // Initialize vision model and encode image
     const modelinit_start = timer.read();
@@ -228,13 +239,14 @@ pub fn main() !void {
     const TextModelType = TextModel(model_config);
     var text_model = try TextModelType.init(weights, allocator);
     defer text_model.deinit();
-
-    try printTimeDiff(modelinit_start, timer.read(), "Models Init", args.show_stats);
+    const models_init_time = getTimeDiff(modelinit_start, timer.read());
+    try printTimeDiff(models_init_time, "Models Init", args.show_stats);
 
     const image_encode_start = timer.read();
     var image_tensor = try vision_model.encode_image(args.image_path);
     defer image_tensor.deinit();
-    try printTimeDiff(image_encode_start, timer.read(), "Image Encoding", args.show_stats);
+    const image_encoding_time = getTimeDiff(image_encode_start, timer.read());
+    try printTimeDiff(image_encoding_time, "Image Encoding", args.show_stats);
 
     // Initialize tokens and create input tensor
     const token_init_start = timer.read();
@@ -258,8 +270,8 @@ pub fn main() !void {
     var input_ids = try Tensor(u32).init(allocator, &[_]usize{token_ids.items.len});
     defer input_ids.deinit();
     @memcpy(input_ids.data, token_ids.items);
-
-    try printTimeDiff(token_init_start, timer.read(), "Token Initialization", args.show_stats);
+    const token_init_time = getTimeDiff(token_init_start, timer.read());
+    try printTimeDiff(token_init_time, "Token Initialization", args.show_stats);
 
     // Generation loop
     var pos: usize = 0;
@@ -297,14 +309,16 @@ pub fn main() !void {
     defer leading_embed.deinit();
     var input_embeds = try ops.concat(f16, leading_embed, last_slice, 0);
     defer input_embeds.deinit();
-    try printTimeDiff(embedding_start, timer.read(), "Embedding Processing", args.show_stats);
+    const embedding_process_time = getTimeDiff(embedding_start, timer.read());
+    try printTimeDiff(embedding_process_time, "Embedding Processing", args.show_stats);
 
     // Initialize KV cache
     const cache_start = timer.read();
     const MyKVCache = KVCache(config);
     var kv_cache = try MyKVCache.init(allocator);
     defer kv_cache.deinit();
-    try printTimeDiff(cache_start, timer.read(), "KV Cache Initialization", args.show_stats);
+    const kv_cache_initialization_time = getTimeDiff(cache_start, timer.read());
+    try printTimeDiff(kv_cache_initialization_time, "KV Cache Initialization", args.show_stats);
 
     // Generation statistics
     var total_decoder_time: i128 = 0;
@@ -360,6 +374,8 @@ pub fn main() !void {
         token_count += 1;
     }
 
+    const total_exec_time = @as(f64, @floatFromInt(timer.read() - total_start)) / 1_000_000_000.0;
+
     if (!ENABLE_STREAMING) {
         try stdout.writeAll(output_buffer.items);
     }
@@ -401,6 +417,46 @@ pub fn main() !void {
         });
 
         // Print total execution time
-        try printTimeDiff(total_start, timer.read(), "Total Execution", true);
+        try printTimeDiff(total_exec_time, "Total Execution", true);
+    }
+
+    if (args.save_stats_path.len > 0) {
+        try stdout.print("{s}[STATS] Saving statistics to file: {s}{s}\n", .{ time_color, args.save_stats_path, reset_color });
+
+        var stat_file_exists = true;
+        std.fs.cwd().access(args.save_stats_path, .{}) catch |err| {
+            stat_file_exists = if (err == error.FileNotFound) false else true;
+        };
+
+        var stats_file: std.fs.File = undefined;
+        if (!stat_file_exists) {
+            stats_file = try std.fs.cwd().createFile(args.save_stats_path, .{});
+        } else {
+            stats_file = try std.fs.cwd().openFile(args.save_stats_path, .{ .mode = .read_write });
+        }
+        defer stats_file.close();
+
+        if (!stat_file_exists) {
+            try stats_file.writeAll("Timestamp,Initialization,Tokenizer Loading,Model Weights Loading,Image Display,Image Encoding,Token Initialization,Embedding Processing,KV Cache Initialization,Tokens,Time to First Token,Tokens per Second,Average Decoder Per Token,Average Sampling Per Token,Average Embedding Per Token,Total Execution,Image Path\n");
+        }
+
+        const timestamp = std.time.milliTimestamp();
+
+        const time_to_first_sec = @as(f64, @floatFromInt(first_token_time)) / 1_000_000_000.0;
+        const remaining_tokens = if (token_count > 1) token_count - 1 else 0;
+        const remaining_time = timer.read() - post_first_token_start;
+        const tokens_per_second = if (remaining_tokens != 0)
+            @as(f64, @floatFromInt(remaining_tokens)) / (@as(f64, @floatFromInt(remaining_time)) / 1_000_000_000.0)
+        else
+            0.0;
+
+        const avg_decoder_sec = @as(f64, @floatFromInt(total_decoder_time)) / @as(f64, @floatFromInt(token_count)) / 1_000_000_000.0;
+        const avg_sampling_sec = @as(f64, @floatFromInt(total_sampling_time)) / @as(f64, @floatFromInt(token_count)) / 1_000_000_000.0;
+        const avg_embedding_sec = @as(f64, @floatFromInt(total_embedding_time)) / @as(f64, @floatFromInt(token_count)) / 1_000_000_000.0;
+
+        const csv_line = try std.fmt.allocPrint(allocator, "{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{s}\n", .{ timestamp, initialization_time, tokenizer_loading_time, model_weights_loading_time, image_display_time, models_init_time, image_encoding_time, token_init_time, embedding_process_time, kv_cache_initialization_time, token_count, time_to_first_sec, tokens_per_second, avg_decoder_sec, avg_sampling_sec, avg_embedding_sec, total_exec_time, args.image_path });
+
+        try stats_file.seekFromEnd(0);
+        try stats_file.writeAll(csv_line);
     }
 }
