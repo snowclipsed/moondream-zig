@@ -2,6 +2,10 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+// Special token handling constants
+const GPT2_SPACE_PREFIX = [_]u8{ 0xC4, 0xA0 }; // Ġ in UTF-8
+const GPT2_NEWLINE_PREFIX = [_]u8{ 0xC4, 0x82 }; // Ċ in UTF-8
+
 const SpecialToken = struct {
     id: u32,
     content: []const u8,
@@ -13,7 +17,6 @@ const SpecialToken = struct {
 };
 
 pub const Tokenizer = struct {
-    // TODO : Add handling external tokens to tokenizer
     const Self = @This();
     tokens: std.StringHashMap(u32),
     special_tokens: std.ArrayList(SpecialToken),
@@ -163,28 +166,30 @@ pub const Tokenizer = struct {
         return std.unicode.utf8Encode(bytes);
     }
 
+    // Modified preprocessText to handle GPT-2 specific character encodings
     fn preprocessText(text: []const u8, allocator: Allocator) ![]u8 {
-        // Add space prefix to words
         var result = std.ArrayList(u8).init(allocator);
         errdefer result.deinit();
 
         var i: usize = 0;
-        var last_was_space = true; // Start with true to handle first word
-
         while (i < text.len) {
             const c = text[i];
+
+            // Handle different whitespace cases
             if (std.ascii.isWhitespace(c)) {
-                try result.append(c);
-                last_was_space = true;
-            } else {
-                if (!last_was_space) {
-                    try result.append(c);
-                } else {
-                    // Add the special GPT2 space marker (Ġ) followed by the character
-                    try result.appendSlice("Ġ");
-                    try result.append(c);
+                if (c == ' ') {
+                    // Add GPT-2 space prefix (Ġ)
+                    try result.appendSlice(&GPT2_SPACE_PREFIX);
+                } else if (c == '\n') {
+                    // Add GPT-2 newline prefix (Ċ)
+                    try result.appendSlice(&GPT2_NEWLINE_PREFIX);
                 }
-                last_was_space = false;
+            } else {
+                if (i == 0 or (i > 0 and std.ascii.isWhitespace(text[i - 1]))) {
+                    // Add space prefix at the start of words
+                    try result.appendSlice(&GPT2_SPACE_PREFIX);
+                }
+                try result.append(c);
             }
             i += 1;
         }
@@ -192,52 +197,44 @@ pub const Tokenizer = struct {
         return result.toOwnedSlice();
     }
 
+    // Modified encode function to handle special tokens and UTF-8 properly
     pub fn encode(self: *const Tokenizer, text: []const u8) !std.ArrayList(u32) {
         var tokens = std.ArrayList(u32).init(self.allocator);
         errdefer tokens.deinit();
 
+        // First preprocess the text to handle GPT-2 special characters
+        const processed_text = try preprocessText(text, self.allocator);
+        defer self.allocator.free(processed_text);
+
         var current_pos: usize = 0;
-        var prev_was_whitespace = true; // Start with true to handle first word
-
-        while (current_pos < text.len) {
-            // Special handling for whitespace
-            if (std.ascii.isWhitespace(text[current_pos])) {
-                if (text[current_pos] == ' ') {
-                    try tokens.append(32); // Standard space token
-                } else if (text[current_pos] == '\n') {
-                    try tokens.append(198); // Newline token
+        while (current_pos < processed_text.len) {
+            // First check for special tokens
+            var special_token_found = false;
+            for (self.special_tokens.items) |special_token| {
+                if (current_pos + special_token.content.len <= processed_text.len) {
+                    if (mem.eql(u8, special_token.content, processed_text[current_pos .. current_pos + special_token.content.len])) {
+                        try tokens.append(special_token.id);
+                        current_pos += special_token.content.len;
+                        special_token_found = true;
+                        break;
+                    }
                 }
-                current_pos += 1;
-                prev_was_whitespace = true;
-                continue;
             }
+            if (special_token_found) continue;
 
+            // Try to match the longest token
             var longest_match: ?struct { token: []const u8, id: u32, len: usize } = null;
             var token_it = self.tokens.iterator();
 
-            // Try to find the longest matching token
             while (token_it.next()) |entry| {
                 const token = entry.key_ptr.*;
-
-                // Skip Ġ tokens when not at a word boundary
-                if (token.len >= 3 and std.mem.startsWith(u8, token, "Ġ") and !prev_was_whitespace) {
-                    continue;
-                }
-
-                const token_content = if (token.len >= 3 and std.mem.startsWith(u8, token, "Ġ"))
-                    token[3..]
-                else
-                    token;
-
-                // Check if we have enough text left to match
-                if (current_pos + token_content.len <= text.len) {
-                    const text_slice = text[current_pos .. current_pos + token_content.len];
-                    if (std.mem.eql(u8, token_content, text_slice)) {
-                        if (longest_match == null or token_content.len > longest_match.?.len) {
+                if (current_pos + token.len <= processed_text.len) {
+                    if (mem.eql(u8, token, processed_text[current_pos .. current_pos + token.len])) {
+                        if (longest_match == null or token.len > longest_match.?.len) {
                             longest_match = .{
-                                .token = token_content,
+                                .token = token,
                                 .id = entry.value_ptr.*,
-                                .len = token_content.len,
+                                .len = token.len,
                             };
                         }
                     }
@@ -247,17 +244,16 @@ pub const Tokenizer = struct {
             if (longest_match) |match| {
                 try tokens.append(match.id);
                 current_pos += match.len;
-                prev_was_whitespace = false;
             } else {
-                // Handle UTF-8 sequences properly
-                const byte = text[current_pos];
-                if (byte >= 0x80) { // UTF-8 leading byte
-                    const utf8_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
-                    if (current_pos + utf8_len <= text.len) {
-                        const sequence = text[current_pos .. current_pos + utf8_len];
-                        // Store the entire UTF-8 sequence as bytes
-                        for (sequence) |b| {
-                            try tokens.append(b);
+                // Handle unknown bytes
+                const byte = processed_text[current_pos];
+                if (byte >= 0x80) {
+                    const utf8_len = try std.unicode.utf8ByteSequenceLength(byte);
+                    if (current_pos + utf8_len <= processed_text.len) {
+                        // Create a byte-level token for each byte in the UTF-8 sequence
+                        var j: usize = 0;
+                        while (j < utf8_len) : (j += 1) {
+                            try tokens.append(processed_text[current_pos + j]);
                         }
                         current_pos += utf8_len;
                     } else {
@@ -268,7 +264,6 @@ pub const Tokenizer = struct {
                     try tokens.append(byte);
                     current_pos += 1;
                 }
-                prev_was_whitespace = false;
             }
         }
 
@@ -279,76 +274,70 @@ pub const Tokenizer = struct {
         std.debug.print("vocab size: {}\n", .{self.tokens.count()});
         std.debug.print("merge list size: {}\n", .{self.merges.items.len});
     }
-    // TODO: Write Decode Function.
+    // TODO: Write Decode Function Tests.
+    // Modified decode function to properly handle GPT-2 special characters
     pub fn decode(self: *const Tokenizer, tokens: std.ArrayList(u32)) ![]const u8 {
         var decoded_text = std.ArrayList(u8).init(self.allocator);
         errdefer decoded_text.deinit();
 
+        var last_was_space = false;
         for (tokens.items) |token_id| {
             if (token_id == self.bos_token or token_id == self.eos_token or token_id == self.pad_token) {
                 continue;
             }
 
+            // First check special tokens
+            var special_found = false;
+            for (self.special_tokens.items) |special_token| {
+                if (special_token.id == token_id) {
+                    try decoded_text.appendSlice(special_token.content);
+                    special_found = true;
+                    break;
+                }
+            }
+            if (special_found) continue;
+
+            // Then check regular tokens
             var found = false;
             var token_it = self.tokens.iterator();
             while (token_it.next()) |entry| {
                 if (entry.value_ptr.* == token_id) {
                     const token = entry.key_ptr.*;
 
-                    // Handle single character tokens directly
-                    if (token.len == 1) {
-                        try decoded_text.appendSlice(token);
-                        found = true;
-                        break;
-                    }
-
-                    // Handle tokens with special prefixes
-                    if (token.len > 1) {
-                        switch (token[1]) {
-                            0xA0 => {
-                                // This is 'Ġ' (0xC4 0xA0 in UTF-8)
-                                try decoded_text.append(' ');
-                                try decoded_text.appendSlice(token[2..]);
-                            },
-                            0x82 => {
-                                // This is 'Ċ' (0xC4 0x82 in UTF-8)
-                                try decoded_text.append('\n');
-                                try decoded_text.appendSlice(token[2..]);
-                            },
-                            else => {
-                                if (token[0] == 0xC4) {
-                                    // Other UTF-8 prefixed tokens
-                                    try decoded_text.appendSlice(token[2..]);
-                                } else {
-                                    try decoded_text.appendSlice(token);
-                                }
-                            },
+                    // Handle GPT-2 special prefixes
+                    if (token.len >= 2 and mem.eql(u8, token[0..2], &GPT2_SPACE_PREFIX)) {
+                        if (!last_was_space) {
+                            try decoded_text.append(' ');
                         }
+                        try decoded_text.appendSlice(token[2..]);
+                        last_was_space = false;
+                    } else if (token.len >= 2 and mem.eql(u8, token[0..2], &GPT2_NEWLINE_PREFIX)) {
+                        try decoded_text.append('\n');
+                        try decoded_text.appendSlice(token[2..]);
+                        last_was_space = true;
                     } else {
                         try decoded_text.appendSlice(token);
+                        last_was_space = false;
                     }
                     found = true;
                     break;
                 }
             }
 
-            if (!found) {
+            if (!found and token_id < 256) {
                 // Handle byte-level tokens
-                if (token_id < 256) {
-                    try decoded_text.append(@intCast(token_id));
-                    found = true;
-                }
+                try decoded_text.append(@intCast(token_id));
+                last_was_space = false;
+                found = true;
             }
 
             if (!found) {
-                std.debug.print("Token not found: {}\n", .{token_id});
                 return error.TokenNotFound;
             }
         }
 
         return decoded_text.toOwnedSlice();
     }
-
     pub fn deinit(self: *Self) void {
         var token_it = self.tokens.keyIterator();
         while (token_it.next()) |key| {
