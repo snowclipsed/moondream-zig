@@ -33,7 +33,7 @@ pub const Tokenizer = struct {
             .special_tokens = std.ArrayList(SpecialToken).init(allocator),
             .merges = std.ArrayList([]const u8).init(allocator),
             .allocator = allocator,
-            .eos_token = 50256, // These values should match your tokenizer.json
+            .eos_token = 50256,
             .bos_token = 50257,
             .pad_token = 50258,
         };
@@ -108,7 +108,6 @@ pub const Tokenizer = struct {
         if (vocab.get("<|endoftext|>")) |eos_value| {
             tokenizer.eos_token = @intCast(eos_value.integer);
         }
-        // You might want to add other special tokens like bos_token and pad_token here
 
         return tokenizer;
     }
