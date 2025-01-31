@@ -32,7 +32,7 @@ const HEADER_ART =
 
 // Default paths and configurations
 const DEFAULT_MODEL_PATH = "../moondream.bin";
-const DEFAULT_TOKENIZER_PATH = "../tokenizer.bin";
+const DEFAULT_TOKENIZER_PATH = "../tokenizer.json";
 const DEFAULT_IMAGE_PATH = "../images/demo-1.jpg";
 const DEFAULT_PROMPT = "describe the image";
 const DEFAULT_MAX_TOKENS: usize = 200;
@@ -119,7 +119,7 @@ fn printUsage() !void {
         \\
         \\Options:
         \\  --model <path>       Path to model weights (default: ../moondream.bin)
-        \\  --tokenizer <path>   Path to tokenizer file (default: ../tokenizer.bin)
+        \\  --tokenizer <path>   Path to tokenizer file (default: ../tokenizer.json)
         \\  --image <path>       Path to input image (default: ../images/demo-1.jpg)
         \\  --prompt <text>      Prompt for the model (default: "describe the image")
         \\  --max-tokens <num>   Maximum number of tokens to generate (default: 200)

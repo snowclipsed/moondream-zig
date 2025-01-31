@@ -8,8 +8,6 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const VisionModel = @import("vision_model_new.zig").VisionModel;
 const TextModel = @import("text_model_new.zig").TextModel;
 const KVCache = @import("text_model_new.zig").KVCache;
-const EMBEDDED_MODEL = @embedFile("../moondream.bin");
-const EMBEDDED_TOKENIZER = @embedFile("../tokenizer.bin");
 
 const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
@@ -121,7 +119,7 @@ fn printUsage() !void {
         \\
         \\Options:
         \\  --model <path>       Path to model weights (default: ../moondream.bin)
-        \\  --tokenizer <path>   Path to tokenizer file (default: ../tokenizer.bin)
+        \\  --tokenizer <path>   Path to tokenizer file (default: .tokenizer.json)
         \\  --image <path>       Path to input image (default: ../images/demo-1.jpg)
         \\  --prompt <text>      Prompt for the model (default: "describe the image")
         \\  --max-tokens <num>   Maximum number of tokens to generate (default: 200)
