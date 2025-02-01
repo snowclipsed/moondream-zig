@@ -305,7 +305,7 @@ pub fn main() !void {
         tokenizer.deinit();
         allocator.destroy(tokenizer);
     }
-    tokenizer.* = try Tokenizer.fromFile("../tokenizer.bin", allocator);
+    tokenizer.* = try Tokenizer.fromJson("../tokenizer.json", allocator);
 
     var weights = try allocator.create(Weights);
     defer {

@@ -79,5 +79,8 @@ profile/color
 profile/profile1.txt
 profile/profile_analysis/
 src/profile_analysis/
+profile/hgemmtrans
+profile/sgemminplace
+profile/shakespeare.txt
 
 .DS_Store
