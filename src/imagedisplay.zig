@@ -92,9 +92,9 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
         try std.io.getStdOut().writer().print("\n", .{});
     }
 
-    // Reset terminal colors
-    try std.io.getStdOut().writer().print("\x1b[0m", .{});
-    std.debug.print("Displaying image at scale {d:3}x.\n", .{scale});
+    // // Reset terminal colors
+    // try std.io.getStdOut().writer().print("\x1b[0m", .{});
+    // std.debug.print("Displaying image at scale {d:3}x.\n", .{scale});
 }
 
 fn printColorBlock(upper: Pixel, lower: Pixel) !void {

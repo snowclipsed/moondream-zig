@@ -64,6 +64,80 @@ fn getCurrentTimestamp() []const u8 {
     return buf[0..timestamp.len];
 }
 
+const LoadingSpinner = struct {
+    thread: ?std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    message: []const u8,
+
+    const frames = [_][]const u8{
+        \\  /\\___/\\
+        \\ (  o o  )  
+        \\  (  T  ) /
+        \\ .^`-^-'^.
+        ,
+        \\  /\\___/\\
+        \\ (  - -  )  
+        \\  (  T  ) -
+        \\ .^`-^-'^.
+        ,
+        \\  /\\___/\\
+        \\ (  o o  )  
+        \\  (  T  ) \\
+        \\ .^`-^-'^.
+    };
+
+    // Move up 5 lines from current position and clear to end of each line
+    const CLEAR_LINES = "\x1B[5A\x1B[K\x1B[K\x1B[K\x1B[K\x1B[K";
+
+    pub fn init(message: []const u8) LoadingSpinner {
+        return .{
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .message = message,
+        };
+    }
+
+    fn spinnerThread(self: *LoadingSpinner) void {
+        const stdout = std.io.getStdOut().writer();
+        var frame: usize = 0;
+
+        while (!self.stop_flag.load(.monotonic)) {
+            // Clear previous frame
+            stdout.writeAll(CLEAR_LINES) catch return;
+
+            // Print current frame with message
+            stdout.print("{s}\n{s}\n", .{
+                frames[frame],
+                self.message,
+            }) catch return;
+
+            frame = (frame + 1) % frames.len;
+            std.time.sleep(200 * std.time.ns_per_ms);
+        }
+
+        // Clear the animation one final time
+        stdout.writeAll(CLEAR_LINES) catch return;
+    }
+
+    pub fn start(self: *LoadingSpinner) !void {
+        if (self.thread == null) {
+            const stdout = std.io.getStdOut().writer();
+            self.stop_flag.store(false, .monotonic);
+            // Print initial newlines for space
+            try stdout.writeAll("\n\n\n\n\n");
+            self.thread = try std.Thread.spawn(.{}, spinnerThread, .{self});
+        }
+    }
+
+    pub fn stop(self: *LoadingSpinner) void {
+        if (self.thread) |thread| {
+            self.stop_flag.store(true, .monotonic);
+            thread.join();
+            self.thread = null;
+        }
+    }
+};
+
 const ChatState = struct {
     vision_model: *VisionModel(model_config),
     text_model: *TextModel(model_config),
@@ -157,19 +231,30 @@ const ChatState = struct {
     }
 
     pub fn loadImage(self: *ChatState, image_path: []const u8) !void {
+        var spinner = LoadingSpinner.init("Loading image file...");
+        try spinner.start();
+
         // Store image path
         if (self.current_image_path) |old_path| {
             self.allocator.free(old_path);
         }
         self.current_image_path = try self.allocator.dupe(u8, image_path);
 
+        // Display image
         try displayImage(self.allocator, image_path, 0.75);
-        std.debug.print("\n", .{});
+        std.debug.print("\n \n \n", .{});
+
+        spinner.stop();
+
+        // Start new spinner for vision processing
+        var vision_spinner = LoadingSpinner.init("Processing image with vision model...");
+        try vision_spinner.start();
+        defer vision_spinner.stop();
 
         // Clean up old tensor's data
         self.image_tensor.deinit();
 
-        // Encode new image directly into the existing tenso
+        // Encode new image directly into the existing tensor
         self.image_tensor.* = try self.vision_model.encode_image(image_path);
     }
 
@@ -296,8 +381,10 @@ pub fn main() !void {
     // Display header art
     try stdout.print("{s}{s}{s}\n\n", .{ main_color, HEADER_ART, reset_color });
     try stdout.writeAll("Welcome to the Chat Interface!\n");
-    try displayCommands(stdout);
-    try stdout.writeAll("\n");
+
+    // Add loading spinner for model initialization
+    var spinner = LoadingSpinner.init("Loading model...");
+    try spinner.start();
 
     // Load model and tokenizer first - these stay loaded
     var tokenizer = try allocator.create(Tokenizer);
@@ -330,6 +417,11 @@ pub fn main() !void {
     }
     text_model.* = try TextModelType.init(weights.*, allocator);
 
+    // Stop the spinner now that loading is complete
+    spinner.stop();
+
+    try displayCommands(stdout);
+    try stdout.writeAll("\n");
     var chat_state: ?*ChatState = null;
     defer if (chat_state != null) chat_state.?.deinit();
 
