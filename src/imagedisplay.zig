@@ -13,6 +13,8 @@ const Pixel = struct {
 };
 
 pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale: f32) !void {
+    const stdout = std.io.getStdOut().writer();
+
     // Create null-terminated path for C
     var path_buffer = try allocator.alloc(u8, image_path.len + 1);
     defer allocator.free(path_buffer);
@@ -71,6 +73,9 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
     // Print the image
     var y: usize = 0;
     while (y < term_height) : (y += 1) {
+        // Clear line before printing
+        try stdout.print("\x1b[K", .{});
+
         var x: usize = 0;
         while (x < term_width) : (x += 1) {
             const upper_idx = (y * 2 * term_width + x) * 3;
@@ -87,33 +92,50 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
                 .b = resized[lower_idx + 2],
             };
 
-            try printColorBlock(upper, lower);
+            try printColorBlock(upper, lower, x, term_width);
         }
-        try std.io.getStdOut().writer().print("\n", .{});
+
+        // Clear to end of line and print newline
+        try stdout.print("\x1b[K\n", .{});
     }
 
-    // // Reset terminal colors
-    // try std.io.getStdOut().writer().print("\x1b[0m", .{});
-    // std.debug.print("Displaying image at scale {d:3}x.\n", .{scale});
+    // Reset colors at the end
+    try stdout.print("\x1b[0m", .{});
 }
 
-fn printColorBlock(upper: Pixel, lower: Pixel) !void {
+fn printColorBlock(upper: Pixel, lower: Pixel, current_x: usize, term_width: usize) !void {
+    if (current_x >= term_width) return;
+
     const writer = std.io.getStdOut().writer();
-    try writer.print("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀", .{
+    try writer.print("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀\x1b[0m", .{
         upper.r, upper.g, upper.b,
         lower.r, lower.g, lower.b,
     });
 }
 
-// pub fn main() !void {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     defer _ = gpa.deinit();
-//     const allocator = gpa.allocator();
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-//     // Example usage with different scales:
-//     // 1.0 = original size (80 columns)
-//     // 0.5 = half size (40 columns)
-//     // 2.0 = double size (160 columns)
-//     const image_path: []const u8 = "../images/demo-1.jpg";
-//     try displayImage(allocator, image_path, 1.0);
-// }
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+
+    // Skip program name
+    _ = args.next();
+
+    // Get image path
+    const image_path = args.next() orelse {
+        std.debug.print("Usage: {s} <image_path> [scale]\n", .{"image-display"});
+        return error.InvalidArguments;
+    };
+
+    // Get optional scale factor
+    const scale_str = args.next();
+    const scale: f32 = if (scale_str) |s|
+        try std.fmt.parseFloat(f32, s)
+    else
+        1.0;
+
+    try displayImage(allocator, image_path, scale);
+}

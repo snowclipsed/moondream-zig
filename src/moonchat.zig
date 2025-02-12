@@ -70,20 +70,20 @@ const LoadingSpinner = struct {
     message: []const u8,
 
     const frames = [_][]const u8{
-        \\  /\\___/\\
-        \\ (  o o  )  
-        \\  (  T  ) /
-        \\ .^`-^-'^.
+        \\ /\___/\
+        \\(> .. <)
+        \\ (  w )~
+        \\  u u
         ,
-        \\  /\\___/\\
-        \\ (  - -  )  
-        \\  (  T  ) -
-        \\ .^`-^-'^.
+        \\ /\___/\
+        \\(> -- <)
+        \\ (  w )~
+        \\  u u
         ,
-        \\  /\\___/\\
-        \\ (  o o  )  
-        \\  (  T  ) \\
-        \\ .^`-^-'^.
+        \\ /\___/\
+        \\(> .. <)
+        \\ (  w )~
+        \\  u u
     };
 
     // Move up 5 lines from current position and clear to end of each line
@@ -231,6 +231,8 @@ const ChatState = struct {
     }
 
     pub fn loadImage(self: *ChatState, image_path: []const u8) !void {
+        const stdout = std.io.getStdOut().writer();
+
         var spinner = LoadingSpinner.init("Loading image file...");
         try spinner.start();
 
@@ -240,22 +242,31 @@ const ChatState = struct {
         }
         self.current_image_path = try self.allocator.dupe(u8, image_path);
 
+        // Make sure spinner is stopped and cleared before displaying image
+        spinner.stop();
+
         // Display image
         try displayImage(self.allocator, image_path, 0.75);
-        std.debug.print("\n \n \n", .{});
 
-        spinner.stop();
+        std.debug.print("\n\n\n", .{});
+
+        try stdout.writeAll("Image loaded! Enter your prompt:\n");
 
         // Start new spinner for vision processing
         var vision_spinner = LoadingSpinner.init("Processing image with vision model...");
         try vision_spinner.start();
-        defer vision_spinner.stop();
 
         // Clean up old tensor's data
         self.image_tensor.deinit();
 
         // Encode new image directly into the existing tensor
         self.image_tensor.* = try self.vision_model.encode_image(image_path);
+
+        // Explicitly stop spinner and ensure complete cleanup
+        vision_spinner.stop();
+        // Move cursor up and clear multiple lines to ensure complete cleanup
+        try stdout.writeAll("\x1B[6A\x1B[J"); // Move up 6 lines and clear to end
+        try stdout.writeAll("\x1B[0m"); // Reset colors
     }
 
     pub fn processTurn(self: *ChatState, prompt: []const u8) !void {
