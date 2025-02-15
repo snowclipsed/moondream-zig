@@ -9,6 +9,7 @@ const KVCache = @import("text_model.zig").KVCache;
 const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
 const ops = @import("ops.zig");
+const sampling = @import("sampling.zig");
 const displayImage = @import("imagedisplay.zig").displayImage;
 
 // ANSI Color codes
@@ -148,7 +149,7 @@ const ChatState = struct {
     allocator: std.mem.Allocator,
     rng: std.rand.DefaultPrng,
     current_image_path: ?[]u8,
-    sampling_config: ops.SamplingConfig,
+    sampling_config: sampling.SamplingConfig,
     max_length: usize,
 
     // Add method to change sampling configuration
@@ -333,7 +334,7 @@ const ChatState = struct {
 
             var logits = try self.text_model.lm_head(result.output);
             defer logits.deinit();
-            const next_token_id = try ops.sample(f16, &logits, self.sampling_config, self.rng.random(), self.allocator);
+            const next_token_id = try sampling.sample(f16, &logits, self.sampling_config, self.rng.random(), self.allocator);
 
             if (next_token_id == self.tokenizer.eos_token) break;
 
