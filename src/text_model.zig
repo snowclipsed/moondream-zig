@@ -9,6 +9,8 @@ const ops = @import("ops.zig");
 const hgemm = @import("hgemm.zig");
 const hgemmtrans = @import("hgemmtrans.zig");
 const TextPreSlicedWeights = @import("preslice_text.zig").TextPreSlicedWeights;
+const multiattn = @import("attention.zig").multiMaskedScaledDotProductAttention;
+const singleattn = @import("attention.zig").singleMaskedScaledDotProductAttention;
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
@@ -279,10 +281,10 @@ pub fn TextModel(comptime model_config: Config) type {
 
             if (seq_len == 1) {
                 // Single token fast path
-                attn_output = try ops.singleTokenAttentionFast(qr, k_final, v_final, attn_mask, self.allocator);
+                attn_output = try singleattn(qr, k_final, v_final, attn_mask, self.allocator);
             } else {
                 // Multi-token path
-                attn_output = try ops.multiscaledDotProductAttention(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
+                attn_output = try multiattn(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
             }
             defer attn_output.deinit();
 

@@ -1,13 +1,15 @@
 const std = @import("std");
-const Timer = std.time.Timer;
-const print = std.debug.print;
 const Allocator = std.mem.Allocator;
+
 const Weights = @import("weights.zig").Weights;
 const PreSlicedWeights = @import("preslice_vision.zig").PreSlicedWeights;
 const Config = @import("config.zig").Config;
+
 const Tensor = @import("tensor.zig").Tensor;
 const ops = @import("ops.zig");
 const hgemm = @import("hgemm.zig");
+const attn = @import("attention.zig").multiMasklessScaledDotProductAttention;
+
 const c = @cImport({
     @cInclude("stb_image.h");
     @cInclude("stb_image_resize2.h");
@@ -313,7 +315,7 @@ pub fn VisionModel(comptime model_config: Config) type {
             try ops.transposeAxes(f16, &k, 0, 1);
             try ops.transposeAxes(f16, &v, 0, 1);
 
-            var attn_out = try ops.multimasklessDotProductAttention(
+            var attn_out = try attn(
                 n_heads,
                 head_dim,
                 q,
