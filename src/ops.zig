@@ -10,7 +10,6 @@ const StabilityError = @import("tensor.zig").StabilityError;
 
 const sgemm = @import("sgemm.zig").matmul;
 const sgemminplace = @import("sgemminplace.zig").matmul;
-const hgemminplace = @import("hgemminplace.zig").matmul;
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
