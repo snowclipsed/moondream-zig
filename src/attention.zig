@@ -207,6 +207,34 @@ const HEAD_DIM_CHUNKS: usize = MODEL_HEAD_DIM / SIMD_WIDTH;
 const MAX_KV_LEN: usize = 2048; // Maximum sequence length
 const MAX_THREADS: usize = 32; // Maximum number of threads (same as MODEL_N_HEADS)
 
+// Create attention mask for proper causal attention alignment
+pub fn createAttentionMask(allocator: Allocator, pos: usize, seq_len: usize) !Tensor(bool) {
+    // First create the base mask of shape [seq_len, pos + seq_len]
+    var mask = try Tensor(bool).init(allocator, &[_]usize{ seq_len, pos + seq_len });
+    errdefer mask.deinit();
+
+    // Fill the first part (before pos) with true
+    for (0..seq_len) |i| {
+        for (0..pos) |j| {
+            const idx = i * (pos + seq_len) + j;
+            mask.data[idx] = true;
+        }
+    }
+
+    // Fill the second part (pos onwards) with lower triangular matrix
+    for (0..seq_len) |i| {
+        for (0..seq_len) |j| {
+            const idx = i * (pos + seq_len) + (j + pos);
+            mask.data[idx] = j <= i; // Lower triangular
+        }
+    }
+
+    // Reshape to add head dimension [1, seq_len, pos + seq_len]
+    try mask.reshape(&[_]usize{ 1, seq_len, pos + seq_len });
+
+    return mask;
+}
+
 /// Thread context for masked attention
 const MaskedAttnThreadContext = struct {
     start_head: usize,
