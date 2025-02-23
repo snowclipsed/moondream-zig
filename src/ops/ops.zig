@@ -3,13 +3,10 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
-const Tensor = @import("tensor.zig").Tensor;
-const TensorView = @import("tensor.zig").TensorView;
-const Slice = @import("tensor.zig").Slice;
-const StabilityError = @import("tensor.zig").StabilityError;
-
-const sgemm = @import("sgemm.zig").matmul;
-const sgemminplace = @import("sgemminplace.zig").matmul;
+const Tensor = @import("../core/tensor.zig").Tensor;
+const TensorView = @import("../core/tensor.zig").TensorView;
+const Slice = @import("../core/tensor.zig").Slice;
+const StabilityError = @import("../core/tensor.zig").StabilityError;
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
@@ -1563,8 +1560,6 @@ pub fn broadcast_add_simd(a: *Tensor(f16), b: Tensor(f16)) !void {
 
     var i: usize = 0;
     while (i < total_elements) : (i += 1) {
-        // var a_coords = try a.allocator.alloc(usize, a.shape.len);
-        // defer a.allocator.free(a_coords);
         var temp = i;
 
         for (0..a.shape.len) |j| {

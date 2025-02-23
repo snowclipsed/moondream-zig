@@ -1,8 +1,8 @@
 const std = @import("std");
-const Tensor = @import("tensor.zig").Tensor;
+const Tensor = @import("../core/tensor.zig").Tensor;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
-const sgemminplace = @import("sgemminplace.zig").matmul;
+const sgemminplace = @import("../ops/sgemm_inplace.zig").matmul;
 const softmax = @import("ops.zig").softmax;
 
 // ----- Unmasked Attention ----- //
@@ -77,7 +77,7 @@ const AttnThreadContext = struct {
     workspace: *ThreadWorkspace,
 };
 
-pub fn multiMasklessScaledDotProductAttention(
+pub fn multiMasklessSDPA(
     n_heads: comptime_int,
     head_dim: comptime_int,
     query: Tensor(f16),
@@ -307,7 +307,7 @@ const MaskedThreadWorkspace = struct {
     }
 };
 
-pub fn multiMaskedScaledDotProductAttention(
+pub fn multiMaskedSDPA(
     query: Tensor(f16),
     key: Tensor(f16),
     value: Tensor(f16),
@@ -534,7 +534,7 @@ fn processHeads(ctx: HeadContext) void {
     }
 }
 
-pub fn singleMaskedScaledDotProductAttention(
+pub fn singleMaskedSDPA(
     query: Tensor(f16),
     key: Tensor(f16),
     value: Tensor(f16),

@@ -1,9 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Tensor = @import("tensor.zig").Tensor;
-const Weights = @import("weights.zig").Weights;
+const Tensor = @import("../core/tensor.zig").Tensor;
+const Weights = @import("../model/weights.zig").Weights;
 
-pub const PreSlicedWeights = struct {
+pub const visionPreSlicedWeights = struct {
     // Transformer block weights
     v_norm1_w: []Tensor(f16),
     v_norm1_b: []Tensor(f16),
@@ -26,7 +26,7 @@ pub const PreSlicedWeights = struct {
     original_weights: Weights,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, weights: Weights, n_layers: usize) !PreSlicedWeights {
+    pub fn init(allocator: Allocator, weights: Weights, n_layers: usize) !visionPreSlicedWeights {
         // Allocate arrays for each set of weights
         var v_norm1_w = try allocator.alloc(Tensor(f16), n_layers);
         errdefer allocator.free(v_norm1_w);
@@ -88,7 +88,7 @@ pub const PreSlicedWeights = struct {
             errdefer v_fc2_b[i].deinit();
         }
 
-        return PreSlicedWeights{
+        return visionPreSlicedWeights{
             .v_norm1_w = v_norm1_w,
             .v_norm1_b = v_norm1_b,
             .v_norm2_w = v_norm2_w,
@@ -106,7 +106,7 @@ pub const PreSlicedWeights = struct {
         };
     }
 
-    pub fn deinit(self: *PreSlicedWeights) void {
+    pub fn deinit(self: *visionPreSlicedWeights) void {
         // Free all pre-sliced tensors
         for (self.v_norm1_w) |*tensor| tensor.deinit();
         for (self.v_norm1_b) |*tensor| tensor.deinit();

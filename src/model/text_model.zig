@@ -3,21 +3,16 @@ const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 
 const Weights = @import("weights.zig").Weights;
-const TextPreSlicedWeights = @import("preslice_text.zig").TextPreSlicedWeights;
 const Config = @import("config.zig").Config;
+const textPreSlicedWeights = @import("../preprocessing/preslice_text.zig").textPreSlicedWeights;
 
-const Tensor = @import("tensor.zig").Tensor;
-const Slice = @import("tensor.zig").Slice;
+const Tensor = @import("../core/tensor.zig").Tensor;
+const Slice = @import("../core/tensor.zig").Slice;
 
-const ops = @import("ops.zig");
-const hgemm = @import("hgemm.zig");
-const hgemmtrans = @import("hgemmtrans.zig");
-
-const precomputeFreqs = @import("rope.zig").precomputeFreqsCis;
-const applyRotEmb = @import("rope.zig").applyRotaryEmb;
-const createAttnMask = @import("attention.zig").createAttentionMask;
-const multiAttn = @import("attention.zig").multiMaskedScaledDotProductAttention;
-const singleAttn = @import("attention.zig").singleMaskedScaledDotProductAttention;
+const ops = @import("../ops/ops.zig");
+const hgemmTrans = @import("../ops/hgemm_trans.zig");
+const rope = @import("../ops/rope.zig");
+const attention = @import("../ops/attention.zig");
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
@@ -80,17 +75,17 @@ pub fn TextModel(comptime model_config: Config) type {
 
         // Instance fields
         weights: Weights,
-        presliced_weights: TextPreSlicedWeights,
+        presliced_weights: textPreSlicedWeights,
         allocator: Allocator,
         freqs_cis: Tensor(f32),
 
         pub fn init(weights: Weights, allocator: Allocator) !Self {
             // Create pre-sliced weights
-            var presliced_weights = try TextPreSlicedWeights.init(allocator, weights, config.n_layers);
+            var presliced_weights = try textPreSlicedWeights.init(allocator, weights, config.n_layers);
             errdefer presliced_weights.deinit();
 
             // Precompute freqs_cis
-            var freqs_cis = try precomputeFreqs(f32, allocator, config.n_heads, config.dim, rotary_dims.theta);
+            var freqs_cis = try rope.precomputeFreqsCis(f32, allocator, config.n_heads, config.dim, rotary_dims.theta);
             errdefer freqs_cis.deinit();
 
             return Self{
@@ -195,7 +190,7 @@ pub fn TextModel(comptime model_config: Config) type {
             const layer_out_proj_w = self.presliced_weights.t_out_proj_w[layer];
             const layer_out_proj_b = self.presliced_weights.t_out_proj_b[layer];
 
-            var qkv = try hgemmtrans.matmul(input, layer_t_Wqkv_w, self.allocator);
+            var qkv = try hgemmTrans.matmul(input, layer_t_Wqkv_w, self.allocator);
             defer qkv.deinit();
 
             try ops.broadcast_add_simd(&qkv, layer_t_Wqkv_b);
@@ -237,7 +232,7 @@ pub fn TextModel(comptime model_config: Config) type {
                 position_ids.data[i] = pos + i;
             }
 
-            var qr = try applyRotEmb(
+            var qr = try rope.applyRotEmb(
                 self.allocator,
                 q,
                 n_heads,
@@ -248,7 +243,7 @@ pub fn TextModel(comptime model_config: Config) type {
             );
             defer qr.deinit();
 
-            var kr = try applyRotEmb(
+            var kr = try rope.applyRotEmb(
                 self.allocator,
                 k,
                 n_heads,
@@ -281,24 +276,24 @@ pub fn TextModel(comptime model_config: Config) type {
             defer k_final.deinit();
             defer v_final.deinit();
 
-            var attn_mask = try createAttnMask(self.allocator, pos, seq_len);
+            var attn_mask = try attention.createAttentionMask(self.allocator, pos, seq_len);
             defer attn_mask.deinit();
 
             var attn_output: Tensor(f16) = undefined;
 
             if (seq_len == 1) {
                 // Single token fast path
-                attn_output = try singleAttn(qr, k_final, v_final, attn_mask, self.allocator);
+                attn_output = try attention.singleMaskedSDPA(qr, k_final, v_final, attn_mask, self.allocator);
             } else {
                 // Multi-token path
-                attn_output = try multiAttn(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
+                attn_output = try attention.multiMaskedSDPA(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
             }
             defer attn_output.deinit();
 
             try ops.transposeAxes(f16, &attn_output, 0, 1);
             try attn_output.reshape(&[_]usize{ seq_len, n_heads * head_dim });
 
-            var out_proj = try hgemmtrans.matmul(attn_output, layer_out_proj_w, self.allocator);
+            var out_proj = try hgemmTrans.matmul(attn_output, layer_out_proj_w, self.allocator);
             errdefer out_proj.deinit();
 
             try ops.broadcast_add_simd(&out_proj, layer_out_proj_b);
@@ -312,14 +307,14 @@ pub fn TextModel(comptime model_config: Config) type {
             const layer_t_fc2_w = self.presliced_weights.t_fc2_w[layer];
             const layer_t_fc2_b = self.presliced_weights.t_fc2_b[layer];
 
-            var fc1 = try hgemmtrans.matmul(input, layer_t_fc1_w, self.allocator);
+            var fc1 = try hgemmTrans.matmul(input, layer_t_fc1_w, self.allocator);
             defer fc1.deinit();
 
             try ops.broadcast_add_simd(&fc1, layer_t_fc1_b);
 
             try ops.gelu(f16, &fc1);
 
-            var fc2 = try hgemmtrans.matmul(fc1, layer_t_fc2_w, self.allocator);
+            var fc2 = try hgemmTrans.matmul(fc1, layer_t_fc2_w, self.allocator);
             errdefer fc2.deinit();
 
             try ops.broadcast_add_simd(&fc2, layer_t_fc2_b);
@@ -341,7 +336,7 @@ pub fn TextModel(comptime model_config: Config) type {
 
             try normalized.reshape(&[_]usize{ 1, Self.config.dim });
 
-            var logits = try hgemmtrans.matmul(normalized, self.weights.t_linear_w, self.allocator);
+            var logits = try hgemmTrans.matmul(normalized, self.weights.t_linear_w, self.allocator);
             errdefer logits.deinit();
 
             try ops.broadcast_add_simd(&logits, self.weights.t_linear_b);

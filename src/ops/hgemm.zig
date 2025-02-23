@@ -1,11 +1,12 @@
 const std = @import("std");
-const testing = std.testing;
+const Allocator = std.mem.Allocator;
+
 const atomic = std.atomic;
 const math = std.math;
-const Allocator = std.mem.Allocator;
-const Tensor = @import("tensor.zig").Tensor;
-const Slice = @import("tensor.zig").Slice;
+const Tensor = @import("../core/tensor.zig").Tensor;
+
 const time = std.time;
+const testing = std.testing;
 
 comptime {
     @setFloatMode(.optimized);

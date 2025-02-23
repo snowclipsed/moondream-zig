@@ -1,5 +1,5 @@
 const std = @import("std");
-const Tensor = @import("tensor.zig").Tensor;
+const Tensor = @import("../core/tensor.zig").Tensor;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
@@ -127,7 +127,7 @@ pub fn precomputeFreqsCis(
     return result;
 }
 
-pub fn applyRotaryEmb(
+pub fn applyRotEmb(
     allocator: Allocator,
     x: Tensor(f16),
     n_heads: usize,

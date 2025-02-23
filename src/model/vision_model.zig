@@ -2,17 +2,17 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Weights = @import("weights.zig").Weights;
-const PreSlicedWeights = @import("preslice_vision.zig").PreSlicedWeights;
+const visionPreSlicedWeights = @import("../preprocessing/preslice_vision.zig").visionPreSlicedWeights;
 const Config = @import("config.zig").Config;
 
-const Tensor = @import("tensor.zig").Tensor;
-const ops = @import("ops.zig");
-const hgemm = @import("hgemm.zig");
+const Tensor = @import("../core/tensor.zig").Tensor;
+const ops = @import("../ops/ops.zig");
+const hgemm = @import("../ops/hgemm.zig");
 
-const rearrangeBCHWtoBTC = @import("image_handler.zig").rearrangeBCHWtoBTC;
-const normalizePatch = @import("image_handler.zig").normalizePatch;
-const convertBHWCtoBCHW = @import("image_handler.zig").convertBHWCtoBCHW;
-const attn = @import("attention.zig").multiMasklessScaledDotProductAttention;
+const rearrangeBCHWtoBTC = @import("../utils/reshape_handler.zig").rearrangeBCHWtoBTC;
+const normalizePatch = @import("../utils/reshape_handler.zig").normalizePatch;
+const convertBHWCtoBCHW = @import("../utils/reshape_handler.zig").convertBHWCtoBCHW;
+const attention = @import("../ops/attention.zig");
 
 const c = @cImport({
     @cInclude("stb_image.h");
@@ -46,16 +46,6 @@ pub fn VisionModel(comptime model_config: Config) type {
             const v_dim: usize = config.vit_dim;
         };
 
-        // Pre-computed shapes for tensors
-        const tensor_shapes = struct {
-            const qkv: [2]usize = .{ batch_size * patches_per_image, config.vit_dim * 3 };
-            const attention: [3]usize = .{ batch_size * patches_per_image, config.n_vit_heads, config.vit_head_dim };
-            const patches: [4]usize = .{ batch_size, config.img_dim, config.img_dim, config.img_channels };
-            const q_shape: [3]usize = .{ batch_size * patches_per_image, config.vit_dim, config.vit_head_dim };
-            const k_shape: [3]usize = .{ batch_size * patches_per_image, config.vit_dim, config.vit_head_dim };
-            const v_shape: [3]usize = .{ batch_size * patches_per_image, config.vit_dim, config.vit_head_dim };
-        };
-
         // Pre-computed patch dimensions
         const patch_dims = struct {
             const area: usize = config.patch_size * config.patch_size;
@@ -75,12 +65,12 @@ pub fn VisionModel(comptime model_config: Config) type {
 
         // Instance fields
         weights: Weights,
-        presliced_weights: PreSlicedWeights,
+        presliced_weights: visionPreSlicedWeights,
         allocator: Allocator,
 
         pub fn init(weights: Weights, allocator: Allocator) !Self {
             // Create pre-sliced weights
-            var presliced_weights = try PreSlicedWeights.init(allocator, weights, config.n_vit_layers);
+            var presliced_weights = try visionPreSlicedWeights.init(allocator, weights, config.n_vit_layers);
             errdefer presliced_weights.deinit();
 
             return Self{
@@ -319,7 +309,7 @@ pub fn VisionModel(comptime model_config: Config) type {
             try ops.transposeAxes(f16, &k, 0, 1);
             try ops.transposeAxes(f16, &v, 0, 1);
 
-            var attn_out = try attn(
+            var attn_out = try attention.multiMasklessSDPA(
                 n_heads,
                 head_dim,
                 q,

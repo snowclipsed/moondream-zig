@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Tensor = @import("tensor.zig").Tensor;
+const Tensor = @import("../core/tensor.zig").Tensor;
 const Config = @import("config.zig").Config;
 
 pub const Weights = struct {

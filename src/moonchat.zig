@@ -1,16 +1,19 @@
 const std = @import("std");
-const Config = @import("config.zig").Config;
-const model_config = @import("config.zig").MODEL_CONFIG;
-const Weights = @import("weights.zig").Weights;
-const Tokenizer = @import("tokenizer.zig").Tokenizer;
-const VisionModel = @import("vision_model.zig").VisionModel;
-const TextModel = @import("text_model.zig").TextModel;
-const KVCache = @import("text_model.zig").KVCache;
-const Tensor = @import("tensor.zig").Tensor;
-const Slice = @import("tensor.zig").Slice;
-const ops = @import("ops.zig");
-const sampling = @import("sampling.zig");
-const displayImage = @import("imagedisplay.zig").displayImage;
+const Tensor = @import("core/tensor.zig").Tensor;
+const Slice = @import("core/tensor.zig").Slice;
+const ops = @import("ops/ops.zig");
+
+const Tokenizer = @import("preprocessing/tokenizer.zig").Tokenizer;
+
+const Config = @import("/model/config.zig").Config;
+const model_config = @import("model/config.zig").MODEL_CONFIG;
+const Weights = @import("model/weights.zig").Weights;
+const VisionModel = @import("model/vision_model.zig").VisionModel;
+const TextModel = @import("model/text_model.zig").TextModel;
+const KVCache = @import("model/text_model.zig").KVCache;
+
+const sampling = @import("utils/sampling.zig");
+const displayImage = @import("utils/image_display.zig").displayImage;
 
 // ANSI Color codes
 const HEADER_ART =

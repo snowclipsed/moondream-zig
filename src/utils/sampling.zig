@@ -1,5 +1,5 @@
 const std = @import("std");
-const Tensor = @import("tensor.zig").Tensor;
+const Tensor = @import("../core/tensor.zig").Tensor;
 const Allocator = std.mem.Allocator;
 
 // ---------- Sampling ---------- //

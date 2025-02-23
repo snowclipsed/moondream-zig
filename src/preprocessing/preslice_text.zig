@@ -1,8 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Tensor = @import("tensor.zig").Tensor;
-const Weights = @import("weights.zig").Weights;
-pub const TextPreSlicedWeights = struct {
+const Tensor = @import("../core/tensor.zig").Tensor;
+const Weights = @import("../model/weights.zig").Weights;
+
+pub const textPreSlicedWeights = struct {
     // Layer norm weights
     t_ln_w: []Tensor(f16),
     t_ln_b: []Tensor(f16),
@@ -23,7 +24,7 @@ pub const TextPreSlicedWeights = struct {
     original_weights: Weights,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, weights: Weights, n_layers: usize) !TextPreSlicedWeights {
+    pub fn init(allocator: Allocator, weights: Weights, n_layers: usize) !textPreSlicedWeights {
         // Allocate arrays for each set of weights
         var t_ln_w = try allocator.alloc(Tensor(f16), n_layers);
         errdefer allocator.free(t_ln_w);
@@ -77,7 +78,7 @@ pub const TextPreSlicedWeights = struct {
             errdefer t_fc2_b[i].deinit();
         }
 
-        return TextPreSlicedWeights{
+        return textPreSlicedWeights{
             .t_ln_w = t_ln_w,
             .t_ln_b = t_ln_b,
             .t_Wqkv_w = t_Wqkv_w,
@@ -93,7 +94,7 @@ pub const TextPreSlicedWeights = struct {
         };
     }
 
-    pub fn deinit(self: *TextPreSlicedWeights) void {
+    pub fn deinit(self: *textPreSlicedWeights) void {
         for (self.t_ln_w) |*tensor| tensor.deinit();
         for (self.t_ln_b) |*tensor| tensor.deinit();
 
