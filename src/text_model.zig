@@ -1,16 +1,23 @@
 const std = @import("std");
 const print = std.debug.print;
 const Allocator = std.mem.Allocator;
+
 const Weights = @import("weights.zig").Weights;
+const TextPreSlicedWeights = @import("preslice_text.zig").TextPreSlicedWeights;
 const Config = @import("config.zig").Config;
+
 const Tensor = @import("tensor.zig").Tensor;
 const Slice = @import("tensor.zig").Slice;
+
 const ops = @import("ops.zig");
 const hgemm = @import("hgemm.zig");
 const hgemmtrans = @import("hgemmtrans.zig");
-const TextPreSlicedWeights = @import("preslice_text.zig").TextPreSlicedWeights;
-const multiattn = @import("attention.zig").multiMaskedScaledDotProductAttention;
-const singleattn = @import("attention.zig").singleMaskedScaledDotProductAttention;
+
+const precomputeFreqs = @import("rope.zig").precomputeFreqsCis;
+const applyRotEmb = @import("rope.zig").applyRotaryEmb;
+const createAttnMask = @import("attention.zig").createAttentionMask;
+const multiAttn = @import("attention.zig").multiMaskedScaledDotProductAttention;
+const singleAttn = @import("attention.zig").singleMaskedScaledDotProductAttention;
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
@@ -83,7 +90,7 @@ pub fn TextModel(comptime model_config: Config) type {
             errdefer presliced_weights.deinit();
 
             // Precompute freqs_cis
-            var freqs_cis = try ops.precomputeFreqsCis(f32, allocator, config.n_heads, config.dim, rotary_dims.theta);
+            var freqs_cis = try precomputeFreqs(f32, allocator, config.n_heads, config.dim, rotary_dims.theta);
             errdefer freqs_cis.deinit();
 
             return Self{
@@ -230,7 +237,7 @@ pub fn TextModel(comptime model_config: Config) type {
                 position_ids.data[i] = pos + i;
             }
 
-            var qr = try ops.applyRotaryEmb(
+            var qr = try applyRotEmb(
                 self.allocator,
                 q,
                 n_heads,
@@ -241,7 +248,7 @@ pub fn TextModel(comptime model_config: Config) type {
             );
             defer qr.deinit();
 
-            var kr = try ops.applyRotaryEmb(
+            var kr = try applyRotEmb(
                 self.allocator,
                 k,
                 n_heads,
@@ -274,17 +281,17 @@ pub fn TextModel(comptime model_config: Config) type {
             defer k_final.deinit();
             defer v_final.deinit();
 
-            var attn_mask = try ops.createAttentionMask(self.allocator, pos, seq_len);
+            var attn_mask = try createAttnMask(self.allocator, pos, seq_len);
             defer attn_mask.deinit();
 
             var attn_output: Tensor(f16) = undefined;
 
             if (seq_len == 1) {
                 // Single token fast path
-                attn_output = try singleattn(qr, k_final, v_final, attn_mask, self.allocator);
+                attn_output = try singleAttn(qr, k_final, v_final, attn_mask, self.allocator);
             } else {
                 // Multi-token path
-                attn_output = try multiattn(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
+                attn_output = try multiAttn(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
             }
             defer attn_output.deinit();
 
@@ -319,6 +326,7 @@ pub fn TextModel(comptime model_config: Config) type {
 
             return fc2;
         }
+
         pub fn lm_head(self: Self, hidden: Tensor(f16)) !Tensor(f16) {
             if (hidden.shape.len != 2) {
                 return error.InvalidInputShape;

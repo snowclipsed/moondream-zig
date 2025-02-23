@@ -8,6 +8,10 @@ const Config = @import("config.zig").Config;
 const Tensor = @import("tensor.zig").Tensor;
 const ops = @import("ops.zig");
 const hgemm = @import("hgemm.zig");
+
+const rearrangeBCHWtoBTC = @import("image_handler.zig").rearrangeBCHWtoBTC;
+const normalizePatch = @import("image_handler.zig").normalizePatch;
+const convertBHWCtoBCHW = @import("image_handler.zig").convertBHWCtoBCHW;
 const attn = @import("attention.zig").multiMasklessScaledDotProductAttention;
 
 const c = @cImport({
@@ -163,7 +167,7 @@ pub fn VisionModel(comptime model_config: Config) type {
             var patches = try self.createPatches(image_path);
             defer patches.deinit();
 
-            var bchw_patches = try ops.convert_bhwc_to_bchw(self.allocator, patches);
+            var bchw_patches = try convertBHWCtoBCHW(self.allocator, patches);
             defer bchw_patches.deinit();
 
             for (bchw_patches.data) |*val| {
@@ -182,7 +186,7 @@ pub fn VisionModel(comptime model_config: Config) type {
             stdev.data[1] = 0.5;
             stdev.data[2] = 0.5;
 
-            var normalized = try ops.normalize_patch(self.allocator, bchw_patches, mean, stdev);
+            var normalized = try normalizePatch(self.allocator, bchw_patches, mean, stdev);
             defer normalized.deinit();
 
             var encoder_output = try self.vision_encoder(normalized);
@@ -211,7 +215,7 @@ pub fn VisionModel(comptime model_config: Config) type {
                 return error.UnexpectedBatchCount;
             }
 
-            var x = try ops.rearrangeBCHWtoBTC(self.allocator, input, Self.config.patch_size);
+            var x = try rearrangeBCHWtoBTC(self.allocator, input, Self.config.patch_size);
             defer x.deinit();
 
             const B = x.shape[0];
