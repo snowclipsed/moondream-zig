@@ -15,7 +15,6 @@ const KVCache = @import("model/text_model.zig").KVCache;
 const sampling = @import("utils/sampling.zig");
 const displayImage = @import("utils/image_display.zig").displayImage;
 
-// ANSI Color codes
 const HEADER_ART =
     \\███╗   ███╗ ██████╗  ██████╗ ███╗   ██╗██████╗ ██████╗ ███████╗ █████╗ ███╗   ███╗ ▪    ███████╗██╗ ██████╗ 
     \\████╗ ████║██╔═══██╗██╔═══██╗████╗  ██║██╔══██╗██╔══██╗██╔════╝██╔══██╗████╗ ████║ ▪    ╚══███╔╝██║██╔════╝ 
@@ -25,6 +24,7 @@ const HEADER_ART =
     \\╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝ ▪    ╚══════╝╚═╝ ╚═════╝ •
 ;
 
+// ANSI Color Codes
 const main_color = "\x1b[95m";
 const reset_color = "\x1b[0m";
 const time_color = "\x1b[94m";
@@ -155,7 +155,17 @@ const ChatState = struct {
     sampling_config: sampling.SamplingConfig,
     max_length: usize,
 
-    // Add method to change sampling configuration
+    /// Sets the sampling method for the chat state.
+    ///
+    /// This function allows you to specify the sampling method to be used
+    /// for the chat state. The method is provided as a string.
+    ///
+    /// # Parameters
+    /// - `self`: A pointer to the `ChatState` instance.
+    /// - `method`: A constant byte slice representing the sampling method.
+    ///
+    /// # Errors
+    /// This function may return an error if the provided sampling method is invalid.
     pub fn setSamplingMethod(self: *ChatState, method: []const u8) !void {
         if (std.mem.eql(u8, method, "greedy")) {
             self.sampling_config = .{ .method = .greedy };
@@ -175,6 +185,16 @@ const ChatState = struct {
         }
     }
 
+    /// Retrieves the current sampling method used in the chat state.
+    ///
+    /// This function returns a slice of constant unsigned 8-bit integers
+    /// representing the name or identifier of the current sampling method.
+    ///
+    /// Parameters:
+    /// - `self`: A constant pointer to the `ChatState` structure.
+    ///
+    /// Returns:
+    /// - A slice of constant `u8` representing the current sampling method.
     pub fn getCurrentSamplingMethod(self: *const ChatState) []const u8 {
         return switch (self.sampling_config.method) {
             .greedy => "greedy",
@@ -183,6 +203,21 @@ const ChatState = struct {
         };
     }
 
+    /// Initializes the chat state with the provided models, tokenizer, and weights.
+    ///
+    /// This function sets up the necessary components for the chat system to function,
+    /// including the vision model, text model, tokenizer, and weights.
+    ///
+    /// Parameters:
+    /// - `allocator`: The memory allocator to use for allocating resources.
+    /// - `vision_model`: A pointer to the vision model configuration.
+    /// - `text_model`: A pointer to the text model configuration.
+    /// - `tokenizer`: A pointer to the tokenizer to use for processing text.
+    /// - `weights`: A pointer to the weights to use for the models.
+    ///
+    /// Returns:
+    /// - A pointer to the initialized `ChatState` on success.
+    /// - An error if initialization fails.
     pub fn init(
         allocator: std.mem.Allocator,
         vision_model: *VisionModel(model_config),
@@ -221,6 +256,24 @@ const ChatState = struct {
         return state;
     }
 
+    /// Clears the chat state.
+    ///
+    /// This function resets the chat state to its initial state, effectively
+    /// clearing any messages or data stored in the chat.
+    ///
+    /// # Errors
+    ///
+    /// This function may return an error if the chat state cannot be cleared
+    /// due to an underlying issue.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: A pointer to the `ChatState` instance that will be cleared.
+    ///
+    /// # Returns
+    ///
+    /// This function returns `!void`, indicating that it may return an error
+    /// or nothing if the operation is successful.
     pub fn clearChat(self: *ChatState) !void {
         const stdout = std.io.getStdOut().writer();
 
@@ -234,6 +287,23 @@ const ChatState = struct {
         }
     }
 
+    /// Loads an image from the specified file path into the chat state.
+    ///
+    /// This function takes a file path to an image and loads it into the
+    /// chat state. It returns an error if the image cannot be loaded.
+    ///
+    /// # Parameters
+    /// - `self`: A pointer to the `ChatState` instance.
+    /// - `image_path`: A slice of constant unsigned 8-bit integers representing the file path to the image.
+    ///
+    /// # Errors
+    /// This function returns an error if the image cannot be loaded.
+    ///
+    /// # Example
+    /// ```
+    /// const chat_state = ChatState{};
+    /// try chat_state.loadImage("/path/to/image.png");
+    /// ```
     pub fn loadImage(self: *ChatState, image_path: []const u8) !void {
         const stdout = std.io.getStdOut().writer();
 
@@ -273,6 +343,17 @@ const ChatState = struct {
         try stdout.writeAll("\x1B[0m"); // Reset colors
     }
 
+    /// Processes a turn in the chat state with the given prompt.
+    ///
+    /// This function takes a prompt as input and processes it within the context
+    /// of the current chat state. It performs necessary actions based on the prompt
+    /// and updates the chat state accordingly.
+    ///
+    /// # Parameters
+    /// - `self`: A pointer to the `ChatState` instance.
+    /// - `prompt`: A slice of constant unsigned 8-bit integers representing the prompt to process.
+    ///
+    /// @return Returns an error if the processing fails.
     pub fn processTurn(self: *ChatState, prompt: []const u8) !void {
         const stdout = std.io.getStdOut().writer();
         const timestamp = getCurrentTimestamp();
@@ -285,7 +366,6 @@ const ChatState = struct {
         var start_time: i64 = undefined;
         var timing_started = false;
 
-        // ... [existing token generation code]
         var prompt_buf = std.ArrayList(u8).init(self.allocator);
         defer prompt_buf.deinit();
         try prompt_buf.writer().print("\n\nQuestion: {s}\n\nAnswer:", .{prompt});
@@ -391,6 +471,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Initialize standard I/O
     const stdout = std.io.getStdOut().writer();
 
     // Display header art
@@ -409,13 +490,16 @@ pub fn main() !void {
     }
     tokenizer.* = try Tokenizer.fromJson("../tokenizer.json", allocator);
 
+    // load weights
     var weights = try allocator.create(Weights);
     defer {
         weights.deinit();
         allocator.destroy(weights);
     }
+
     weights.* = try Weights.init(model_config, "../moondream.bin", allocator);
 
+    // load vision model persistent state
     const VisionModelType = VisionModel(model_config);
     var vision_model = try allocator.create(VisionModelType);
     defer {
@@ -424,6 +508,7 @@ pub fn main() !void {
     }
     vision_model.* = try VisionModelType.init(weights.*, allocator);
 
+    // load text model persistent state
     const TextModelType = TextModel(model_config);
     var text_model = try allocator.create(TextModelType);
     defer {
@@ -444,6 +529,8 @@ pub fn main() !void {
     const stdin = std.io.getStdIn().reader();
 
     while (true) {
+        // start chat loop
+
         try stdout.print("{s}>{s} ", .{ prompt_color, reset_color });
         const input = try stdin.readUntilDelimiter(&buffer, '\n');
 
