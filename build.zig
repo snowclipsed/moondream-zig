@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
 
     // Add C source files
     stb_image.addCSourceFile(.{
-        .file = .{ .cwd_relative = "dependencies/stb_image.c" },
+        .file = .{ .cwd_relative = "src/dependencies/stb_image.c" },
         .flags = &[_][]const u8{
             "-Wall",
             "-Wextra",
@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
     });
 
     stb_resize.addCSourceFile(.{
-        .file = .{ .cwd_relative = "dependencies/stb_image_resize2.c" },
+        .file = .{ .cwd_relative = "src/dependencies/stb_image_resize2.c" },
         .flags = &[_][]const u8{
             "-Wall",
             "-Wextra",
@@ -46,13 +46,13 @@ pub fn build(b: *std.Build) void {
     // Create the main executable
     const exe = b.addExecutable(.{
         .name = "moondream",
-        .root_source_file = .{ .cwd_relative = "moonchat.zig" },
+        .root_source_file = .{ .cwd_relative = "src/moonchat.zig" },
         .target = target,
         .optimize = optimize,
     });
 
     // Add dependencies folder for headers
-    exe.addIncludePath(.{ .cwd_relative = "dependencies" });
+    exe.addIncludePath(.{ .cwd_relative = "src/dependencies" });
 
     // Link with our static libraries
     exe.linkLibrary(stb_image);
@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
 
     for (test_targets) |test_target| {
         const ops_tests = b.addTest(.{
-            .root_source_file = .{ .cwd_relative = "ops_test.zig" },
+            .root_source_file = .{ .cwd_relative = "src/ops/ops_test.zig" },
             .target = b.resolveTargetQuery(test_target),
         });
 

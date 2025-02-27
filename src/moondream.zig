@@ -32,9 +32,9 @@ const HEADER_ART =
 ;
 
 // Default paths and configurations
-const DEFAULT_MODEL_PATH = "../moondream.bin";
-const DEFAULT_TOKENIZER_PATH = "../tokenizer.json";
-const DEFAULT_IMAGE_PATH = "../images/demo-1.jpg";
+const DEFAULT_MODEL_PATH = "moondream.bin";
+const DEFAULT_TOKENIZER_PATH = ".tokenizer.json";
+const DEFAULT_IMAGE_PATH = "images/demo-1.jpg";
 const DEFAULT_PROMPT = "describe the image";
 const DEFAULT_MAX_TOKENS: usize = 200;
 

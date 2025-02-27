@@ -488,7 +488,7 @@ pub fn main() !void {
         tokenizer.deinit();
         allocator.destroy(tokenizer);
     }
-    tokenizer.* = try Tokenizer.fromJson("../tokenizer.json", allocator);
+    tokenizer.* = try Tokenizer.fromJson("tokenizer.json", allocator);
 
     // load weights
     var weights = try allocator.create(Weights);
@@ -497,7 +497,7 @@ pub fn main() !void {
         allocator.destroy(weights);
     }
 
-    weights.* = try Weights.init(model_config, "../moondream.bin", allocator);
+    weights.* = try Weights.init(model_config, "moondream.bin", allocator);
 
     // load vision model persistent state
     const VisionModelType = VisionModel(model_config);
