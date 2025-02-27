@@ -77,6 +77,50 @@ const AttnThreadContext = struct {
     workspace: *ThreadWorkspace,
 };
 
+/// Performs multi-headed scaled dot-product attention (without masking) optimized for CPU performance.
+///
+/// This function implements the standard attention formula:
+///     Attention(Q, K, V) = softmax(Q*K^T / sqrt(d_k)) * V
+/// across multiple heads in parallel, utilizing a thread pool for efficient execution.
+///
+/// Performance optimizations:
+/// - Uses f16 for storage and f32 for computation (mixed precision)
+/// - Thread-level parallelism with each thread processing multiple heads
+/// - Pre-allocated thread workspaces to minimize allocations during computation
+/// - Efficient memory layout with transposed key matrix for better cache utilization
+/// - Adaptive threading that scales based on available CPU cores
+/// - Nested parallelism within matrix multiplications
+/// - Balanced workload distribution across threads
+///
+/// The implementation follows a zero-copy design pattern where possible and leverages
+/// Zig's explicit memory management to avoid unnecessary allocations/deallocations
+/// during the computation-intensive attention process.
+///
+/// Parameters:
+///     n_heads: comptime_int - Number of attention heads
+///     head_dim: comptime_int - Dimension of each attention head
+///     query: Tensor(f16) - Query tensor with shape [n_heads, q_len, head_dim]
+///     key: Tensor(f16) - Key tensor with shape [n_heads, kv_len, head_dim]
+///     value: Tensor(f16) - Value tensor with shape [n_heads, kv_len, head_dim]
+///     allocator: Allocator - Memory allocator for intermediate tensors
+///
+/// Returns:
+///     Tensor(f16) - Output tensor with shape [n_heads, q_len, head_dim]
+///
+/// Errors:
+///     - OutOfMemory if allocator fails to allocate memory
+///     - ThreadCreationFailure if thread spawning fails
+///     - Other errors from tensor operations or matrix multiplication
+///
+/// Thread safety:
+///     This function is thread-safe and creates a dedicated thread pool for attention
+///     computation. The input tensors should not be modified during execution.
+///
+/// Example:
+///     ```
+///     var output = try multiMasklessSDPA(12, 64, query_tensor, key_tensor, value_tensor, allocator);
+///     defer output.deinit();
+///    ```
 pub fn multiMasklessSDPA(
     n_heads: comptime_int,
     head_dim: comptime_int,
@@ -307,6 +351,67 @@ const MaskedThreadWorkspace = struct {
     }
 };
 
+/// Performs multi-token masked scaled dot-product attention optimized for CPU parallelism.
+///
+/// This function implements the standard attention formula with masking:
+///     Attention(Q, K, V) = softmax(mask(Q*K^T / sqrt(d_k))) * V
+/// processing multiple query tokens against key-value pairs simultaneously across
+/// attention heads in parallel.
+///
+/// Key performance optimizations:
+/// - Mixed precision: Uses f16 for storage and f32 for computations
+/// - Memory layout transformation: Transposes key matrices for optimal cache access
+/// - Multi-level parallelism: Distributes heads across threads with nested parallelism
+///   for matrix multiplications
+/// - Thread-local workspaces: Pre-allocates per-thread memory to avoid allocation
+///   during computation
+/// - Controlled precision flow: Maintains numerical stability with careful
+///   precision management
+/// - Balanced workload distribution: Ensures even distribution of heads across threads
+///
+/// This implementation is designed for inference scenarios where multiple tokens
+/// need to be processed simultaneously with arbitrary attention masking patterns.
+/// Unlike the single-token path, this handles arbitrary sequence lengths and
+/// supports complex masking patterns beyond simple causal masking.
+///
+/// Parameters:
+///     query: Tensor(f16) - Query tensor with shape [n_heads, q_len, head_dim]
+///     key: Tensor(f16) - Key tensor with shape [n_heads, kv_len, head_dim]
+///     value: Tensor(f16) - Value tensor with shape [n_heads, kv_len, head_dim]
+///     mask: Tensor(bool) - Attention mask tensor with shape [q_len, 1, kv_len] or [q_len, kv_len]
+///                          where false indicates positions to mask out
+///     n_heads: usize - Number of attention heads
+///     head_dim: usize - Dimension of each attention head
+///     allocator: Allocator - Memory allocator for intermediate tensors
+///
+/// Returns:
+///     Tensor(f16) - Output tensor with shape [n_heads, q_len, head_dim]
+///
+/// Errors:
+///     - OutOfMemory if allocator fails to allocate memory
+///     - ThreadCreationFailure if thread spawning fails
+///     - Other errors from tensor operations or matrix multiplication
+///
+/// Thread safety:
+///     This function is thread-safe and creates a dedicated thread pool for attention
+///     computation. The input tensors should not be modified during execution.
+///
+/// Performance considerations:
+///     - Performance scales well with increasing numbers of CPU cores
+///     - Memory bandwidth can become a bottleneck with very large tensors
+///     - Optimal performance is achieved when head_dim is a multiple of SIMD width
+///
+/// Example:
+///     ```
+///     var mask = try createCausalMask(seq_len, allocator);
+///     defer mask.deinit();
+///
+///     var output = try multiMaskedSDPA(
+///         query_tensor, key_tensor, value_tensor, mask,
+///         16, 64, allocator
+///     );
+///     defer output.deinit();
+///     ```
 pub fn multiMaskedSDPA(
     query: Tensor(f16),
     key: Tensor(f16),
@@ -455,7 +560,41 @@ const HeadContext = struct {
     workspace: *SingleHeadWorkspace,
 };
 
-// Worker function
+/// Worker function for parallel processing of attention heads during single-token generation.
+///
+/// This function is specifically optimized for the critical path of autoregressive inference
+/// where a single new token query attends to all previous key-value pairs. The implementation
+/// contains numerous performance optimizations that make it especially efficient for this case.
+///
+/// Performance optimizations:
+/// - SIMD vectorization: Uses explicit SIMD types (SimdF16x8, SimdF32x8) to process 8 elements
+///   simultaneously, maximizing CPU vector unit utilization
+/// - Mixed precision: Computes in f32 for numerical stability but stores in f16 for memory efficiency
+/// - Compile-time constants: Uses MODEL_HEAD_DIM, HEAD_DIM_CHUNKS, and SIMD_WIDTH as compile-time
+///   constants to enable aggressive compiler optimizations
+/// - Branchless softmax: Implements softmax using branchless operations to avoid pipeline stalls
+/// - Memory alignment: Ensures proper alignment for SIMD operations with explicit pointer casting
+/// - Loop unrolling: Uses inline for loops to force unrolling of the inner loops across SIMD chunks
+/// - Direct memory access: Avoids unnecessary copies through direct, aligned pointer manipulation
+///
+/// Why it works well for single-token generation:
+/// 1. Predictable access patterns: With exactly one query token, memory access patterns are
+///    highly predictable, allowing for optimal prefetching and cache utilization
+/// 2. No matrix multiplication: Replaces general matrix multiplication with direct dot products,
+///    eliminating overhead for this specific case
+/// 3. SIMD-friendly dimensions: Model dimensions are typically multiples of SIMD width,
+///    enabling perfect vectorization without remainder handling
+/// 4. Minimal branching: Critical loops contain minimal conditional logic, reducing branch
+///    mispredictions in the processor pipeline
+/// 5. Workspace reuse: Uses pre-allocated thread-local workspaces, eliminating allocation
+///    overhead during the latency-sensitive generation phase
+///
+/// Parameters:
+///     ctx: HeadContext - Contains pointers to input/output tensors and thread-specific workspaces
+///
+/// Thread safety:
+///     Designed to be called from multiple threads simultaneously, with each thread processing
+///     different attention heads using thread-local workspaces.
 fn processHeads(ctx: HeadContext) void {
     const scores = &ctx.workspace.scores;
     const out_head = &ctx.workspace.out_head;
@@ -534,6 +673,56 @@ fn processHeads(ctx: HeadContext) void {
     }
 }
 
+/// Performs single-token masked scaled dot-product attention optimized for the token generation phase.
+///
+/// This function implements a specialized version of the attention mechanism specifically designed
+/// for the "hot path" of autoregressive token generation, where a single new token query attends
+/// to all previous key-value pairs with masking.
+///
+/// Unlike the multi-headed general attention, this function:
+/// - Processes exactly one token query per head (middle dimension is always 1)
+/// - Uses masked attention to prevent attending to future positions
+/// - Employs global pre-allocated workspaces to eliminate allocation overhead
+/// - Enforces a maximum sequence length (MAX_KV_LEN) for safety and optimization
+/// - Uses model-specific constants (MODEL_N_HEADS, MODEL_HEAD_DIM) for specialized execution
+///
+/// Performance optimizations:
+/// - Zero dynamic allocations during computation (only one for the output tensor)
+/// - Global workspaces eliminate memory allocation during the critical inference path
+/// - Thread-level parallelism across attention heads
+/// - Bounds-checking to prevent sequence length overflow
+/// - Fixed thread count upper limit to prevent excessive threading overhead
+/// - Balanced head distribution across available CPU cores
+///
+/// This implementation is specifically designed for inference-time token generation where
+/// latency is critical and the pattern of computation is highly predictable.
+///
+/// Parameters:
+///     query: Tensor(f16) - Query tensor with shape [MODEL_N_HEADS, 1, MODEL_HEAD_DIM]
+///     key: Tensor(f16) - Key tensor with shape [MODEL_N_HEADS, kv_len, MODEL_HEAD_DIM]
+///     value: Tensor(f16) - Value tensor with shape [MODEL_N_HEADS, kv_len, MODEL_HEAD_DIM]
+///     mask: Tensor(bool) - Attention mask tensor with shape [1, kv_len]
+///     allocator: Allocator - Memory allocator for output tensor
+///
+/// Returns:
+///     Tensor(f16) - Output tensor with shape [MODEL_N_HEADS, 1, MODEL_HEAD_DIM]
+///
+/// Errors:
+///     - SequenceTooLong if kv_len exceeds MAX_KV_LEN
+///     - OutOfMemory if allocator fails to allocate output tensor
+///     - ThreadCreationFailure if thread spawning fails
+///
+/// Thread safety:
+///     This function is thread-safe for inference but assumes global_workspaces are not
+///     concurrently accessed by other functions. Not safe for concurrent model inference.
+///
+/// Example:
+///     ```
+///     var next_token_embedding = try singleMaskedSDPA(
+///         query_tensor, cached_keys, cached_values, attention_mask, allocator
+///     );
+///     defer next_token_embedding.deinit();
+///
 pub fn singleMaskedSDPA(
     query: Tensor(f16),
     key: Tensor(f16),
