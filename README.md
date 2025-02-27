@@ -1,4 +1,4 @@
-# mooondream-zig
+# moondream-zig
 
 Moondream inference in zig!
 
