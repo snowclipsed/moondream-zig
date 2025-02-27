@@ -81,3 +81,4 @@ src/profile_analysis/
 profile/hgemmtrans
 profile/sgemminplace
 profile/shakespeare.txt
+quantize.py

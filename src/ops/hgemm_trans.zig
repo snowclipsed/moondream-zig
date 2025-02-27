@@ -17,7 +17,7 @@ comptime {
 // SIMD and optimization constants
 const Vec8f = @Vector(8, f32);
 const T: usize = 168; // Tile size optimized for cache
-const CACHE_LINE_SIZE: usize = 128;
+const CACHE_LINE_SIZE: usize = atomic.cache_line;
 
 // Thread-local data structure aligned to cache line
 const ThreadLocalData = struct {
@@ -25,7 +25,6 @@ const ThreadLocalData = struct {
     _padding: [64 - @sizeOf(atomic.Value(usize))]u8 = undefined,
 };
 
-// Context for regular matrix multiplication
 const ThreadContext = struct {
     A: []const f16,
     B_t: []const f16,
@@ -371,7 +370,6 @@ fn matmulWorker(ctx: ThreadContext) void {
     }
 }
 
-// Main matrix multiplication function that operates on Tensors
 pub fn matmul(a: Tensor(f16), b_transposed: Tensor(f16), allocator: Allocator) !Tensor(f16) {
     @setRuntimeSafety(false);
     const A_shape = a.shape;
