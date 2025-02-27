@@ -1,19 +1,20 @@
 const std = @import("std");
 
-const Config = @import("/model/config.zig").Config;
-const model_config = @import("/model/config.zig").MODEL_CONFIG;
-const ConfigReader = @import("/model/config.zig").ConfigReader;
-const Weights = @import("/model/weights.zig").Weights;
-const Tokenizer = @import("/preprocessing/tokenizer.zig").Tokenizer;
-const VisionModel = @import("/model/vision_model.zig").VisionModel;
-const TextModel = @import("/model/text_model.zig").TextModel;
-const KVCache = @import("/model/text_model.zig").KVCache;
+const Config = @import("model/config.zig").Config;
+const model_config = @import("model/config.zig").MODEL_CONFIG;
+const ConfigReader = @import("model/config.zig").ConfigReader;
+const Weights = @import("model/weights.zig").Weights;
+const Tokenizer = @import("preprocessing/tokenizer.zig").Tokenizer;
+const VisionModel = @import("model/vision_model.zig").VisionModel;
+const TextModel = @import("model/text_model.zig").TextModel;
+const KVCache = @import("model/text_model.zig").KVCache;
+const sampling = @import("utils/sampling.zig");
 
-const Tensor = @import("/core/tensor.zig").Tensor;
-const Slice = @import("/core/tensor.zig").Slice;
-const ops = @import("/ops/ops.zig");
+const Tensor = @import("core/tensor.zig").Tensor;
+const Slice = @import("core/tensor.zig").Slice;
+const ops = @import("ops/ops.zig");
 
-const displayImage = @import("/utils/image_display.zig").displayImage;
+const displayImage = @import("utils/image_display.zig").displayImage;
 const print = std.debug.print;
 const Timer = std.time.Timer;
 
@@ -188,9 +189,9 @@ pub fn main() !void {
 
     // Configure sampling based on arguments
     const sampling_config = if (std.mem.eql(u8, args.sampling_method, "greedy"))
-        ops.SamplingConfig{ .method = .greedy }
+        sampling.SamplingConfig{ .method = .greedy }
     else
-        ops.SamplingConfig{
+        sampling.SamplingConfig{
             .method = .top_k,
             .top_k = args.top_k,
             .temperature = args.temperature,
@@ -327,7 +328,7 @@ pub fn main() !void {
         const sampling_start = timer.read();
         var logits = try text_model.lm_head(result.output);
         defer logits.deinit();
-        const next_token_id = try ops.sample(f16, &logits, sampling_config, random, allocator);
+        const next_token_id = try sampling.sample(f16, &logits, sampling_config, random, allocator);
         total_sampling_time += timer.read() - sampling_start;
 
         if (next_token_id == tokenizer.eos_token) break;
