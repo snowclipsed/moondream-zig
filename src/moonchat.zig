@@ -316,29 +316,31 @@ const ChatState = struct {
             self.current_image_path = null; // Clear it immediately to prevent double-free in error cases
         }
 
-        // Store new image path
-
-        const normalized_path = try normalizePath(self.allocator, image_path);
-        defer self.allocator.free(normalized_path);
-
-        self.current_image_path = self.allocator.dupe(u8, normalized_path) catch |err| {
+        // Validate and normalize the path
+        const normalized_path = validateImagePath(self.allocator, image_path) catch |err| {
             spinner.stop();
-            try stdout.print("{s}Error: Failed to allocate memory for image path: {s}{s}\n", .{ error_color, @errorName(err), reset_color });
+            try stdout.print("{s}Error: Failed to validate image path: {s}{s}\n", .{ error_color, @errorName(err), reset_color });
             return err;
         };
+
+        // Store the normalized path
+        self.current_image_path = try self.allocator.dupe(u8, normalized_path);
+        errdefer {
+            self.allocator.free(self.current_image_path.?);
+            self.current_image_path = null;
+        }
 
         // Stop the spinner before display operations
         spinner.stop();
 
-        // Try to display the image first
+        // Try to display the image first - use normalized path consistently
         displayImage(self.allocator, normalized_path, 0.75) catch |err| {
             // Clean up the stored path on error
             if (self.current_image_path) |path| {
                 self.allocator.free(path);
                 self.current_image_path = null;
             }
-
-            // Let the caller handle the specific error
+            self.allocator.free(normalized_path); // Free the normalized path
             return err;
         };
 
@@ -354,7 +356,7 @@ const ChatState = struct {
         // Initialize a placeholder/empty tensor to ensure we don't have a null pointer
         self.image_tensor.* = try Tensor(f16).init(self.allocator, &[_]usize{ 1, model_config.dim });
 
-        // Try to encode the image
+        // Try to encode the image - use normalized path consistently
         self.image_tensor.deinit(); // Free the placeholder
         self.image_tensor.* = self.vision_model.encode_image(normalized_path) catch |err| {
             // Stop spinner before showing error
@@ -370,12 +372,17 @@ const ChatState = struct {
                 self.current_image_path = null;
             }
 
+            self.allocator.free(normalized_path); // Free the normalized path
+
             // Reinitialize tensor with empty data
             self.image_tensor.* = try Tensor(f16).init(self.allocator, &[_]usize{ 1, model_config.dim });
 
             // Let the caller handle the specific error
             return err;
         };
+
+        // Free the normalized path after we're done with it
+        self.allocator.free(normalized_path);
 
         // Explicitly stop spinner and ensure complete cleanup
         vision_spinner.stop();
@@ -396,26 +403,62 @@ const ChatState = struct {
         // Add any other error types you need
     };
 
-    // Add these helper functions to your codebase
+    pub fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        // Special handling for Windows UNC paths (\\server\share\...)
+        if (path.len >= 2 and path[0] == '\\' and path[1] == '\\') {
+            // For UNC paths, preserve the leading \\ but convert all other backslashes
+            var normalized = try allocator.alloc(u8, path.len);
+            errdefer allocator.free(normalized);
 
-    // Check if a file exists and is accessible
+            normalized[0] = '\\';
+            normalized[1] = '\\';
+
+            for (path[2..], 0..) |c, i| {
+                normalized[i + 2] = if (c == '\\') '/' else c;
+            }
+
+            return normalized;
+        }
+
+        // For regular paths (including those with drive letters like C:\...)
+        var normalized = try allocator.alloc(u8, path.len);
+        errdefer allocator.free(normalized);
+
+        // Special handling for drive letters (keep the : but convert \ to /)
+        var i: usize = 0;
+        while (i < path.len) : (i += 1) {
+            if (i == 1 and path[i] == ':' and isAlpha(path[0])) {
+                // This is a drive letter (e.g., "C:"), keep it as is
+                normalized[i] = path[i];
+            } else {
+                normalized[i] = if (path[i] == '\\') '/' else path[i];
+            }
+        }
+
+        return normalized;
+    }
+
     pub fn fileExists(path: []const u8) bool {
-        const file = std.fs.cwd().openFile(path, .{}) catch {
-            return false;
-        };
+        // Check if it's an absolute path
+        const is_absolute =
+            (path.len >= 1 and path[0] == '/') or // Unix-style absolute path
+            (path.len >= 3 and isAlpha(path[0]) and path[1] == ':' and (path[2] == '/' or path[2] == '\\')); // Windows-style
+
+        const file = if (is_absolute)
+            std.fs.openFileAbsolute(path, .{}) catch {
+                return false;
+            }
+        else
+            std.fs.cwd().openFile(path, .{}) catch {
+                return false;
+            };
+
         file.close();
         return true;
     }
 
-    pub fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-        var normalized = try allocator.alloc(u8, path.len);
-        errdefer allocator.free(normalized);
-
-        for (path, 0..) |c, i| {
-            normalized[i] = if (c == '\\') '/' else c;
-        }
-
-        return normalized;
+    fn isAlpha(c: u8) bool {
+        return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z');
     }
 
     // Check if a path has a valid image extension
@@ -443,20 +486,28 @@ const ChatState = struct {
     }
 
     // Perform all basic image path validation
-    pub fn validateImagePath(path: []const u8) !bool {
-        if (path.len == 0) {
+    pub fn validateImagePath(allocator: std.mem.Allocator, original_path: []const u8) ![]u8 {
+        if (original_path.len == 0) {
             return error.EmptyPath;
         }
 
-        if (!fileExists(path)) {
+        // Always normalize the path first
+        const normalized_path = try normalizePath(allocator, original_path);
+        errdefer allocator.free(normalized_path);
+
+        // Check if the file exists using the normalized path
+        if (!fileExists(normalized_path)) {
+            allocator.free(normalized_path);
             return error.FileNotFound;
         }
 
-        if (!hasValidImageExtension(path)) {
+        // Check if it has a valid image extension
+        if (!hasValidImageExtension(normalized_path)) {
+            allocator.free(normalized_path);
             return error.InvalidImageFormat;
         }
 
-        return true;
+        return normalized_path;
     }
 
     /// Processes a turn in the chat state with the given prompt.
@@ -652,11 +703,7 @@ pub fn main() !void {
 
         if (std.mem.startsWith(u8, input, "/exit")) {
             break;
-        } else // Update the chat command handling in main() function:
-
-        // Corrected error handling for the /chat command:
-
-        if (std.mem.startsWith(u8, input, "/chat ")) {
+        } else if (std.mem.startsWith(u8, input, "/chat ")) {
             const image_path = std.mem.trim(u8, input[6..], " ");
 
             if (image_path.len == 0) {
@@ -676,7 +723,8 @@ pub fn main() !void {
                     error.FileNotFound => "File not found",
                     error.ImageNotFound => "Image could not be loaded (invalid format or corrupted file)",
                     error.FailedToResizeImage => "Failed to resize image",
-                    // error.ImageLoadFailed => "Failed to load image data", // REMOVE THIS LINE
+                    error.EmptyPath => "Empty image path provided",
+                    error.InvalidImageFormat => "Invalid image format (must be jpg, png, etc.)",
                     else => "Unexpected error occurred",
                 };
 
@@ -685,9 +733,10 @@ pub fn main() !void {
                 // Add helpful suggestions based on error type
                 if (err == error.FileNotFound or err == error.ImageNotFound) {
                     try stdout.print("Make sure the file exists and the path is correct.\n", .{});
-                    try stdout.print("Example: /chat images/cat.png\n", .{});
-                } else if (err == error.FailedToResizeImage) {
-                    try stdout.print("Try a different image file format or check if the file is corrupted.\n", .{});
+                    try stdout.print("For Windows paths, you can use either forward slashes or backslashes:\n", .{});
+                    try stdout.print("Example: /chat C:/images/cat.png  or  /chat C:\\images\\cat.png\n", .{});
+                } else if (err == error.InvalidImageFormat) {
+                    try stdout.print("Supported formats: jpg, jpeg, png, bmp, gif, tiff, webp\n", .{});
                 } else {
                     try stdout.print("Unexpected error occurred. Try a different image.\n", .{});
                 }
