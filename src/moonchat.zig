@@ -317,7 +317,11 @@ const ChatState = struct {
         }
 
         // Store new image path
-        self.current_image_path = self.allocator.dupe(u8, image_path) catch |err| {
+
+        const normalized_path = try normalizePath(self.allocator, image_path);
+        defer self.allocator.free(normalized_path);
+
+        self.current_image_path = self.allocator.dupe(u8, normalized_path) catch |err| {
             spinner.stop();
             try stdout.print("{s}Error: Failed to allocate memory for image path: {s}{s}\n", .{ error_color, @errorName(err), reset_color });
             return err;
@@ -327,7 +331,7 @@ const ChatState = struct {
         spinner.stop();
 
         // Try to display the image first
-        displayImage(self.allocator, image_path, 0.75) catch |err| {
+        displayImage(self.allocator, normalized_path, 0.75) catch |err| {
             // Clean up the stored path on error
             if (self.current_image_path) |path| {
                 self.allocator.free(path);
@@ -352,7 +356,7 @@ const ChatState = struct {
 
         // Try to encode the image
         self.image_tensor.deinit(); // Free the placeholder
-        self.image_tensor.* = self.vision_model.encode_image(image_path) catch |err| {
+        self.image_tensor.* = self.vision_model.encode_image(normalized_path) catch |err| {
             // Stop spinner before showing error
             vision_spinner.stop();
 
@@ -401,6 +405,17 @@ const ChatState = struct {
         };
         file.close();
         return true;
+    }
+
+    pub fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        var normalized = try allocator.alloc(u8, path.len);
+        errdefer allocator.free(normalized);
+
+        for (path, 0..) |c, i| {
+            normalized[i] = if (c == '\\') '/' else c;
+        }
+
+        return normalized;
     }
 
     // Check if a path has a valid image extension
@@ -670,7 +685,7 @@ pub fn main() !void {
                 // Add helpful suggestions based on error type
                 if (err == error.FileNotFound or err == error.ImageNotFound) {
                     try stdout.print("Make sure the file exists and the path is correct.\n", .{});
-                    try stdout.print("Example: /chat images/cat.jpg\n", .{});
+                    try stdout.print("Example: /chat images/cat.png\n", .{});
                 } else if (err == error.FailedToResizeImage) {
                     try stdout.print("Try a different image file format or check if the file is corrupted.\n", .{});
                 } else {

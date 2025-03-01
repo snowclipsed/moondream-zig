@@ -84,18 +84,22 @@ pub fn VisionModel(comptime model_config: Config) type {
             self.presliced_weights.deinit();
             self.* = undefined;
         }
-
         pub fn createPatches(self: Self, image_path: []const u8) !Tensor(f16) {
-            var path_buffer = try self.allocator.alloc(u8, image_path.len + 1);
-            defer self.allocator.free(path_buffer);
-            @memcpy(path_buffer[0..image_path.len], image_path);
-            path_buffer[image_path.len] = 0;
+            // Normalize path before creating C string
+            var normalized_path = try self.allocator.alloc(u8, image_path.len + 1);
+            defer self.allocator.free(normalized_path);
+
+            for (image_path, 0..) |ca, i| {
+                normalized_path[i] = if (ca == '\\') '/' else ca;
+            }
+            normalized_path[image_path.len] = 0; // Null terminate
 
             var width: c_int = 0;
             var height: c_int = 0;
             var channels: c_int = 0;
 
-            const img_data = c.stbi_load(path_buffer.ptr, &width, &height, &channels, 0);
+            // Use normalized path
+            const img_data = c.stbi_load(normalized_path.ptr, &width, &height, &channels, 0);
             if (img_data == null) {
                 const err_str = c.stbi_failure_reason();
                 std.debug.print("STB Image loading failed: {s}\n", .{err_str});
