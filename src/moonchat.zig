@@ -310,21 +310,35 @@ const ChatState = struct {
         var spinner = LoadingSpinner.init("Loading image file...");
         try spinner.start();
 
-        // Store image path
+        // Free previous image path if it exists
         if (self.current_image_path) |old_path| {
             self.allocator.free(old_path);
+            self.current_image_path = null; // Clear it immediately to prevent double-free in error cases
         }
-        self.current_image_path = try self.allocator.dupe(u8, image_path);
 
-        // Make sure spinner is stopped and cleared before displaying image
+        // Store new image path
+        self.current_image_path = self.allocator.dupe(u8, image_path) catch |err| {
+            spinner.stop();
+            try stdout.print("{s}Error: Failed to allocate memory for image path: {s}{s}\n", .{ error_color, @errorName(err), reset_color });
+            return err;
+        };
+
+        // Stop the spinner before display operations
         spinner.stop();
 
-        // Display image
-        try displayImage(self.allocator, image_path, 0.75);
+        // Try to display the image first
+        displayImage(self.allocator, image_path, 0.75) catch |err| {
+            // Clean up the stored path on error
+            if (self.current_image_path) |path| {
+                self.allocator.free(path);
+                self.current_image_path = null;
+            }
+
+            // Let the caller handle the specific error
+            return err;
+        };
 
         std.debug.print("\n\n\n", .{});
-
-        try stdout.writeAll("Image loaded! Enter your prompt:\n");
 
         // Start new spinner for vision processing
         var vision_spinner = LoadingSpinner.init("Processing image with vision model...");
@@ -333,14 +347,101 @@ const ChatState = struct {
         // Clean up old tensor's data
         self.image_tensor.deinit();
 
-        // Encode new image directly into the existing tensor
-        self.image_tensor.* = try self.vision_model.encode_image(image_path);
+        // Initialize a placeholder/empty tensor to ensure we don't have a null pointer
+        self.image_tensor.* = try Tensor(f16).init(self.allocator, &[_]usize{ 1, model_config.dim });
+
+        // Try to encode the image
+        self.image_tensor.deinit(); // Free the placeholder
+        self.image_tensor.* = self.vision_model.encode_image(image_path) catch |err| {
+            // Stop spinner before showing error
+            vision_spinner.stop();
+
+            // Clear the lines the spinner was using
+            try stdout.writeAll("\x1B[6A\x1B[J"); // Move up 6 lines and clear to end
+            try stdout.writeAll("\x1B[0m"); // Reset colors
+
+            // Clean up current image path since we failed to process it
+            if (self.current_image_path) |path| {
+                self.allocator.free(path);
+                self.current_image_path = null;
+            }
+
+            // Reinitialize tensor with empty data
+            self.image_tensor.* = try Tensor(f16).init(self.allocator, &[_]usize{ 1, model_config.dim });
+
+            // Let the caller handle the specific error
+            return err;
+        };
 
         // Explicitly stop spinner and ensure complete cleanup
         vision_spinner.stop();
         // Move cursor up and clear multiple lines to ensure complete cleanup
         try stdout.writeAll("\x1B[6A\x1B[J"); // Move up 6 lines and clear to end
         try stdout.writeAll("\x1B[0m"); // Reset colors
+    }
+
+    const ImageError = error{
+        FileNotFound,
+        ImageNotFound,
+        FailedToResizeImage,
+        InvalidImageDimensions,
+        InvalidResizeDimensions,
+        MemoryAllocationFailed,
+        EmptyPath,
+        InvalidImageFormat,
+        // Add any other error types you need
+    };
+
+    // Add these helper functions to your codebase
+
+    // Check if a file exists and is accessible
+    pub fn fileExists(path: []const u8) bool {
+        const file = std.fs.cwd().openFile(path, .{}) catch {
+            return false;
+        };
+        file.close();
+        return true;
+    }
+
+    // Check if a path has a valid image extension
+    pub fn hasValidImageExtension(path: []const u8) bool {
+        const lower_extensions = [_][]const u8{ ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp" };
+
+        // Convert path to lowercase for case-insensitive comparison
+        var lowercase_buf: [1024]u8 = undefined;
+        if (path.len >= lowercase_buf.len) return false; // Path too long
+
+        for (path, 0..) |c, i| {
+            lowercase_buf[i] = std.ascii.toLower(c);
+        }
+
+        const lowercase_path = lowercase_buf[0..path.len];
+
+        // Check against each valid extension
+        for (lower_extensions) |ext| {
+            if (std.mem.endsWith(u8, lowercase_path, ext)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Perform all basic image path validation
+    pub fn validateImagePath(path: []const u8) !bool {
+        if (path.len == 0) {
+            return error.EmptyPath;
+        }
+
+        if (!fileExists(path)) {
+            return error.FileNotFound;
+        }
+
+        if (!hasValidImageExtension(path)) {
+            return error.InvalidImageFormat;
+        }
+
+        return true;
     }
 
     /// Processes a turn in the chat state with the given prompt.
@@ -536,15 +637,49 @@ pub fn main() !void {
 
         if (std.mem.startsWith(u8, input, "/exit")) {
             break;
-        } else if (std.mem.startsWith(u8, input, "/chat ")) {
+        } else // Update the chat command handling in main() function:
+
+        // Corrected error handling for the /chat command:
+
+        if (std.mem.startsWith(u8, input, "/chat ")) {
             const image_path = std.mem.trim(u8, input[6..], " ");
+
+            if (image_path.len == 0) {
+                try stdout.print("{s}Error: Please provide an image path{s}\n", .{ error_color, reset_color });
+                try stdout.print("Usage: /chat <image-path>\n", .{});
+                continue;
+            }
 
             // Initialize new chat state if needed
             if (chat_state == null) {
                 chat_state = try ChatState.init(allocator, vision_model, text_model, tokenizer, weights);
             }
 
-            try chat_state.?.loadImage(image_path);
+            // Try to load the image, but handle errors gracefully
+            chat_state.?.loadImage(image_path) catch |err| {
+                const error_msg = switch (err) {
+                    error.FileNotFound => "File not found",
+                    error.ImageNotFound => "Image could not be loaded (invalid format or corrupted file)",
+                    error.FailedToResizeImage => "Failed to resize image",
+                    // error.ImageLoadFailed => "Failed to load image data", // REMOVE THIS LINE
+                    else => "Unexpected error occurred",
+                };
+
+                try stdout.print("\n{s}Error: {s} for path '{s}'{s}\n", .{ error_color, error_msg, image_path, reset_color });
+
+                // Add helpful suggestions based on error type
+                if (err == error.FileNotFound or err == error.ImageNotFound) {
+                    try stdout.print("Make sure the file exists and the path is correct.\n", .{});
+                    try stdout.print("Example: /chat images/cat.jpg\n", .{});
+                } else if (err == error.FailedToResizeImage) {
+                    try stdout.print("Try a different image file format or check if the file is corrupted.\n", .{});
+                } else {
+                    try stdout.print("Unexpected error occurred. Try a different image.\n", .{});
+                }
+
+                continue; // Return to command prompt
+            };
+
             try stdout.writeAll("Image loaded! Enter your prompt:\n");
         } else if (std.mem.eql(u8, input, "/newchat")) {
             if (chat_state != null) {

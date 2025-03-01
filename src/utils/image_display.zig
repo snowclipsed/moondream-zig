@@ -15,6 +15,15 @@ const Pixel = struct {
 pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale: f32) !void {
     const stdout = std.io.getStdOut().writer();
 
+    // Check if file exists first
+    const file = std.fs.cwd().openFile(image_path, .{}) catch |err| {
+        if (err == error.FileNotFound) {
+            return error.FileNotFound;
+        }
+        return err;
+    };
+    file.close();
+
     // Create null-terminated path for C
     var path_buffer = try allocator.alloc(u8, image_path.len + 1);
     defer allocator.free(path_buffer);
@@ -39,9 +48,14 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
     if (image_data == null) {
         const err_str = c.stbi_failure_reason();
         std.debug.print("[DEBUG] STB Error: {s}\n", .{err_str});
-        return error.ImageLoadFailed;
+        return error.ImageNotFound; // More specific error type that matches our vision model
     }
     defer c.stbi_image_free(image_data);
+
+    // Validate image dimensions
+    if (width <= 0 or height <= 0) {
+        return error.InvalidImageDimensions;
+    }
 
     // Calculate terminal dimensions with scale factor
     const base_term_width: usize = 80;
@@ -49,8 +63,16 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
     const term_height = @as(usize, @intFromFloat(@as(f32, @floatFromInt(term_width)) * 0.5 *
         @as(f32, @floatFromInt(height)) / @as(f32, @floatFromInt(width))));
 
+    // Validate calculated dimensions
+    if (term_width == 0 or term_height == 0) {
+        return error.InvalidResizeDimensions;
+    }
+
     // Allocate memory for resized image
-    const resized = try allocator.alloc(u8, term_width * term_height * 2 * 3);
+    const resized = allocator.alloc(u8, term_width * term_height * 2 * 3) catch |err| {
+        std.debug.print("[DEBUG] Memory allocation failed: {s}\n", .{@errorName(err)});
+        return error.MemoryAllocationFailed;
+    };
     defer allocator.free(resized);
 
     // Resize image using stbir
@@ -67,7 +89,7 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
     );
 
     if (resize_result == 0) {
-        return error.ResizeFailed;
+        return error.FailedToResizeImage; // Match the error name with our vision model
     }
 
     // Print the image
@@ -92,7 +114,10 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
                 .b = resized[lower_idx + 2],
             };
 
-            try printColorBlock(upper, lower, x, term_width);
+            printColorBlock(upper, lower, x, term_width) catch |err| {
+                std.debug.print("[DEBUG] Error printing color block: {s}\n", .{@errorName(err)});
+                continue; // Try to continue with the next block
+            };
         }
 
         // Clear to end of line and print newline

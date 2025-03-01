@@ -99,7 +99,7 @@ pub fn VisionModel(comptime model_config: Config) type {
             if (img_data == null) {
                 const err_str = c.stbi_failure_reason();
                 std.debug.print("STB Image loading failed: {s}\n", .{err_str});
-                return error.FailedToLoadImage;
+                return error.ImageNotFound; // More specific error type
             }
             defer c.stbi_image_free(img_data);
 
