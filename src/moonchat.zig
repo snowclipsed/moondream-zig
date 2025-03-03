@@ -51,9 +51,10 @@ fn displaySamplerOptions(writer: anytype) !void {
     try writer.print("{s}Available sampling methods:{s}\n", .{ main_color, reset_color });
     try writer.writeAll("  greedy - Always select the most likely token (default)\n");
     try writer.writeAll("  multinomial - Sample from full distribution (temperature=1.0)\n");
-    try writer.writeAll("  top_k - Sample from the top K most likely tokens (k=40)\n\n");
+    try writer.writeAll("  top_k - Sample from the top K most likely tokens (k=40)\n");
+    try writer.writeAll("  min_p - Sample tokens above min-p * max_probability threshold (min_p=0.05)\n\n");
     try writer.writeAll("Usage: /sampler <method>\n");
-    try writer.writeAll("Example: /sampler top_k\n");
+    try writer.writeAll("Example: /sampler min_p\n");
 }
 
 fn getCurrentTimestamp() []const u8 {
@@ -178,7 +179,13 @@ const ChatState = struct {
             self.sampling_config = .{
                 .method = .top_k,
                 .temperature = 1.0,
-                .top_k = 40, // You can adjust this default value
+                .top_k = 40, // Default value
+            };
+        } else if (std.mem.eql(u8, method, "min_p")) {
+            self.sampling_config = .{
+                .method = .min_p,
+                .temperature = 1.0,
+                .min_p = 0.01, // Default value
             };
         } else {
             return error.InvalidSamplingMethod;
@@ -200,6 +207,7 @@ const ChatState = struct {
             .greedy => "greedy",
             .multinomial => "multinomial",
             .top_k => "top_k",
+            .min_p => "min_p",
         };
     }
 
@@ -584,7 +592,9 @@ const ChatState = struct {
 
             var logits = try self.text_model.lm_head(result.output);
             defer logits.deinit();
-            const next_token_id = try sampling.sample(f16, &logits, self.sampling_config, self.rng.random(), self.allocator);
+            var logits_f32 = try logits.castWithSimd(f32);
+            defer logits_f32.deinit();
+            const next_token_id = try sampling.sample(&logits_f32, self.sampling_config, self.rng.random(), self.allocator);
 
             if (next_token_id == self.tokenizer.eos_token) break;
 
