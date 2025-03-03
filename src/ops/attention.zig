@@ -62,7 +62,6 @@ const ThreadPoolContext = struct {
     }
 };
 
-// Updated thread context with workspace
 const AttnThreadContext = struct {
     start_head: usize,
     end_head: usize,

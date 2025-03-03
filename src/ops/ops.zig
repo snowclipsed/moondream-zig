@@ -150,7 +150,6 @@ pub fn transposeAxes(comptime T: type, tensor: *Tensor(T), dim0: usize, dim1: us
         new_data[idx] = tensor.data[src_idx];
     }
 
-    // Update tensor metadata
     tensor.allocator.free(tensor.data);
     tensor.data = new_data;
     tensor.allocator.free(tensor.shape);
@@ -777,7 +776,6 @@ pub fn concat(comptime T: type, tensor: Tensor(T), other: Tensor(T), dim: usize)
 
             result.data[dst_idx] = tensor.data[src_idx];
 
-            // Update coordinates
             var j = coords.len;
             while (j > 0) {
                 j -= 1;
@@ -825,7 +823,6 @@ pub fn concat(comptime T: type, tensor: Tensor(T), other: Tensor(T), dim: usize)
 
             result.data[dst_idx] = other.data[src_idx];
 
-            // Update coordinates
             var j = coords.len;
             while (j > 0) {
                 j -= 1;
@@ -950,7 +947,6 @@ pub fn stack(comptime T: type, tensors: []const Tensor(T), dim: usize) !Tensor(T
             // Copy the value
             result.data[final_dst_idx] = tensor.data[element_idx];
 
-            // Update coordinates for next iteration
             var k = coords.len;
             while (k > 0) {
                 k -= 1;
