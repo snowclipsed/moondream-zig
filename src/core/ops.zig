@@ -312,7 +312,7 @@ pub fn add(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
         std.debug.print("tensor shape: {d}\n", .{tensor.shape});
         std.debug.print("other shape: {d}\n", .{other.shape});
-        std.debug.print("Error during addition", .{});
+        std.debug.print("Error during addition\n", .{});
         return error.ShapeMismatch;
     }
 
@@ -325,7 +325,7 @@ pub fn subtract(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
         std.debug.print("tensor shape: {d}\n", .{tensor.shape});
         std.debug.print("other shape: {d}\n", .{other.shape});
-        std.debug.print("Error during subtraction", .{});
+        std.debug.print("Error during subtraction\n", .{});
         return error.ShapeMismatch;
     }
 
@@ -338,7 +338,7 @@ pub fn multiply(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void {
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
         std.debug.print("tensor shape: {d}\n", .{tensor.shape});
         std.debug.print("other shape: {d}\n", .{other.shape});
-        std.debug.print("Error during multiplication", .{});
+        std.debug.print("Error during multiplication\n", .{});
         return error.ShapeMismatch;
     }
 
@@ -526,7 +526,7 @@ pub fn accumulate(comptime T: type, tensor: *Tensor(T), other: Tensor(T)) !void 
     if (!std.mem.eql(usize, tensor.shape, other.shape)) {
         std.debug.print("tensor shape: {d}\n", .{tensor.shape});
         std.debug.print("other shape: {d}\n", .{other.shape});
-        std.debug.print("Error during accumulation", .{});
+        std.debug.print("Error during accumulation\n", .{});
         return error.ShapeMismatch;
     }
 
@@ -868,7 +868,7 @@ pub fn stack(comptime T: type, tensors: []const Tensor(T), dim: usize) !Tensor(T
     // Validate all tensors have the same shape
     for (tensors[1..]) |tensor| {
         if (!std.mem.eql(usize, tensor.shape, ref_shape)) {
-            std.debug.print("Error during stacking", .{});
+            std.debug.print("Error during stacking\n", .{});
             return error.ShapeMismatch;
         }
     }

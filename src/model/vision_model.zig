@@ -6,13 +6,13 @@ const visionPreSlicedWeights = @import("../preprocessing/preslice_vision.zig").v
 const Config = @import("config.zig").Config;
 
 const Tensor = @import("../core/tensor.zig").Tensor;
-const ops = @import("../ops/ops.zig");
-const hgemm = @import("../ops/hgemm.zig");
+const ops = @import("../core/ops.zig");
+const hgemm = @import("../core/hgemm.zig");
 
 const rearrangeBCHWtoBTC = @import("../utils/reshape_handler.zig").rearrangeBCHWtoBTC;
 const normalizePatch = @import("../utils/reshape_handler.zig").normalizePatch;
 const convertBHWCtoBCHW = @import("../utils/reshape_handler.zig").convertBHWCtoBCHW;
-const attention = @import("../ops/attention.zig");
+const attention = @import("../core/attention.zig");
 
 const c = @cImport({
     @cInclude("stb_image.h");

@@ -9,10 +9,10 @@ const textPreSlicedWeights = @import("../preprocessing/preslice_text.zig").textP
 const Tensor = @import("../core/tensor.zig").Tensor;
 const Slice = @import("../core/tensor.zig").Slice;
 
-const ops = @import("../ops/ops.zig");
-const hgemmTrans = @import("../ops/hgemm_trans.zig");
-const rope = @import("../ops/rope.zig");
-const attention = @import("../ops/attention.zig");
+const ops = @import("../core/ops.zig");
+const hgemmTrans = @import("../core/hgemm_trans.zig");
+const rope = @import("../core/rope.zig");
+const attention = @import("../core/attention.zig");
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {

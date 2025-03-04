@@ -124,7 +124,7 @@ pub fn build(b: *std.Build) void {
 
     for (test_targets) |test_target| {
         const ops_tests = b.addTest(.{
-            .root_source_file = .{ .cwd_relative = "src/ops/ops_test.zig" },
+            .root_source_file = .{ .cwd_relative = "src/core/ops_test.zig" },
             .target = b.resolveTargetQuery(test_target),
         });
 

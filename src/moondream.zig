@@ -12,7 +12,7 @@ const sampling = @import("utils/sampling.zig");
 
 const Tensor = @import("core/tensor.zig").Tensor;
 const Slice = @import("core/tensor.zig").Slice;
-const ops = @import("ops/ops.zig");
+const ops = @import("core/ops.zig");
 
 const displayImage = @import("utils/image_display.zig").displayImage;
 const print = std.debug.print;

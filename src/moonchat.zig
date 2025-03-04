@@ -1,7 +1,7 @@
 const std = @import("std");
 const Tensor = @import("core/tensor.zig").Tensor;
 const Slice = @import("core/tensor.zig").Slice;
-const ops = @import("ops/ops.zig");
+const ops = @import("core/ops.zig");
 
 const Tokenizer = @import("preprocessing/tokenizer.zig").Tokenizer;
 

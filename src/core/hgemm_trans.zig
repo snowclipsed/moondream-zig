@@ -5,7 +5,7 @@ const math = @import("std").math;
 const ArrayList = std.ArrayList;
 
 const Tensor = @import("../core/tensor.zig").Tensor;
-const ops = @import("../ops/ops.zig");
+const ops = @import("../core/ops.zig");
 
 const testing = std.testing;
 const time = @import("std").time;

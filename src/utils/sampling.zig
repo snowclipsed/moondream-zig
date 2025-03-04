@@ -1,6 +1,6 @@
 const std = @import("std");
 const Tensor = @import("../core/tensor.zig").Tensor;
-const ops = @import("../ops/ops.zig");
+const ops = @import("../core/ops.zig");
 const Allocator = std.mem.Allocator;
 
 // ---------- Sampling ---------- //

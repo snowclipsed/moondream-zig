@@ -2,7 +2,7 @@ const std = @import("std");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
-const sgemminplace = @import("../ops/sgemm_inplace.zig").matmul;
+const sgemminplace = @import("../core/sgemm_inplace.zig").matmul;
 const softmax = @import("ops.zig").softmax;
 
 // ----- Unmasked Attention ----- //
