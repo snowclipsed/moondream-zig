@@ -10,13 +10,13 @@ const ops = @import("../core/ops.zig");
 const testing = std.testing;
 const time = @import("std").time;
 
-comptime {
-    @setFloatMode(.optimized);
-}
+// comptime {
+//     @setFloatMode(.optimized);
+// }
 
 // SIMD and optimization constants
 const Vec8f = @Vector(8, f32);
-const T: usize = 168; // Tile size optimized for cache
+pub const T: usize = 168; // Tile size optimized for cache
 const CACHE_LINE_SIZE: usize = atomic.cache_line;
 
 // Thread-local data structure aligned to cache line
@@ -520,7 +520,7 @@ fn matmulImpl(allocator: Allocator, a: []const f16, b_t: []const f16, c: []f16, 
 
     for (thread_pool.items) |thread| thread.join();
 }
-fn transpose(allocator: std.mem.Allocator, tensor: Tensor(f16)) !Tensor(f16) {
+pub fn transpose(allocator: std.mem.Allocator, tensor: Tensor(f16)) !Tensor(f16) {
     const shape = tensor.shape;
     var result = try Tensor(f16).init(allocator, &[_]usize{ shape[1], shape[0] });
     errdefer result.deinit();

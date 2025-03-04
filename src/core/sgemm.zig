@@ -1,16 +1,17 @@
+// sgemm
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const atomic = std.atomic;
 const ArrayList = std.ArrayList;
 
-const Tensor = @import("../core/tensor.zig").Tensor;
-const ops = @import("../core/ops.zig");
+const Tensor = @import("tensor.zig").Tensor;
+const ops = @import("ops.zig");
 
 const testing = std.testing;
 
-comptime {
-    @setFloatMode(.optimized);
-}
+// comptime {
+//     @setFloatMode(.optimized);
+// }
 
 // Compile-time optimizations for tuning parameters
 pub const Tile: usize = blk: {
@@ -309,242 +310,7 @@ fn microKernelAVX2(
         }
     }
 }
-test "matmul basic functionality" {
-    const allocator = testing.allocator;
 
-    // Test case 1: Square matrices
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer b.deinit();
-
-        a.data[0] = 1.0;
-        a.data[1] = 2.0;
-        a.data[2] = 3.0;
-        a.data[3] = 4.0;
-
-        b.data[0] = 5.0;
-        b.data[1] = 6.0;
-        b.data[2] = 7.0;
-        b.data[3] = 8.0;
-
-        var result = try matmul(f32, a, b, allocator);
-        defer result.deinit();
-
-        // Compare with known result
-        try testing.expectApproxEqAbs(result.data[0], 19.0, 1e-6);
-        try testing.expectApproxEqAbs(result.data[1], 22.0, 1e-6);
-        try testing.expectApproxEqAbs(result.data[2], 43.0, 1e-6);
-        try testing.expectApproxEqAbs(result.data[3], 50.0, 1e-6);
-    }
-}
-
-test "matmul edge cases" {
-    const allocator = testing.allocator;
-
-    // Test case 1: 1x1 matrices
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{ 1, 1 });
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 1, 1 });
-        defer b.deinit();
-
-        a.data[0] = 3.0;
-        b.data[0] = 4.0;
-
-        var result = try matmul(f32, a, b, allocator);
-        defer result.deinit();
-
-        try testing.expectApproxEqAbs(result.data[0], 12.0, 1e-6);
-    }
-
-    // Test case 2: Tall matrix × Wide matrix
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{ 3, 1 });
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 1, 3 });
-        defer b.deinit();
-
-        a.data[0] = 1.0;
-        a.data[1] = 2.0;
-        a.data[2] = 3.0;
-
-        b.data[0] = 4.0;
-        b.data[1] = 5.0;
-        b.data[2] = 6.0;
-
-        var result = try matmul(f32, a, b, allocator);
-        defer result.deinit();
-
-        try testing.expectEqual(result.shape[0], @as(usize, 3));
-        try testing.expectEqual(result.shape[1], @as(usize, 3));
-    }
-
-    // Test case 3: Zero matrices
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer b.deinit();
-
-        @memset(a.data, 0);
-        @memset(b.data, 0);
-
-        var result = try matmul(f32, a, b, allocator);
-        defer result.deinit();
-
-        for (result.data) |val| {
-            try testing.expectEqual(val, 0);
-        }
-    }
-}
-
-test "matmul error cases" {
-    const allocator = testing.allocator;
-
-    // Test case 1: Mismatched dimensions
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer b.deinit();
-
-        try testing.expectError(error.ShapeMismatch, matmul(f32, a, b, allocator));
-    }
-
-    // Test case 2: Invalid dimensions
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{2});
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer b.deinit();
-
-        try testing.expectError(error.InvalidDimensions, matmul(f32, a, b, allocator));
-    }
-}
-
-test "matmul correctness against reference" {
-    const allocator = testing.allocator;
-    const test_sizes = [_][3]usize{
-        .{ 32, 32, 32 }, // Small square
-        .{ 47, 35, 23 }, // Odd sizes
-        .{ 128, 64, 96 }, // Rectangular
-        .{ 1, 64, 128 }, // Single row × wide
-        .{ 128, 1, 64 }, // Tall × single column
-        .{ Tile - 1, Tile + 1, Tile }, // Around tile size
-        .{ Tile, Tile, Tile }, // Exactly tile size
-        .{ Tile + 1, Tile - 1, Tile }, // Around tile size
-    };
-
-    for (test_sizes) |size| {
-        const M = size[0];
-        const N = size[1];
-        const K = size[2];
-
-        // Create random input tensors
-        var a = try ops.createRandomTensor(f32, allocator, &[_]usize{ M, K }, 42);
-        defer a.deinit();
-        var b = try ops.createRandomTensor(f32, allocator, &[_]usize{ K, N }, 43);
-        defer b.deinit();
-
-        // Compute using tiled matmul
-        var result = try matmul(f32, a, b, allocator);
-        defer result.deinit();
-
-        // Compute using reference matmul
-        var expected = try ops.matmul(f32, &a, b);
-        defer expected.deinit();
-
-        // Compare results
-        const eps: f32 = 1e-4; // Allow for some floating-point error
-        for (result.data, expected.data) |val, exp| {
-            try testing.expectApproxEqAbs(val, exp, eps);
-        }
-
-        std.debug.print("Test passed for size: M={}, N={}, K={}\n", .{ M, N, K });
-    }
-}
-
-test "matmul numerical stability" {
-    const allocator = testing.allocator;
-
-    // Test case 1: Moderately large numbers
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer b.deinit();
-
-        // Using smaller values to avoid overflow
-        const large: f32 = 1e3;
-        @memset(a.data, large);
-        @memset(b.data, large);
-
-        var result = try matmul(f32, a, b, allocator);
-        defer result.deinit();
-
-        // Check results
-        for (result.data) |val| {
-            // Verify no infinity and reasonable magnitude
-            try testing.expect(!std.math.isInf(val));
-            try testing.expect(!std.math.isNan(val));
-            // For 2x2 matrices filled with 1e3, each element should be 2 * (1e3 * 1e3) = 2e6
-            try testing.expectApproxEqAbs(val, 2e6, 1e-6);
-        }
-    }
-
-    // Test case 2: Small but non-zero numbers
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer b.deinit();
-
-        const small: f32 = 1e-3;
-        @memset(a.data, small);
-        @memset(b.data, small);
-
-        var result = try matmul(f32, a, b, allocator);
-        defer result.deinit();
-
-        // Check results
-        for (result.data) |val| {
-            try testing.expect(!std.math.isNan(val));
-            try testing.expect(val > 0); // Should be positive
-            // For 2x2 matrices filled with 1e-3, each element should be 2 * (1e-3 * 1e-3) = 2e-6
-            try testing.expectApproxEqAbs(val, 2e-6, 1e-9);
-        }
-    }
-
-    // Test case 3: Mixed magnitudes
-    {
-        var a = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer a.deinit();
-        var b = try Tensor(f32).init(allocator, &[_]usize{ 2, 2 });
-        defer b.deinit();
-
-        // First row large, second row small
-        a.data[0] = 1e3;
-        a.data[1] = 1e3;
-        a.data[2] = 1e-3;
-        a.data[3] = 1e-3;
-
-        b.data[0] = 1e-3;
-        b.data[1] = 1e3;
-        b.data[2] = 1e-3;
-        b.data[3] = 1e3;
-
-        var result = try matmul(f32, a, b, allocator);
-        defer result.deinit();
-
-        // Check results
-        for (result.data) |val| {
-            try testing.expect(!std.math.isInf(val));
-            try testing.expect(!std.math.isNan(val));
-        }
-    }
-}
 pub fn calculateGflops(allocator: std.mem.Allocator, M: usize, N: usize, K: usize, iterations: usize) !struct { avg: f64, min: f64, max: f64, std_dev: f64 } {
     const shape_a = [_]usize{ M, K };
     const shape_b = [_]usize{ K, N };
@@ -605,54 +371,54 @@ pub fn calculateGflops(allocator: std.mem.Allocator, M: usize, N: usize, K: usiz
     return .{ .avg = avg, .min = min, .max = max, .std_dev = std_dev };
 }
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+// pub fn main() !void {
+//     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+//     defer arena.deinit();
+//     const allocator = arena.allocator();
 
-    // Define test sizes
-    const sizes = [_]struct { m: usize, n: usize, k: usize, desc: []const u8 }{
-        .{ .m = 800, .n = 6142, .k = 2048, .desc = "Actual scenario" },
-        .{ .m = 1, .n = 6142, .k = 2048, .desc = "Actual scenario 2" },
-        .{ .m = 256, .n = 256, .k = 256, .desc = "Small square" },
-        .{ .m = 512, .n = 512, .k = 512, .desc = "Medium square" },
-        .{ .m = 1024, .n = 1024, .k = 1024, .desc = "Large square" },
-        .{ .m = 1024, .n = 2048, .k = 1024, .desc = "Wide rectangle" },
-        .{ .m = 2048, .n = 2048, .k = 2048, .desc = "Very large square" },
-        .{ .m = 2048, .n = 4096, .k = 2048, .desc = "Large wide" },
-        .{ .m = 4096, .n = 4096, .k = 4096, .desc = "Huge square" },
-        .{ .m = 8192, .n = 2048, .k = 8192, .desc = "Tall large K" },
-        .{ .m = 1152, .n = 4304, .k = 1152, .desc = "Wide custom" },
-        .{ .m = 1, .n = 1, .k = 1, .desc = "Tiny 1x1" },
-        .{ .m = 1, .n = 1, .k = 2048, .desc = "Deep vector" },
-        .{ .m = 2048, .n = 1, .k = 1, .desc = "Tall vector" },
-        .{ .m = 2048, .n = 1, .k = 2048, .desc = "Tall deep vector" },
-        .{ .m = 1, .n = 2048, .k = 2048, .desc = "Wide deep vector" },
-    };
+//     // Define test sizes
+//     const sizes = [_]struct { m: usize, n: usize, k: usize, desc: []const u8 }{
+//         .{ .m = 800, .n = 6142, .k = 2048, .desc = "Actual scenario" },
+//         .{ .m = 1, .n = 6142, .k = 2048, .desc = "Actual scenario 2" },
+//         .{ .m = 256, .n = 256, .k = 256, .desc = "Small square" },
+//         .{ .m = 512, .n = 512, .k = 512, .desc = "Medium square" },
+//         .{ .m = 1024, .n = 1024, .k = 1024, .desc = "Large square" },
+//         .{ .m = 1024, .n = 2048, .k = 1024, .desc = "Wide rectangle" },
+//         .{ .m = 2048, .n = 2048, .k = 2048, .desc = "Very large square" },
+//         .{ .m = 2048, .n = 4096, .k = 2048, .desc = "Large wide" },
+//         .{ .m = 4096, .n = 4096, .k = 4096, .desc = "Huge square" },
+//         .{ .m = 8192, .n = 2048, .k = 8192, .desc = "Tall large K" },
+//         .{ .m = 1152, .n = 4304, .k = 1152, .desc = "Wide custom" },
+//         .{ .m = 1, .n = 1, .k = 1, .desc = "Tiny 1x1" },
+//         .{ .m = 1, .n = 1, .k = 2048, .desc = "Deep vector" },
+//         .{ .m = 2048, .n = 1, .k = 1, .desc = "Tall vector" },
+//         .{ .m = 2048, .n = 1, .k = 2048, .desc = "Tall deep vector" },
+//         .{ .m = 1, .n = 2048, .k = 2048, .desc = "Wide deep vector" },
+//     };
 
-    const iterations = 5;
-    var stdout = std.io.getStdOut().writer();
+//     const iterations = 5;
+//     var stdout = std.io.getStdOut().writer();
 
-    try stdout.print("\nMatMul Benchmark\n", .{});
-    try stdout.print("Configuration:\n", .{});
-    try stdout.print("  Tile size: {d}\n", .{Tile});
-    try stdout.print("  Vector size: {d}\n", .{Vec});
-    try stdout.print("  Number of threads: {d}\n", .{try std.Thread.getCpuCount()});
-    try stdout.print("  Iterations per test: {d}\n\n", .{iterations});
+//     try stdout.print("\nMatMul Benchmark\n", .{});
+//     try stdout.print("Configuration:\n", .{});
+//     try stdout.print("  Tile size: {d}\n", .{Tile});
+//     try stdout.print("  Vector size: {d}\n", .{Vec});
+//     try stdout.print("  Number of threads: {d}\n", .{try std.Thread.getCpuCount()});
+//     try stdout.print("  Iterations per test: {d}\n\n", .{iterations});
 
-    // Print header
-    try stdout.print("{s:<20} {s:<15} {s:<15} {s:<15} {s:<12} {s:<12} {s:<12} {s:<12}\n", .{ "Description", "Size", "Memory (MB)", "GFLOPS/iter", "Min", "Max", "StdDev", "GB/s" });
-    try stdout.print("{s}\n", .{"-" ** 110});
+//     // Print header
+//     try stdout.print("{s:<20} {s:<15} {s:<15} {s:<15} {s:<12} {s:<12} {s:<12} {s:<12}\n", .{ "Description", "Size", "Memory (MB)", "GFLOPS/iter", "Min", "Max", "StdDev", "GB/s" });
+//     try stdout.print("{s}\n", .{"-" ** 110});
 
-    for (sizes) |size| {
-        const memory_mb = @as(f64, @floatFromInt(size.m * size.n + size.n * size.k + size.m * size.k)) * 4.0 / (1024 * 1024);
-        const result = try calculateGflops(allocator, size.m, size.n, size.k, iterations);
+//     for (sizes) |size| {
+//         const memory_mb = @as(f64, @floatFromInt(size.m * size.n + size.n * size.k + size.m * size.k)) * 4.0 / (1024 * 1024);
+//         const result = try calculateGflops(allocator, size.m, size.n, size.k, iterations);
 
-        // Calculate memory bandwidth (GB/s)
-        const elements_accessed = size.m * size.k + size.k * size.n + size.m * size.n;
-        const bytes_accessed = elements_accessed * @sizeOf(f32);
-        const gb_per_s = @as(f64, @floatFromInt(bytes_accessed)) * @as(f64, @floatFromInt(iterations)) / 1e9;
+//         // Calculate memory bandwidth (GB/s)
+//         const elements_accessed = size.m * size.k + size.k * size.n + size.m * size.n;
+//         const bytes_accessed = elements_accessed * @sizeOf(f32);
+//         const gb_per_s = @as(f64, @floatFromInt(bytes_accessed)) * @as(f64, @floatFromInt(iterations)) / 1e9;
 
-        try stdout.print("{s:<20} {d}x{d}x{d:<7} {d:>8.1} {d:>14.1} {d:>11.1} {d:>11.1} {d:>11.2} {d:>11.1}\n", .{ size.desc, size.m, size.n, size.k, memory_mb, result.avg, result.min, result.max, result.std_dev, gb_per_s });
-    }
-}
+//         try stdout.print("{s:<20} {d}x{d}x{d:<7} {d:>8.1} {d:>14.1} {d:>11.1} {d:>11.1} {d:>11.2} {d:>11.1}\n", .{ size.desc, size.m, size.n, size.k, memory_mb, result.avg, result.min, result.max, result.std_dev, gb_per_s });
+//     }
+// }

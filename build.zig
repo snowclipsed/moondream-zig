@@ -83,12 +83,23 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(stb_image);
     b.installArtifact(stb_resize);
 
+    // ---- Benhcmark Executable ----
+    const benchmark_exe = b.addExecutable(.{
+        .name = "benchmark",
+        .root_source_file = .{ .cwd_relative = "src/core/bench.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Create specific build steps for each executable
     const build_chat_step = b.step("chat", "Build the chat client");
     build_chat_step.dependOn(&b.addInstallArtifact(chat_exe, .{}).step);
 
     const build_api_step = b.step("api", "Build the single turn client");
     build_api_step.dependOn(&b.addInstallArtifact(api_exe, .{}).step);
+
+    const build_benchmark_step = b.step("benchmark", "Build the benchmark client");
+    build_benchmark_step.dependOn(&b.addInstallArtifact(benchmark_exe, .{}).step);
 
     // Create run steps for each executable
     const run_chat_cmd = b.addRunArtifact(chat_exe);
@@ -108,6 +119,12 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the chat client (default)");
     run_step.dependOn(&run_cmd.step);
 
+    const run_benchmark_cmd = b.addRunArtifact(benchmark_exe);
+    run_benchmark_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_benchmark_cmd.addArgs(args);
+    const run_benchmark_step = b.step("run-bench", "Run the benchmark client");
+    run_benchmark_step.dependOn(&run_benchmark_cmd.step);
+
     // Tests configuration
     const test_targets = [_]std.Target.Query{
         .{}, // native
@@ -123,6 +140,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
 
     for (test_targets) |test_target| {
+        // Ops tests
         const ops_tests = b.addTest(.{
             .root_source_file = .{ .cwd_relative = "src/core/ops_test.zig" },
             .target = b.resolveTargetQuery(test_target),
@@ -134,7 +152,22 @@ pub fn build(b: *std.Build) void {
         ops_tests.linkSystemLibrary("openblas");
         ops_tests.linkLibC();
 
-        const run_tests = b.addRunArtifact(ops_tests);
-        test_step.dependOn(&run_tests.step);
+        const run_ops_tests = b.addRunArtifact(ops_tests);
+        test_step.dependOn(&run_ops_tests.step);
+
+        // Matrix multiplication tests
+        const matmul_tests = b.addTest(.{
+            .root_source_file = .{ .cwd_relative = "src/core/matmul_test.zig" },
+            .target = b.resolveTargetQuery(test_target),
+        });
+
+        // Link with necessary libraries for matmul tests
+        matmul_tests.linkLibrary(stb_image);
+        matmul_tests.linkLibrary(stb_resize);
+        matmul_tests.linkSystemLibrary("openblas");
+        matmul_tests.linkLibC();
+
+        const run_matmul_tests = b.addRunArtifact(matmul_tests);
+        test_step.dependOn(&run_matmul_tests.step);
     }
 }
