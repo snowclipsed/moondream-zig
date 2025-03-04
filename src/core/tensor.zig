@@ -98,7 +98,7 @@ pub fn Tensor(comptime DataType: type) type {
             var result = try Tensor(TargetType).init(self.allocator, self.shape);
             errdefer result.deinit();
 
-            // Handle the casting based on type combinations
+            // This handles the casting based on type combinations
             for (self.data, 0..) |value, i| {
                 result.data[i] = switch (@TypeOf(value)) {
                     // From floating point types
@@ -271,7 +271,7 @@ pub fn Tensor(comptime DataType: type) type {
             std.debug.assert(size == dst.len);
 
             if (size < 8) {
-                // Handle small arrays with scalar operations
+                // we handle small arrays with scalar operations
                 for (src, 0..) |val, i| {
                     dst[i] = @floatCast(val);
                 }

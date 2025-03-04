@@ -33,8 +33,8 @@ const HEADER_ART =
 
 // Default paths and configurations
 const DEFAULT_MODEL_PATH = "moondream.bin";
-const DEFAULT_TOKENIZER_PATH = ".tokenizer.json";
-const DEFAULT_IMAGE_PATH = "images/demo-1.jpg";
+const DEFAULT_TOKENIZER_PATH = "tokenizer.json";
+const DEFAULT_IMAGE_PATH = "images/frierenburger.png";
 const DEFAULT_PROMPT = "describe the image";
 const DEFAULT_MAX_TOKENS: usize = 200;
 
@@ -58,7 +58,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         .image_path = DEFAULT_IMAGE_PATH,
         .prompt = DEFAULT_PROMPT,
         .max_tokens = DEFAULT_MAX_TOKENS,
-        .show_stats = true,
+        .show_stats = false,
         .sampling_method = "greedy",
         .temperature = 0.5,
         .top_k = 3,
@@ -328,7 +328,9 @@ pub fn main() !void {
         const sampling_start = timer.read();
         var logits = try text_model.lm_head(result.output);
         defer logits.deinit();
-        const next_token_id = try sampling.sample(f16, &logits, sampling_config, random, allocator);
+        var logits_f32 = try logits.castWithSimd(f32);
+        defer logits_f32.deinit();
+        const next_token_id = try sampling.sample(&logits_f32, sampling_config, random, allocator);
         total_sampling_time += timer.read() - sampling_start;
 
         if (next_token_id == tokenizer.eos_token) break;

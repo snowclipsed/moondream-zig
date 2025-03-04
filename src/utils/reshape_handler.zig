@@ -68,13 +68,12 @@ pub fn normalizePatch(allocator: Allocator, input: Tensor(f16), mean: Tensor(f16
     var result = try Tensor(f16).init(allocator, input.shape);
     errdefer result.deinit();
 
-    // Now using BCHW layout
     const batch = input.shape[0];
     const channels = input.shape[1];
     const height = input.shape[2];
     const width = input.shape[3];
 
-    // Perform normalization in BCHW format
+    // Perform normalization in BCHW format (batch, channels, height, width)
     for (0..batch) |b| {
         for (0..channels) |c| {
             const c_mean = mean.data[c];

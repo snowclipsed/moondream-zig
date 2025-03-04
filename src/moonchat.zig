@@ -385,7 +385,6 @@ const ChatState = struct {
             // Reinitialize tensor with empty data
             self.image_tensor.* = try Tensor(f16).init(self.allocator, &[_]usize{ 1, model_config.dim });
 
-            // Let the caller handle the specific error
             return err;
         };
 
