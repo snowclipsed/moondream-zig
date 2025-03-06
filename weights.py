@@ -1,10 +1,75 @@
 import numpy as np
 from safetensors import safe_open
 import struct
+import os
+import requests
+from tqdm import tqdm
+from huggingface_hub import hf_hub_download
 
 # Magic number and version constants
 WEIGHTS_MAGIC = 0x4D4F4F4E  # "MOON" in ASCII
 WEIGHTS_VERSION = 2  # Version 2 for tensor format
+
+def download_file(url, filename):
+    """Download file with progress bar"""
+    response = requests.get(url, stream=True)
+    total_size = int(response.headers.get('content-length', 0))
+    
+    with open(filename, 'wb') as file, tqdm(
+            desc=filename,
+            total=total_size,
+            unit='B',
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar:
+        for data in response.iter_content(chunk_size=1024):
+            size = file.write(data)
+            bar.update(size)
+    
+    print(f"Downloaded {filename}")
+
+def download_from_hf(repo_id, filename, local_path=None):
+    """Download file from Hugging Face"""
+    if local_path is None:
+        local_path = filename
+    
+    print(f"Downloading {filename} from {repo_id}...")
+    hf_hub_download(repo_id=repo_id, filename=filename, local_dir=".", local_dir_use_symlinks=False)
+    
+    # Some files might be in subdirectories, so check and move if needed
+    if not os.path.exists(local_path) and os.path.exists(os.path.join(repo_id.split('/')[-1], filename)):
+        os.rename(os.path.join(repo_id.split('/')[-1], filename), local_path)
+        
+    print(f"Downloaded {filename}")
+
+def ensure_model_files():
+    """Ensure model.safetensors and tokenizer.json files exist"""
+    # Define the repository ID for Moondream model
+    repo_id = "vikhyatk/moondream2"
+    
+    # Check and download model.safetensors
+    if not os.path.exists("model.safetensors"):
+        try:
+            download_from_hf(repo_id, "model.safetensors")
+        except Exception as e:
+            print(f"Error downloading from Hugging Face: {e}")
+            # Fallback to direct URL if needed
+            model_url = "https://huggingface.co/vikhyatk/moondream2/resolve/main/model.safetensors"
+            download_file(model_url, "model.safetensors")
+    else:
+        print("model.safetensors already exists")
+    
+    # Check and download tokenizer.json
+    if not os.path.exists("tokenizer.json"):
+        try:
+            download_from_hf(repo_id, "tokenizer.json")
+        except Exception as e:
+            print(f"Error downloading from Hugging Face: {e}")
+            # Fallback to direct URL if needed
+            tokenizer_url = "https://huggingface.co/vikhyatk/moondream2/resolve/main/tokenizer.json"
+            download_file(tokenizer_url, "tokenizer.json")
+    else:
+        print("tokenizer.json already exists")
 
 def debug_f16_bits(name: str, value: np.float16):
     bits = value.view(np.uint16)
@@ -182,6 +247,14 @@ def convert_safetensors_to_binary(input_file, output_file):
                         f.get_tensor("model.vision.proj_mlp.fc2.bias"))
 
 if __name__ == "__main__":
+    # First ensure we have the model files
+    print("Checking for required model files...")
+    ensure_model_files()
+    
+    # Now run the conversion
     input_file = 'model.safetensors'
     output_file = 'moondream.bin'
+    print(f"\nConverting {input_file} to {output_file}...")
     convert_safetensors_to_binary(input_file, output_file)
+    
+    print(f"\nConversion complete! Output saved to {output_file}")

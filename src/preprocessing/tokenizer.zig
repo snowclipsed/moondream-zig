@@ -548,30 +548,3 @@ pub const Tokenizer = struct {
         self.thread_pool.deinit();
     }
 };
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Initialize tokenizer
-
-    // Load vocabulary from file
-    var tokenizer = try Tokenizer.fromFile("../tokenizer.bin", allocator);
-    defer tokenizer.deinit();
-    // Or load from JSON
-    // try tokenizer.fromJson("../tokenizer.json", allocator);
-
-    // Example text to encode
-    const text = "Hello, this is a test of the parallel tokenizer!";
-    var tokens = try tokenizer.encode(text);
-    defer tokens.deinit();
-
-    // Decode back to text
-    const decoded = try tokenizer.decode(tokens);
-    defer allocator.free(decoded);
-
-    // Print results
-    std.debug.print("Encoded tokens: {any}\n", .{tokens.items});
-    std.debug.print("Decoded text: {s}\n", .{decoded});
-}
