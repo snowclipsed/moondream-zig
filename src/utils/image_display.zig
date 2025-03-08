@@ -18,6 +18,7 @@ pub fn displayImage(allocator: std.mem.Allocator, image_path: []const u8, scale:
     // Check if file exists first
     const file = std.fs.cwd().openFile(image_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
+            std.debug.print("[DEBUG] Image file not found: {s}\n", .{image_path});
             return error.FileNotFound;
         }
         return err;
