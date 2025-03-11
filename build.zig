@@ -149,7 +149,6 @@ pub fn build(b: *std.Build) void {
         // Link with our static libraries for tests too
         ops_tests.linkLibrary(stb_image);
         ops_tests.linkLibrary(stb_resize);
-        ops_tests.linkSystemLibrary("openblas");
         ops_tests.linkLibC();
 
         const run_ops_tests = b.addRunArtifact(ops_tests);
@@ -164,7 +163,6 @@ pub fn build(b: *std.Build) void {
         // Link with necessary libraries for matmul tests
         matmul_tests.linkLibrary(stb_image);
         matmul_tests.linkLibrary(stb_resize);
-        matmul_tests.linkSystemLibrary("openblas");
         matmul_tests.linkLibC();
 
         const run_matmul_tests = b.addRunArtifact(matmul_tests);
