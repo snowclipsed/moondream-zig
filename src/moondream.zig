@@ -121,7 +121,7 @@ fn printUsage() !void {
         \\Options:
         \\  --model <path>       Path to model weights (default: ../moondream.bin)
         \\  --tokenizer <path>   Path to tokenizer file (default: ../tokenizer.json)
-        \\  --image <path>       Path to input image (default: ../images/demo-1.jpg)
+        \\  --image <path>       Path to input image (default: ../images/frierenburger.png)
         \\  --prompt <text>      Prompt for the model (default: "describe the image")
         \\  --max-tokens <num>   Maximum number of tokens to generate (default: 200)
         \\  --sampling <method>  Sampling method: 'greedy' or 'topk' (default: greedy)
