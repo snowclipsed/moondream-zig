@@ -246,6 +246,19 @@ def convert_safetensors_to_binary(input_file, output_file):
             write_tensor(out_f, "v_proj_fc2_b",
                         f.get_tensor("model.vision.proj_mlp.fc2.bias"))
 
+def delete_file(file_path):
+    """Delete a file if it exists and return success status"""
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            return True
+        except Exception as e:
+            print(f"Error deleting {file_path}: {e}")
+            return False
+    else:
+        print(f"File {file_path} does not exist")
+        return False
+
 if __name__ == "__main__":
     # First ensure we have the model files
     print("Checking for required model files...")
@@ -258,3 +271,10 @@ if __name__ == "__main__":
     convert_safetensors_to_binary(input_file, output_file)
     
     print(f"\nConversion complete! Output saved to {output_file}")
+    
+    # Delete the original safetensors file to save space
+    print("\nDeleting original safetensors file to save disk space...")
+    if delete_file(input_file):
+        print(f"Successfully deleted {input_file}")
+    
+    print("\nProcess complete! The converted model is available as moondream.bin and tokenizer.json is preserved.")
