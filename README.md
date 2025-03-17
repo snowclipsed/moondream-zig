@@ -82,13 +82,7 @@ or if you have built the binaries using the building from source step, you can a
 
 ```bash
 # Basic usage
-./moonchat
-
-# With configuration options
-./moonchat --model ./moondream.bin --tokenizer ./tokenizer.bin
-
-# With sampling parameters
-./moonchat --temp 0.8 --top-p 0.92 --top-k 50
+./zig-out/bin/moonchat
 ```
 
 #### Chat Configuration Options
@@ -143,7 +137,7 @@ Below are performance benchmarks comparing moondream-zig with other implementati
 | Python (Huggingface)| 5.5                           | 10.5                      |
 
 
-*Note: These benchmarks were run on consumer hardware with the model in FP16 precision. Performance may vary based on your specific hardware. Please feel free to submit your own benchmarks in an issue!*
+*Note: These benchmarks were run on consumer CPUs with the model in FP16 precision. Performance may vary based on your specific hardware. Please feel free to submit your own benchmarks in an issue!*
 
 ## File Structure
 
@@ -211,6 +205,8 @@ Contributions are welcome! Please feel free to Fork the repository submit a Pull
 - [ ] Batch processing support for higher throughput
 - [ ] AVX-512 kernel optimizations
 
+## Hire me this summer!
+
 
 ## Acknowledgements
 
@@ -219,8 +215,8 @@ This project would not have been possible without the following:
 - The [Moondream](https://github.com/vikhyat/moondream) project by Vikhyat Korrapati for the original model implementation
 - [Zig](https://ziglang.org/) programming language and community for creating an efficient systems programming language
 - The many open-source AI projects that have made vision-language models accessible
-- Shoutout to @httpslinus, @k7agar, @_vatsadev,  @seatedro, @dnbt777, @ParsaKhaz, @AdjectiveAlli, @sasuke__420, @jrysana on X for giving me ideas, testing my implementation, helping me bench my code and debugging!
-- Folks at huggingface, like Alvaro Bartolome, Arthur Zucker for their support with the tokenizer and benchmarking.
+- Shoutout to @httpslinus, @k7agar, @_vatsadev,  @seatedro, @dnbt777, @ParsaKhaz, @AdjectiveAlli, @sasuke__420, @jrysana, @qtnx_, @felix_red_panda, @kalomaze, @Aryvyo, @Guudfit and more on X for giving me ideas, testing my implementation, helping me bench my code and debugging!
+- Folks at Huggingface like Alvaro Bartolome, Arthur Zucker for their support with the tokenizer and benchmarking.
 
 This project draws inspiration from other LLM inference implementations like [llama2.c](https://github.com/karpathy/llama2.c) by Andrej Karpathy, [llama.cpp](https://github.com/ggerganov/llama.cpp) by Georgi Gerganov.
 
