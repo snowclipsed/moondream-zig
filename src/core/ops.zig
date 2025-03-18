@@ -1069,6 +1069,13 @@ pub fn layerNormYolo(comptime T: type, input: Tensor(T), weight: Tensor(T), bias
     return layerNormYoloInner(T, 6, 0, 3, false, input, weight, bias, eps);
 }
 
+pub fn layerNormYoloCheckEverything(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+    if (builtin.cpu.arch == .aarch64) {
+        return layerNormYoloInner(T, 0, 10, 3, true, input, weight, bias, eps);
+    }
+    return layerNormYoloInner(T, 6, 0, 3, true, input, weight, bias, eps);
+}
+
 pub fn layerNormYoloInner(
     comptime T: type,
     // number of unrolls of one type for welford's algorithm update
@@ -1315,16 +1322,20 @@ pub fn layerNormYoloInner(
                 const final_value = scaled + bias_val;
 
                 if (CHECK_EVERYTHING) {
-                    if (std.math.isNan(final_value)) {
-                        return error.ComputedNaN;
-                    }
-                    if (std.math.isInf(final_value)) {
-                        return error.ComputedInfinity;
+                    const check_me: [VLEN]f32 = @bitCast(final_value);
+                    for (check_me) |val| {
+                        if (std.math.isNan(val)) {
+                            return error.ComputedNaN;
+                        }
+                        if (std.math.isInf(val)) {
+                            return error.ComputedInfinity;
+                        }
                     }
                 }
 
                 // Cast back to original type T only at the end
                 out_ptr[0..VLEN].* = @as(Tv, @floatCast(final_value));
+
                 out_ptr += VLEN;
                 start_ptr += VLEN;
                 weight_ptr += VLEN;
@@ -1346,11 +1357,14 @@ pub fn layerNormYoloInner(
             const final_value = scaled + bias_val;
 
             if (CHECK_EVERYTHING) {
-                if (std.math.isNan(final_value)) {
-                    return error.ComputedNaN;
-                }
-                if (std.math.isInf(final_value)) {
-                    return error.ComputedInfinity;
+                const check_me: [VLEN]f32 = @bitCast(final_value);
+                for (check_me) |val| {
+                    if (std.math.isNan(val)) {
+                        return error.ComputedNaN;
+                    }
+                    if (std.math.isInf(val)) {
+                        return error.ComputedInfinity;
+                    }
                 }
             }
 
