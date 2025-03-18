@@ -91,6 +91,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const benchmark_layernorm_exe = b.addExecutable(.{
+        .name = "benchmark_layernorm",
+        .root_source_file = .{ .cwd_relative = "src/core/bench_layernorm.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Create specific build steps for each executable
     const build_chat_step = b.step("chat", "Build the chat client");
     build_chat_step.dependOn(&b.addInstallArtifact(chat_exe, .{}).step);
@@ -100,6 +107,9 @@ pub fn build(b: *std.Build) void {
 
     const build_benchmark_step = b.step("benchmark", "Build the benchmark client");
     build_benchmark_step.dependOn(&b.addInstallArtifact(benchmark_exe, .{}).step);
+
+    const build_benchmark_layernorm_step = b.step("benchmark_layernorm", "Build the benchmark_layernorm client");
+    build_benchmark_layernorm_step.dependOn(&b.addInstallArtifact(benchmark_layernorm_exe, .{}).step);
 
     // Create run steps for each executable
     const run_chat_cmd = b.addRunArtifact(chat_exe);

@@ -8,32 +8,34 @@ const math = std.math;
 const sgemm = @import("sgemm.zig");
 const hgemm = @import("hgemm.zig");
 const hgemm_trans = @import("hgemm_trans.zig");
+const layerNorm = @import("ops.zig").layerNorm;
+const layerNormYoloInner = @import("ops.zig").layerNormYoloInner;
 
 // Import common dependency
 const Tensor = @import("tensor.zig").Tensor;
 
 // ANSI color codes for terminal output
-const Color = struct {
-    const reset = "\x1b[0m";
-    const bold = "\x1b[1m";
-    const red = "\x1b[31m";
-    const green = "\x1b[32m";
-    const yellow = "\x1b[33m";
-    const blue = "\x1b[34m";
-    const magenta = "\x1b[35m";
-    const cyan = "\x1b[36m";
-    const white = "\x1b[37m";
-    const bright_red = "\x1b[91m";
-    const bright_green = "\x1b[92m";
-    const bright_yellow = "\x1b[93m";
-    const bright_blue = "\x1b[94m";
-    const bright_magenta = "\x1b[95m";
-    const bright_cyan = "\x1b[96m";
-    const bright_white = "\x1b[97m";
+pub const Color = struct {
+    pub const reset = "\x1b[0m";
+    pub const bold = "\x1b[1m";
+    pub const red = "\x1b[31m";
+    pub const green = "\x1b[32m";
+    pub const yellow = "\x1b[33m";
+    pub const blue = "\x1b[34m";
+    pub const magenta = "\x1b[35m";
+    pub const cyan = "\x1b[36m";
+    pub const white = "\x1b[37m";
+    pub const bright_red = "\x1b[91m";
+    pub const bright_green = "\x1b[92m";
+    pub const bright_yellow = "\x1b[93m";
+    pub const bright_blue = "\x1b[94m";
+    pub const bright_magenta = "\x1b[95m";
+    pub const bright_cyan = "\x1b[96m";
+    pub const bright_white = "\x1b[97m";
 };
 
 // Data structures
-const BenchmarkResult = struct {
+pub const BenchmarkResult = struct {
     avg_time_ns: u64,
     min_time_ns: u64,
     max_time_ns: u64,
@@ -251,7 +253,7 @@ fn benchmarkHgemmTrans(allocator: Allocator, M: usize, N: usize, K: usize, num_r
 }
 
 // Utility functions for formatting and visualization
-fn getColorForValue(value: f64, min: f64, max: f64) []const u8 {
+pub fn getColorForValue(value: f64, min: f64, max: f64) []const u8 {
     // Normalize value to 0-1 range
     const range = max - min;
     if (range <= 0.0001) return Color.yellow;
@@ -268,7 +270,7 @@ fn getColorForValue(value: f64, min: f64, max: f64) []const u8 {
     }
 }
 
-fn getInverseColorForValue(value: f64, min: f64, max: f64) []const u8 {
+pub fn getInverseColorForValue(value: f64, min: f64, max: f64) []const u8 {
     // For metrics where lower is better (like execution time)
     // Normalize and invert value to 0-1 range
     const range = max - min;
@@ -296,7 +298,7 @@ fn determineBestImpl(sgemm_gflops: f64, hgemm_gflops: f64, hgemm_trans_gflops: f
     }
 }
 
-fn printColoredValue(value: f64, color: []const u8, width: usize, precision: usize) void {
+pub fn printColoredValue(value: f64, color: []const u8, width: usize, precision: usize) void {
     // Use fixed formatting and then pad manually
     var buffer: [64]u8 = undefined;
 
@@ -323,7 +325,7 @@ fn printColoredValue(value: f64, color: []const u8, width: usize, precision: usi
     print("{s}{s}{s}", .{ color, padded_buffer[0 .. padding + formatted.len], Color.reset });
 }
 
-fn printColoredHeader(text: []const u8) void {
+pub fn printColoredHeader(text: []const u8) void {
     print("\n{s}{s}{s}{s}\n", .{ Color.bold, Color.bright_cyan, text, Color.reset });
 }
 
