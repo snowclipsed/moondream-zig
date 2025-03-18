@@ -1201,23 +1201,6 @@ pub fn layerNormYoloInner(
                 start_ptr += VLEN;
             }
         }
-        // subtract fake zeros from each state
-        if (false) {
-            const other_count: f32v = @splat(@as(f32, -N_FAKE_ZEROS));
-            const other_m: f32v = @splat(@as(f32, 0));
-            const total_n = count + other_count;
-            const selfnothern = count * other_count;
-            const total_n_rcp = @as(f32v, @splat(@as(f32, 1.0))) / total_n;
-            inline for (0..N_U) |j| {
-                @setFloatMode(.optimized);
-                const dmean = other_m - mean[j];
-                const dmean_over_n = dmean * total_n_rcp;
-                const selfnothern_dmean2_over_n = selfnothern * dmean * dmean_over_n;
-                mean[j] += other_count * dmean_over_n;
-                m2[j] += selfnothern_dmean2_over_n;
-            }
-            count += other_count;
-        }
         // tree reduction
         const n_tree_iters = @bitSizeOf(usize) - @clz(N_U - 1);
         var counts: [N_U]f32v = .{count} ** N_U;
