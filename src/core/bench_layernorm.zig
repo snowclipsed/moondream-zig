@@ -5,8 +5,8 @@ const time = std.time;
 const math = std.math;
 
 // Import the implementations
-const layerNorm = @import("ops.zig").layerNorm;
-const layerNormYoloInner = @import("ops.zig").layerNormYoloInner;
+const layerNormOld = @import("ops.zig").layerNormOld;
+const layerNormInner = @import("ops.zig").layerNormInner;
 
 // Import common dependency
 const Tensor = @import("tensor.zig").Tensor;
@@ -20,10 +20,10 @@ const Color = @import("bench.zig").Color;
 const BenchmarkResult = @import("bench.zig").BenchmarkResult;
 
 fn benchmarkSLayerNormYolo(allocator: Allocator, M: usize, K: usize, num_runs: usize) !BenchmarkResult {
-    return benchmarkSLayerNormYoloInner(10, 1, allocator, M, K, num_runs);
+    return benchmarkSLayerNormInner(10, 1, allocator, M, K, num_runs);
 }
 
-fn benchmarkSLayerNormYoloInner(comptime T: type, comptime large_unroll: usize, comptime stage2_unroll: usize, allocator: Allocator, M: usize, K: usize, num_runs: usize) !BenchmarkResult {
+fn benchmarkSLayerNormInner(comptime T: type, comptime large_unroll: usize, comptime stage2_unroll: usize, allocator: Allocator, M: usize, K: usize, num_runs: usize) !BenchmarkResult {
     // Create tensors
     var a = try Tensor(T).init(allocator, &[_]usize{ M, K });
     defer a.deinit();
@@ -47,7 +47,7 @@ fn benchmarkSLayerNormYoloInner(comptime T: type, comptime large_unroll: usize, 
     const eps = 0.00001;
 
     // Warmup run
-    var warmup = try layerNormYoloInner(T, 0, large_unroll, stage2_unroll, false, a, g, b, eps);
+    var warmup = try layerNormInner(T, 0, large_unroll, stage2_unroll, false, a, g, b, eps);
     warmup.deinit();
 
     // Benchmark runs
@@ -58,7 +58,7 @@ fn benchmarkSLayerNormYoloInner(comptime T: type, comptime large_unroll: usize, 
 
     for (0..num_runs) |_| {
         var timer = try time.Timer.start();
-        var result = try layerNormYoloInner(T, 0, large_unroll, stage2_unroll, false, a, g, b, eps);
+        var result = try layerNormInner(T, 0, large_unroll, stage2_unroll, false, a, g, b, eps);
         const elapsed = timer.read();
         result.deinit();
 
@@ -92,7 +92,7 @@ fn benchmarkSLayerNormYoloInner(comptime T: type, comptime large_unroll: usize, 
     };
 }
 
-fn benchmarkSLayerNorm(T: type, allocator: Allocator, M: usize, K: usize, num_runs: usize) !BenchmarkResult {
+fn benchmarkSLayerNormOld(T: type, allocator: Allocator, M: usize, K: usize, num_runs: usize) !BenchmarkResult {
     // Create tensors
     var a = try Tensor(T).init(allocator, &[_]usize{ M, K });
     defer a.deinit();
@@ -116,7 +116,7 @@ fn benchmarkSLayerNorm(T: type, allocator: Allocator, M: usize, K: usize, num_ru
     const eps = 0.00001;
 
     // Warmup run
-    var warmup = try layerNorm(T, a, g, b, eps);
+    var warmup = try layerNormOld(T, a, g, b, eps);
     warmup.deinit();
 
     // Benchmark runs
@@ -127,7 +127,7 @@ fn benchmarkSLayerNorm(T: type, allocator: Allocator, M: usize, K: usize, num_ru
 
     for (0..num_runs) |_| {
         var timer = try time.Timer.start();
-        var result = try layerNorm(T, a, g, b, eps);
+        var result = try layerNormOld(T, a, g, b, eps);
         const elapsed = timer.read();
         result.deinit();
 
@@ -215,7 +215,7 @@ pub fn benchmarkLayerNorm() !void {
     for (embed_dims) |dim_info| {
         print("  Benchmarking Layer Norm with embedding dimension: {d} ({s})...\n", .{ dim_info.dim, dim_info.desc });
 
-        const standard_result = try benchmarkSLayerNorm(allocator, M, dim_info.dim, num_runs);
+        const standard_result = try benchmarkSLayerNormOld(allocator, M, dim_info.dim, num_runs);
         const yolo_result = try benchmarkSLayerNormYolo(allocator, M, dim_info.dim, num_runs);
 
         try results.append(.{
@@ -604,7 +604,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         print("  Benchmarking Layer Norm for dimension: {d} ({s})...\n", .{ dim_info.dim, dim_info.desc });
 
         // First benchmark standard LayerNorm as baseline
-        const standard_result = try benchmarkSLayerNorm(T, allocator, M, dim_info.dim, num_runs);
+        const standard_result = try benchmarkSLayerNormOld(T, allocator, M, dim_info.dim, num_runs);
 
         // Create configs list for this dimension
         var configs = std.ArrayList(YoloConfig).init(allocator);
@@ -614,10 +614,10 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         inline for (10..11) |first_unroll| {
             print("    Testing first unroll factor {d}...\n", .{first_unroll});
 
-            inline for (3..4) |second_unroll| {
+            inline for (1..7) |second_unroll| {
 
                 // Benchmark YoloLN with these unroll factors
-                const yolo_result = try benchmarkSLayerNormYoloInner(
+                const yolo_result = try benchmarkSLayerNormInner(
                     T,
                     first_unroll,
                     second_unroll,

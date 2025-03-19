@@ -1060,23 +1060,23 @@ pub fn createRandomTensor(comptime T: type, allocator: std.mem.Allocator, shape:
 
 // ----------------------------------------------------------------------------
 
-pub fn layerNormYolo(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
     if (builtin.cpu.arch == .aarch64) {
         // empirically determined settings for NEON (Apple M1): N_A=0, N_B=10, N_S2 = 3
-        return layerNormYoloInner(T, 0, 10, 3, false, input, weight, bias, eps);
+        return layerNormInner(T, 0, 10, 3, false, input, weight, bias, eps);
     }
     // my guess for avx2??
-    return layerNormYoloInner(T, 6, 0, 3, false, input, weight, bias, eps);
+    return layerNormInner(T, 6, 0, 3, false, input, weight, bias, eps);
 }
 
-pub fn layerNormYoloCheckEverything(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+pub fn layerNormCheckEverything(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
     if (builtin.cpu.arch == .aarch64) {
-        return layerNormYoloInner(T, 0, 10, 3, true, input, weight, bias, eps);
+        return layerNormInner(T, 0, 10, 3, true, input, weight, bias, eps);
     }
-    return layerNormYoloInner(T, 6, 0, 3, true, input, weight, bias, eps);
+    return layerNormInner(T, 6, 0, 3, true, input, weight, bias, eps);
 }
 
-pub fn layerNormYoloInner(
+pub fn layerNormInner(
     comptime T: type,
     // number of unrolls of one type for welford's algorithm update
     comptime N_A: usize,
@@ -1400,7 +1400,7 @@ pub fn layerNormYoloInner(
     return output;
 }
 
-pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+pub fn layerNormOld(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
     // Check input stability
     try checkStability(T, input);
     try checkStability(T, weight);
