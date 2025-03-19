@@ -1129,7 +1129,7 @@ pub fn layerNormYoloInner(
     const N_FAKE_ZEROS: f32 = 100_000;
     // NOTE: not using AVX-512 until the gemms do.
     // To use AVX-512, get rid of the @min.
-    const VLEN = @min(std.simd.suggestVectorLength(f32) orelse 4, 16);
+    const VLEN = @min(std.simd.suggestVectorLength(f32) orelse 4, 8);
     const f32v = @Vector(VLEN, f32);
     const Tv = @Vector(VLEN, T);
 
