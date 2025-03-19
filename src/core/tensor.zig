@@ -34,6 +34,18 @@ pub fn Tensor(comptime DataType: type) type {
         /// Errors:
         /// - Returns an error if memory allocation for the shape or data fails.
         pub fn init(allocator: Allocator, shape: []const usize) !Self {
+            return initInner(true, allocator, shape);
+        }
+
+        pub fn initWithoutMemset(allocator: Allocator, shape: []const usize) !Self {
+            return initInner(false, allocator, shape);
+        }
+
+        fn initInner(
+            comptime memset: bool,
+            allocator: Allocator,
+            shape: []const usize,
+        ) !Self {
             var size: u128 = 1;
             for (shape) |dim| {
                 size = size * dim;
@@ -50,10 +62,12 @@ pub fn Tensor(comptime DataType: type) type {
             // Now we know size fits in usize
             const final_size: usize = @intCast(size);
             const data = try allocator.alignedAlloc(DataType, 32, final_size);
-            if (DataType == bool) {
-                @memset(data, false);
-            } else {
-                @memset(data, 0);
+            if (memset) {
+                if (DataType == bool) {
+                    @memset(data, false);
+                } else {
+                    @memset(data, 0);
+                }
             }
 
             const self = Tensor(DataType){
@@ -95,7 +109,7 @@ pub fn Tensor(comptime DataType: type) type {
         /// with checks for potential data loss.
         pub fn castTo(self: Self, comptime TargetType: type) !Tensor(TargetType) {
             // Create new tensor with same shape but target type
-            var result = try Tensor(TargetType).init(self.allocator, self.shape);
+            var result = try Tensor(TargetType).initWithoutMemset(self.allocator, self.shape);
             errdefer result.deinit();
 
             // This handles the casting based on type combinations
@@ -499,7 +513,7 @@ pub fn Tensor(comptime DataType: type) type {
 
             // Special case: 1D tensor becomes scalar (0D tensor)
             if (self.shape.len == 1) {
-                var result = try Self.init(self.allocator, &[_]usize{});
+                var result = try Self.initWithoutMemset(self.allocator, &[_]usize{});
                 result.data[0] = self.data[index];
                 return result;
             }
@@ -518,7 +532,7 @@ pub fn Tensor(comptime DataType: type) type {
             }
 
             // Create new tensor with reduced dimensions
-            var result = try Self.init(self.allocator, new_shape);
+            var result = try Self.initWithoutMemset(self.allocator, new_shape);
             errdefer result.deinit();
             self.allocator.free(new_shape);
 
@@ -629,7 +643,7 @@ pub fn Tensor(comptime DataType: type) type {
             }
 
             // Create new tensor with calculated shape
-            var result = try Self.init(self.allocator, new_shape);
+            var result = try Self.initWithoutMemset(self.allocator, new_shape);
             errdefer result.deinit();
 
             // Calculate strides for the original tensor
@@ -694,8 +708,13 @@ pub fn Tensor(comptime DataType: type) type {
         }
 
         pub fn copy(self: Self) !Self {
-            const new_tensor = try Self.init(self.allocator, self.shape);
+            const new_tensor = try Self.initWithoutMemset(self.allocator, self.shape);
             @memcpy(new_tensor.data, self.data);
+            return new_tensor;
+        }
+
+        pub fn copyShape(self: Self) !Self {
+            const new_tensor = try Self.initWithoutMemset(self.allocator, self.shape);
             return new_tensor;
         }
 
@@ -1322,7 +1341,7 @@ pub fn TensorView(comptime DataType: type) type {
 
         /// Convert view back to owned tensor (copies data)
         pub fn toTensor(self: Self) !Tensor(DataType) {
-            var result = try Tensor(DataType).init(self.allocator, self.shape);
+            var result = try Tensor(DataType).initWithoutMemset(self.allocator, self.shape);
             errdefer result.deinit();
 
             // Copy data using view's layout
@@ -1445,7 +1464,7 @@ pub fn TensorView(comptime DataType: type) type {
         /// Add to TensorView struct
         pub fn toContiguousTensor(self: Self) !Tensor(DataType) {
             // Create new tensor with current shape
-            var result = try Tensor(DataType).init(self.allocator, self.shape);
+            var result = try Tensor(DataType).initWithoutMemset(self.allocator, self.shape);
             errdefer result.deinit();
 
             // Copy data using view's layout
