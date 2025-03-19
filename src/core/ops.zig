@@ -1293,36 +1293,40 @@ pub fn layerNormYoloInner(
         const rcp_std_dev_v: f32v = @splat(@as(f32, rcp_std_dev));
         while (@intFromPtr(start_ptr) < @intFromPtr(end_ptr)) {
             @setFloatMode(.optimized);
-            inline for (0..N_S2) |_| {
+            var input_val: [N_S2]f32v = undefined;
+            var weight_val: [N_S2]f32v = undefined;
+            var bias_val: [N_S2]f32v = undefined;
+            var final_value: [N_S2]f32v = undefined;
+            inline for (0..N_S2) |j| {
                 // Cast all values to f32 for intermediate calculations
-                const input_val: f32v = @floatCast(@as(Tv, start_ptr[0..VLEN].*));
-                const weight_val: f32v = @floatCast(@as(Tv, weight_ptr[0..VLEN].*));
-                const bias_val: f32v = @floatCast(@as(Tv, bias_ptr[0..VLEN].*));
-
+                input_val[j] = @floatCast(@as(Tv, start_ptr[0..VLEN].*));
+                weight_val[j] = @floatCast(@as(Tv, weight_ptr[0..VLEN].*));
+                bias_val[j] = @floatCast(@as(Tv, bias_ptr[0..VLEN].*));
+                start_ptr = start_ptr + VLEN;
+                weight_ptr = weight_ptr + VLEN;
+                bias_ptr = bias_ptr + VLEN;
+            }
+            inline for (0..N_S2) |j| {
                 // Perform normalization in f32
-                const normalized = (input_val - mean_v) * rcp_std_dev_v;
-                const scaled = normalized * weight_val;
-                const final_value = scaled + bias_val;
-
-                if (CHECK_EVERYTHING) {
-                    const check_me: [VLEN]f32 = @bitCast(final_value);
-                    for (check_me) |val| {
-                        if (std.math.isNan(val)) {
-                            return error.ComputedNaN;
-                        }
-                        if (std.math.isInf(val)) {
-                            return error.ComputedInfinity;
-                        }
+                const normalized = (input_val[j] - mean_v) * rcp_std_dev_v;
+                const scaled = normalized * weight_val[j];
+                final_value[j] = scaled + bias_val[j];
+            }
+            if (CHECK_EVERYTHING) {
+                const check_me: [VLEN*N_S2]f32 = @bitCast(final_value);
+                for (check_me) |val| {
+                    if (std.math.isNan(val)) {
+                        return error.ComputedNaN;
+                    }
+                    if (std.math.isInf(val)) {
+                        return error.ComputedInfinity;
                     }
                 }
-
+            }
+            inline for (0..N_S2) |j| {
                 // Cast back to original type T only at the end
-                out_ptr[0..VLEN].* = @as(Tv, @floatCast(final_value));
-
+                out_ptr[0..VLEN].* = @as(Tv, @floatCast(final_value[j]));
                 out_ptr += VLEN;
-                start_ptr += VLEN;
-                weight_ptr += VLEN;
-                bias_ptr += VLEN;
             }
         }
         end_ptr = input.data.ptr + end_idx;
