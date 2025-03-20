@@ -97,7 +97,9 @@ const ThreadContext = struct {
 };
 
 fn workerThread(ctx: ThreadContext) void {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
+
     var local_C: [T][T]f32 align(AVX2_ALIGNMENT) = undefined;
 
     while (true) {
@@ -177,7 +179,9 @@ fn computeTile(
     j_end: usize,
     k_end: usize,
 ) void {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
+
     var A_local: [T][T]f32 align(32) = undefined;
     var B_local: [T][T]f32 align(32) = undefined;
 
@@ -355,7 +359,9 @@ fn computeTile(
 //  * this function to multiply them with f16 inputs.
 
 pub fn matmul(a: Tensor(f16), b: Tensor(f16), allocator: Allocator) !Tensor(f16) {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
+
     const A_shape = a.shape;
     const B_shape = b.shape;
 

@@ -56,6 +56,7 @@ comptime {
 
 // Core computation for vector chunk
 fn processVectorChunk(start_n: usize, end_n: usize, a: []const f16, b_t: []const f16, c: []f16, K: usize) void {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
 
     for (start_n..end_n) |n| {
@@ -101,6 +102,8 @@ fn processVectorChunk(start_n: usize, end_n: usize, a: []const f16, b_t: []const
 
 // Vector-matrix multiplication worker
 fn vectorWorker(ctx: VectorThreadContext) void {
+    @setFloatMode(.optimized);
+
     while (true) {
         const chunk_idx = ctx.shared_counter.current_index.fetchAdd(1, .seq_cst);
         if (chunk_idx >= ctx.total_chunks) break;
@@ -126,7 +129,9 @@ fn computeTile(
     K: usize,
     N: usize,
 ) void {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
+
     var local_C: [T][T]f32 align(32) = undefined;
     var A_local: [T][T]f32 align(32) = undefined;
     var B_local: [T][T]f32 align(32) = undefined;
@@ -241,7 +246,9 @@ fn computeTileTransposed(
     j_end: usize,
     k_end: usize,
 ) void {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
+
     var A_local: [T][T]f32 align(32) = undefined;
     var B_local: [T][T]f32 align(32) = undefined;
 
@@ -332,7 +339,9 @@ fn computeTileTransposed(
 }
 // Regular matrix multiplication worker
 fn matmulWorker(ctx: ThreadContext) void {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
+
     var local_C: [T][T]f32 align(32) = undefined;
 
     while (true) {
@@ -371,7 +380,9 @@ fn matmulWorker(ctx: ThreadContext) void {
 }
 
 pub fn matmul(a: Tensor(f16), b_transposed: Tensor(f16), allocator: Allocator) !Tensor(f16) {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
+
     const A_shape = a.shape;
     const B_t_shape = b_transposed.shape;
 
@@ -460,6 +471,7 @@ pub fn matmul(a: Tensor(f16), b_transposed: Tensor(f16), allocator: Allocator) !
 
 // Internal implementation that works on slices
 fn matmulImpl(allocator: Allocator, a: []const f16, b_t: []const f16, c: []f16, M: usize, K: usize, N: usize) !void {
+    @setFloatMode(.optimized);
     @setRuntimeSafety(false);
 
     // Fast path for vector-matrix multiplication
@@ -521,6 +533,8 @@ fn matmulImpl(allocator: Allocator, a: []const f16, b_t: []const f16, c: []f16, 
     for (thread_pool.items) |thread| thread.join();
 }
 pub fn transpose(allocator: std.mem.Allocator, tensor: Tensor(f16)) !Tensor(f16) {
+    @setFloatMode(.optimized);
+
     const shape = tensor.shape;
     var result = try Tensor(f16).init(allocator, &[_]usize{ shape[1], shape[0] });
     errdefer result.deinit();
