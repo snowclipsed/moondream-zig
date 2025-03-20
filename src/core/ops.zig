@@ -1099,15 +1099,16 @@ inline fn welfordAddOneArr(
 ) void {
     @setFloatMode(.optimized);
     const N = N_A + N_B;
-    var x: [N]@Vector(VLEN, T) = undefined;
+    const Tv = @Vector(VLEN, T);
+    var x: [N]Tv = undefined;
     inline for (0..N) |i| {
         x[i] = xptr[i*VLEN..(i+1)*VLEN].*;
     }
-    var delta: [N]@Vector(VLEN, T) = undefined;
+    var delta: [N]Tv = undefined;
     inline for (0..N) |i| {
         delta[N-1-i] = x[N-1-i] - mean[N-1-i];
     }
-    var delta2: [N]@Vector(VLEN, T) = undefined;
+    var delta2: [N]Tv = undefined;
     inline for (0..N_B) |i| {
         delta2[N-1-i] = delta[N-1-i] * delta[N-1-i];
     }
@@ -1295,6 +1296,7 @@ pub fn layerNormInner(
             return error.ZeroStandardDeviation;
         }
         const rcp_std_dev = 1.0 / std_dev;
+        const mean_over_std_dev = smean[0] * rcp_std_dev;
 
         // Normalize and apply scale and bias
         // Do computations in f32 and cast back to T at the end
@@ -1304,7 +1306,7 @@ pub fn layerNormInner(
         var weight_ptr: [*]T = weight.data.ptr;
         var bias_ptr: [*]T = bias.data.ptr;
         var out_ptr: [*]T = output.data.ptr + start_idx;
-        const mean_v: f32v = @splat(@as(f32, smean[0]));
+        const mean_over_std_dev_v: f32v = @splat(@as(f32, mean_over_std_dev));
         const rcp_std_dev_v: f32v = @splat(@as(f32, rcp_std_dev));
         while (@intFromPtr(start_ptr) < @intFromPtr(end_ptr)) {
             @setFloatMode(.optimized);
@@ -1323,7 +1325,7 @@ pub fn layerNormInner(
             }
             inline for (0..N_S2) |j| {
                 // Perform normalization in f32
-                final_value[j] = (input_val[j] - mean_v) * rcp_std_dev_v;
+                final_value[j] = input_val[j] * rcp_std_dev_v - mean_over_std_dev_v;
             }
             inline for (0..N_S2) |j| {
                 final_value[j] = final_value[j] * weight_val[j] + bias_val[j];
@@ -1355,9 +1357,8 @@ pub fn layerNormInner(
             const bias_val: f32v = @floatCast(@as(Tv, bias_ptr[0..VLEN].*));
 
             // Perform normalization in f32
-            const normalized = (input_val - mean_v) * rcp_std_dev_v;
-            const scaled = normalized * weight_val;
-            const final_value = scaled + bias_val;
+            const normalized = input_val * rcp_std_dev_v - mean_over_std_dev_v;
+            const final_value = normalized * weight_val + bias_val;
 
             if (CHECK_EVERYTHING) {
                 const check_me: [VLEN]f32 = @bitCast(final_value);
@@ -1387,9 +1388,8 @@ pub fn layerNormInner(
             const bias_val: f32 = @floatCast(bias_ptr[0]);
 
             // Perform normalization in f32
-            const normalized = (input_val - smean[0]) * rcp_std_dev;
-            const scaled = normalized * weight_val;
-            const final_value = scaled + bias_val;
+            const normalized = input_val * rcp_std_dev - mean_over_std_dev;
+            const final_value = normalized * weight_val + bias_val;
 
             // Check for stability of computed value
             if (CHECK_EVERYTHING) {
