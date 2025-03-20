@@ -5,6 +5,7 @@ const time = std.time;
 const math = std.math;
 
 // Import the implementations
+const layerNormOldF64 = @import("ops.zig").layerNormOldF64;
 const layerNormOld = @import("ops.zig").layerNormOld;
 const layerNormInner = @import("ops.zig").layerNormInner;
 
@@ -47,7 +48,7 @@ fn benchmarkSLayerNormInner(comptime T: type, comptime large_unroll: usize, comp
     const eps = 0.00001;
 
     // Warmup run
-    var warmup = try layerNormInner(T, 0, large_unroll, stage2_unroll, false, a, g, b, eps);
+    var warmup = try layerNormInner(T, large_unroll, large_unroll, stage2_unroll, false, a, g, b, eps);
     warmup.deinit();
 
     // Benchmark runs
@@ -58,7 +59,7 @@ fn benchmarkSLayerNormInner(comptime T: type, comptime large_unroll: usize, comp
 
     for (0..num_runs) |_| {
         var timer = try time.Timer.start();
-        var result = try layerNormInner(T, 0, large_unroll, stage2_unroll, false, a, g, b, eps);
+        var result = try layerNormInner(T, large_unroll, large_unroll, stage2_unroll, false, a, g, b, eps);
         const elapsed = timer.read();
         result.deinit();
 
@@ -68,14 +69,14 @@ fn benchmarkSLayerNormInner(comptime T: type, comptime large_unroll: usize, comp
 
         // Calculate GFLOPS for this run
         const seconds = @as(f64, @floatFromInt(elapsed)) / 1e9;
-        const ops = 14 * M * K;
+        const ops = 10 * M * K;
         const gflops = @as(f64, @floatFromInt(ops)) / seconds / 1e9;
         max_gflops = @max(max_gflops, gflops);
     }
 
     const avg_time = total_time / num_runs;
-    const avg_seconds = @as(f64, @floatFromInt(avg_time)) / 1e9;
-    const ops = 14 * M * K;
+    const avg_seconds = @as(f64, @floatFromInt(min_time)) / 1e9;
+    const ops = 10 * M * K;
     const avg_gflops = @as(f64, @floatFromInt(ops)) / avg_seconds / 1e9;
 
     // Calculate memory bandwidth
@@ -126,6 +127,7 @@ fn benchmarkSLayerNormOld(T: type, allocator: Allocator, M: usize, K: usize, num
     var max_gflops: f64 = 0;
 
     for (0..num_runs) |_| {
+        //_ = try layerNormOldF64(T, a, g, b, eps);
         var timer = try time.Timer.start();
         var result = try layerNormOld(T, a, g, b, eps);
         const elapsed = timer.read();
@@ -137,14 +139,14 @@ fn benchmarkSLayerNormOld(T: type, allocator: Allocator, M: usize, K: usize, num
 
         // Calculate GFLOPS for this run
         const seconds = @as(f64, @floatFromInt(elapsed)) / 1e9;
-        const ops = 14 * M * K;
+        const ops = 10 * M * K;
         const gflops = @as(f64, @floatFromInt(ops)) / seconds / 1e9;
         max_gflops = @max(max_gflops, gflops);
     }
 
     const avg_time = total_time / num_runs;
     const avg_seconds = @as(f64, @floatFromInt(avg_time)) / 1e9;
-    const ops = 14 * M * K;
+    const ops = 10 * M * K;
     const avg_gflops = @as(f64, @floatFromInt(ops)) / avg_seconds / 1e9;
 
     // Calculate memory bandwidth
@@ -611,11 +613,10 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
 
         // Now run grid search over unroll factors (first_unroll, second_unroll)
         // Total unroll will range from 0 to 8, divided between first and second unroll
-        inline for (10..11) |first_unroll| {
+        inline for (8..9) |first_unroll| {
             print("    Testing first unroll factor {d}...\n", .{first_unroll});
 
-            inline for (3..4) |second_unroll| {
-
+            inline for (4..5) |second_unroll| {
                 // Benchmark YoloLN with these unroll factors
                 const yolo_result = try benchmarkSLayerNormInner(
                     T,
@@ -672,8 +673,8 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
 
     for (all_results.items) |dim_result| {
         // Check standard
-        min_gflops = @min(min_gflops, dim_result.standard.avg_gflops);
-        max_gflops = @max(max_gflops, dim_result.standard.avg_gflops);
+        min_gflops = @min(min_gflops, dim_result.standard.max_gflops);
+        max_gflops = @max(max_gflops, dim_result.standard.max_gflops);
 
         const standard_ms = @as(f64, @floatFromInt(dim_result.standard.min_time_ns)) / 1e6;
         min_time = @min(min_time, standard_ms);
@@ -683,12 +684,12 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
 
         // Check all configs
         for (dim_result.configs.items) |config| {
-            min_gflops = @min(min_gflops, config.result.avg_gflops);
-            max_gflops = @max(max_gflops, config.result.avg_gflops);
+            min_gflops = @min(min_gflops, config.result.max_gflops);
+            max_gflops = @max(max_gflops, config.result.max_gflops);
             min_bandwidth = @min(min_bandwidth, config.result.avg_bandwidth_gbps);
             max_bandwidth = @max(max_bandwidth, config.result.avg_bandwidth_gbps);
 
-            const speedup = config.result.avg_gflops / dim_result.standard.avg_gflops;
+            const speedup = config.result.max_gflops / dim_result.standard.max_gflops;
             min_speedup = @min(min_speedup, speedup);
             max_speedup = @max(max_speedup, speedup);
 
@@ -705,18 +706,18 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         var best_gflops: f64 = 0;
 
         for (dim_result.configs.items, 0..) |config, i| {
-            if (config.result.avg_gflops > best_gflops) {
-                best_gflops = config.result.avg_gflops;
+            if (config.result.max_gflops > best_gflops) {
+                best_gflops = config.result.max_gflops;
                 best_config_idx = i;
             }
         }
 
         const best_config = dim_result.configs.items[best_config_idx];
-        const speedup = best_config.result.avg_gflops / dim_result.standard.avg_gflops;
+        const speedup = best_config.result.max_gflops / dim_result.standard.max_gflops;
         const config_ms = @as(f64, @floatFromInt(best_config.result.min_time_ns)) / 1e6;
 
         // Get colors based on performance
-        const gflops_color = getColorForValue(best_config.result.avg_gflops, min_gflops, max_gflops);
+        const gflops_color = getColorForValue(best_config.result.max_gflops, min_gflops, max_gflops);
         const speedup_color = getColorForValue(speedup, min_speedup, max_speedup);
         const time_color = getInverseColorForValue(config_ms, min_time, max_time);
 
@@ -735,7 +736,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         });
 
         // Performance columns with color
-        printColoredValue(best_config.result.avg_gflops, gflops_color, 15, 1);
+        printColoredValue(best_config.result.max_gflops, gflops_color, 15, 1);
         print(" │ ", .{});
         printColoredValue(speedup, speedup_color, 15, 2);
         print("x │ ", .{});
@@ -773,7 +774,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         const standard_ms = @as(f64, @floatFromInt(dim_result.standard.min_time_ns)) / 1e6;
 
         print("│ {s}{s:^15}{s} │ ", .{ Color.blue, "Standard LN", Color.reset });
-        printColoredValue(dim_result.standard.avg_gflops, getColorForValue(dim_result.standard.avg_gflops, min_gflops, max_gflops), 15, 1);
+        printColoredValue(dim_result.standard.max_gflops, getColorForValue(dim_result.standard.max_gflops, min_gflops, max_gflops), 15, 1);
         print(" │ ", .{});
         printColoredValue(standard_ms, getInverseColorForValue(standard_ms, min_time, max_time), 15, 2);
         print(" │ {s}{s:^15}{s} │ ", .{ Color.white, "baseline", Color.reset });
@@ -799,7 +800,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
 
         for (configs_sorted) |config| {
             const config_ms = @as(f64, @floatFromInt(config.result.min_time_ns)) / 1e6;
-            const speedup = config.result.avg_gflops / dim_result.standard.avg_gflops;
+            const speedup = config.result.max_gflops / dim_result.standard.max_gflops;
 
             // Format the config string
             var config_buf: [32]u8 = undefined;
@@ -808,14 +809,14 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
             }) catch unreachable;
 
             // Get colors
-            const gflops_color = getColorForValue(config.result.avg_gflops, min_gflops, max_gflops);
+            const gflops_color = getColorForValue(config.result.max_gflops, min_gflops, max_gflops);
             const time_color = getInverseColorForValue(config_ms, min_time, max_time);
             const speedup_color = getColorForValue(speedup, min_speedup, max_speedup);
             const bandwidth_color = getColorForValue(config.result.avg_bandwidth_gbps, 0, max_bandwidth);
 
             // Print row
             print("│ {s:^15} │ ", .{config_str});
-            printColoredValue(config.result.avg_gflops, gflops_color, 15, 1);
+            printColoredValue(config.result.max_gflops, gflops_color, 15, 1);
             print(" │ ", .{});
             printColoredValue(config_ms, time_color, 15, 2);
             print(" │ ", .{});
@@ -867,14 +868,14 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         var best_gflops: f64 = 0;
 
         for (dim_result.configs.items, 0..) |config, i| {
-            if (config.result.avg_gflops > best_gflops) {
-                best_gflops = config.result.avg_gflops;
+            if (config.result.max_gflops > best_gflops) {
+                best_gflops = config.result.max_gflops;
                 best_config_idx = i;
             }
         }
 
         const best_config = dim_result.configs.items[best_config_idx];
-        const speedup = best_config.result.avg_gflops / dim_result.standard.avg_gflops;
+        const speedup = best_config.result.max_gflops / dim_result.standard.max_gflops;
 
         // Add to power_configs
         if (power_configs.getPtr(power)) |config| {
@@ -1014,7 +1015,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
                     if (config.first_unroll + config.second_unroll == total_unroll and
                         config.first_unroll == first_unroll) {
                         sample_count += 1;
-                        total_speedup += config.result.avg_gflops / dim_result.standard.avg_gflops;
+                        total_speedup += config.result.max_gflops / dim_result.standard.max_gflops;
                     }
                 }
             }
