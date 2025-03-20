@@ -2,6 +2,8 @@ const std = @import("std");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
+const Mutex = Thread.Mutex;
+const Condition = Thread.Condition;
 const sgemminplace = @import("../core/sgemm_inplace.zig").matmul;
 const softmax = @import("ops.zig").softmax;
 
@@ -559,42 +561,9 @@ const HeadContext = struct {
     workspace: *SingleHeadWorkspace,
 };
 
-/// Worker function for parallel processing of attention heads during single-token generation.
-///
-/// This function is specifically optimized for the critical path of autoregressive inference
-/// where a single new token query attends to all previous key-value pairs. The implementation
-/// contains numerous performance optimizations that make it especially efficient for this case.
-///
-/// Performance optimizations:
-/// - SIMD vectorization: Uses explicit SIMD types (SimdF16x8, SimdF32x8) to process 8 elements
-///   simultaneously, maximizing CPU vector unit utilization
-/// - Mixed precision: Computes in f32 for numerical stability but stores in f16 for memory efficiency
-/// - Compile-time constants: Uses MODEL_HEAD_DIM, HEAD_DIM_CHUNKS, and SIMD_WIDTH as compile-time
-///   constants to enable aggressive compiler optimizations
-/// - Branchless softmax: Implements softmax using branchless operations to avoid pipeline stalls
-/// - Memory alignment: Ensures proper alignment for SIMD operations with explicit pointer casting
-/// - Loop unrolling: Uses inline for loops to force unrolling of the inner loops across SIMD chunks
-/// - Direct memory access: Avoids unnecessary copies through direct, aligned pointer manipulation
-///
-/// Why it works well for single-token generation:
-/// 1. Predictable access patterns: With exactly one query token, memory access patterns are
-///    highly predictable, allowing for optimal prefetching and cache utilization
-/// 2. No matrix multiplication: Replaces general matrix multiplication with direct dot products,
-///    eliminating overhead for this specific case
-/// 3. SIMD-friendly dimensions: Model dimensions are typically multiples of SIMD width,
-///    enabling perfect vectorization without remainder handling
-/// 4. Minimal branching: Critical loops contain minimal conditional logic, reducing branch
-///    mispredictions in the processor pipeline
-/// 5. Workspace reuse: Uses pre-allocated thread-local workspaces, eliminating allocation
-///    overhead during the latency-sensitive generation phase
-///
-/// Parameters:
-///     ctx: HeadContext - Contains pointers to input/output tensors and thread-specific workspaces
-///
-/// Thread safety:
-///     Designed to be called from multiple threads simultaneously, with each thread processing
-///     different attention heads using thread-local workspaces.
 fn processHeads(ctx: HeadContext) void {
+    @setFloatMode(.optimized);
+
     const scores = &ctx.workspace.scores;
     const out_head = &ctx.workspace.out_head;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(MODEL_HEAD_DIM)));
@@ -672,56 +641,121 @@ fn processHeads(ctx: HeadContext) void {
     }
 }
 
-/// Performs single-token masked scaled dot-product attention optimized for the token generation phase.
-///
-/// This function implements a specialized version of the attention mechanism specifically designed
-/// for the "hot path" of autoregressive token generation, where a single new token query attends
-/// to all previous key-value pairs with masking.
-///
-/// Unlike the multi-headed general attention, this function:
-/// - Processes exactly one token query per head (middle dimension is always 1)
-/// - Uses masked attention to prevent attending to future positions
-/// - Employs global pre-allocated workspaces to eliminate allocation overhead
-/// - Enforces a maximum sequence length (MAX_KV_LEN) for safety and optimization
-/// - Uses model-specific constants (MODEL_N_HEADS, MODEL_HEAD_DIM) for specialized execution
-///
-/// Performance optimizations:
-/// - Zero dynamic allocations during computation (only one for the output tensor)
-/// - Global workspaces eliminate memory allocation during the critical inference path
-/// - Thread-level parallelism across attention heads
-/// - Bounds-checking to prevent sequence length overflow
-/// - Fixed thread count upper limit to prevent excessive threading overhead
-/// - Balanced head distribution across available CPU cores
-///
-/// This implementation is specifically designed for inference-time token generation where
-/// latency is critical and the pattern of computation is highly predictable.
-///
-/// Parameters:
-///     query: Tensor(f16) - Query tensor with shape [MODEL_N_HEADS, 1, MODEL_HEAD_DIM]
-///     key: Tensor(f16) - Key tensor with shape [MODEL_N_HEADS, kv_len, MODEL_HEAD_DIM]
-///     value: Tensor(f16) - Value tensor with shape [MODEL_N_HEADS, kv_len, MODEL_HEAD_DIM]
-///     mask: Tensor(bool) - Attention mask tensor with shape [1, kv_len]
-///     allocator: Allocator - Memory allocator for output tensor
-///
-/// Returns:
-///     Tensor(f16) - Output tensor with shape [MODEL_N_HEADS, 1, MODEL_HEAD_DIM]
-///
-/// Errors:
-///     - SequenceTooLong if kv_len exceeds MAX_KV_LEN
-///     - OutOfMemory if allocator fails to allocate output tensor
-///     - ThreadCreationFailure if thread spawning fails
-///
-/// Thread safety:
-///     This function is thread-safe for inference but assumes global_workspaces are not
-///     concurrently accessed by other functions. Not safe for concurrent model inference.
-///
-/// Example:
-///     ```
-///     var next_token_embedding = try singleMaskedSDPA(
-///         query_tensor, cached_keys, cached_values, attention_mask, allocator
-///     );
-///     defer next_token_embedding.deinit();
-///
+/// Persistent thread pool for attention head processing
+pub const ThreadPool = struct {
+    threads: [MAX_THREADS]Thread,
+    head_contexts: [MAX_THREADS]?*HeadContext,
+    mutex: Mutex = .{},
+    work_signal: Condition = .{},
+    complete_signal: Condition = .{},
+    tasks_remaining: usize = 0,
+    shutdown: bool = false,
+    initialized: bool = false,
+    thread_count: usize = 0,
+
+    /// Initialize the thread pool with worker threads
+    pub fn init(self: *ThreadPool) !void {
+        if (self.initialized) return;
+
+        self.thread_count = @min(MODEL_N_HEADS, try Thread.getCpuCount());
+
+        // Initialize head contexts to null
+        for (0..MAX_THREADS) |i| {
+            self.head_contexts[i] = null;
+        }
+
+        // Create worker threads
+        for (0..self.thread_count) |i| {
+            self.threads[i] = try Thread.spawn(.{}, workerFunction, .{ self, i });
+        }
+
+        self.initialized = true;
+    }
+
+    /// Shut down the thread pool
+    pub fn deinit(self: *ThreadPool) void {
+        if (!self.initialized) return;
+
+        // Signal threads to shut down
+        self.mutex.lock();
+        self.shutdown = true;
+        self.work_signal.broadcast();
+        self.mutex.unlock();
+
+        // Wait for all threads to terminate
+        for (0..self.thread_count) |i| {
+            self.threads[i].join();
+        }
+
+        self.initialized = false;
+    }
+
+    /// Submit a batch of head contexts to be processed in parallel
+    pub fn processHeads(self: *ThreadPool, contexts: []HeadContext) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Assign contexts to worker threads
+        for (0..contexts.len) |i| {
+            self.head_contexts[i] = &contexts[i];
+        }
+
+        // Set tasks counter
+        self.tasks_remaining = contexts.len;
+
+        // Signal workers to start processing
+        self.work_signal.broadcast();
+
+        // Wait for all tasks to complete
+        while (self.tasks_remaining > 0) {
+            self.complete_signal.wait(&self.mutex);
+        }
+    }
+};
+
+/// Worker thread function
+fn workerFunction(pool: *ThreadPool, thread_id: usize) void {
+    while (true) {
+        // Wait for work
+        pool.mutex.lock();
+
+        while (pool.head_contexts[thread_id] == null and !pool.shutdown) {
+            pool.work_signal.wait(&pool.mutex);
+        }
+
+        // Check for shutdown signal
+        if (pool.shutdown) {
+            pool.mutex.unlock();
+            break;
+        }
+
+        // Get task context
+        const ctx = pool.head_contexts[thread_id].?;
+        pool.mutex.unlock();
+
+        // Process the heads
+        processHeads(ctx.*);
+
+        // Mark task as complete
+        pool.mutex.lock();
+        pool.head_contexts[thread_id] = null;
+        pool.tasks_remaining -= 1;
+
+        // Signal completion if all tasks are done
+        if (pool.tasks_remaining == 0) {
+            pool.complete_signal.signal();
+        }
+        pool.mutex.unlock();
+    }
+}
+
+// Global thread pool instance
+var global_thread_pool: ThreadPool = .{
+    .threads = undefined,
+    .head_contexts = undefined,
+};
+
+/// Drop-in replacement for singleMaskedSDPA that uses a persistent thread pool
 pub fn singleMaskedSDPA(
     query: Tensor(f16),
     key: Tensor(f16),
@@ -729,24 +763,29 @@ pub fn singleMaskedSDPA(
     mask: Tensor(bool),
     allocator: Allocator,
 ) !Tensor(f16) {
+    @setFloatMode(.optimized);
+
     const kv_len = key.shape[1];
     if (kv_len > MAX_KV_LEN) return error.SequenceTooLong;
+
+    // Initialize thread pool if needed
+    if (!global_thread_pool.initialized) {
+        try global_thread_pool.init();
+    }
 
     // Initialize output tensor (only allocation we need)
     var out = try Tensor(f16).init(allocator, &[_]usize{ MODEL_N_HEADS, 1, MODEL_HEAD_DIM });
     errdefer out.deinit();
 
-    // Set up threads
-    const thread_count = @min(MODEL_N_HEADS, try Thread.getCpuCount());
-    var threads: [MAX_THREADS]Thread = undefined;
+    // Prepare task contexts
     var contexts: [MAX_THREADS]HeadContext = undefined;
+    const thread_count = global_thread_pool.thread_count;
 
-    // Distribute work
+    // Distribute work (same as original)
     const heads_per_thread = MODEL_N_HEADS / thread_count;
     const remaining_heads = MODEL_N_HEADS % thread_count;
     var current_head: usize = 0;
 
-    // Launch threads
     for (0..thread_count) |t| {
         const start_head = current_head;
         const extra_head: usize = if (t < remaining_heads) 1 else 0;
@@ -763,14 +802,17 @@ pub fn singleMaskedSDPA(
             .kv_len = kv_len,
             .workspace = &global_workspaces[t],
         };
-
-        threads[t] = try Thread.spawn(.{}, processHeads, .{contexts[t]});
     }
 
-    // Wait for completion
-    for (threads[0..thread_count]) |thread| {
-        thread.join();
-    }
+    // Use thread pool instead of creating new threads
+    global_thread_pool.processHeads(contexts[0..thread_count]);
 
     return out;
+}
+
+// Add this to model teardown code
+pub fn cleanupThreadPool() void {
+    if (global_thread_pool.initialized) {
+        global_thread_pool.deinit();
+    }
 }
