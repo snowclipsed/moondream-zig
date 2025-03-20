@@ -614,7 +614,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         inline for (10..11) |first_unroll| {
             print("    Testing first unroll factor {d}...\n", .{first_unroll});
 
-            inline for (1..7) |second_unroll| {
+            inline for (3..4) |second_unroll| {
 
                 // Benchmark YoloLN with these unroll factors
                 const yolo_result = try benchmarkSLayerNormInner(

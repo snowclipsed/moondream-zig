@@ -1076,6 +1076,35 @@ pub fn layerNormCheckEverything(comptime T: type, input: Tensor(T), weight: Tens
     return layerNormInner(T, 6, 0, 3, true, input, weight, bias, eps);
 }
 
+inline fn welfordAddOneA(x: anytype, rcp: @TypeOf(x), mean: *@TypeOf(x), m2: *@TypeOf(x)) void {
+    @setFloatMode(.optimized);
+    const delta = x - mean.*;
+    mean.* += delta * rcp;
+    const delta2 = x - mean.*;
+    m2.* += delta * delta2;
+}
+
+inline fn welfordAddOneB(x: anytype, rcp: @TypeOf(x), prev_count: @TypeOf(x), mean: *@TypeOf(x), m2: *@TypeOf(x)) void {
+    @setFloatMode(.optimized);
+    const delta = x - mean.*;
+    const delta_div_n = delta * rcp;
+    mean.* += delta_div_n;
+    const delta_sq = delta * delta;
+    m2.* += prev_count * delta_sq * rcp;
+}
+
+inline fn welfordMerge(comptime T: type, na: *T, ma: *T, m2a: *T, nb: T, mb: T, m2b: T) void {
+    @setFloatMode(.optimized);
+    const delta = mb - ma.*;
+    const total_n = na.* + nb;
+    const n_prod = na.* * nb;
+    const delta_over_n = delta / total_n;
+    const n_prod_delta2_over_n = n_prod * delta * delta_over_n;
+    na.* = total_n;
+    ma.* += nb * delta_over_n;
+    m2a.* += m2b + n_prod_delta2_over_n;
+}
+
 pub fn layerNormInner(
     comptime T: type,
     // number of unrolls of one type for welford's algorithm update
@@ -1158,19 +1187,12 @@ pub fn layerNormInner(
             rcp = rcp * (@as(f32v, @splat(@as(f32, 2))) - count * rcp);
             inline for (0..N_A) |j| {
                 const x: f32v = @floatCast(@as(Tv, start_ptr[0..VLEN].*));
-                const delta = x - mean[j];
-                mean[j] += delta * rcp;
-                const delta2 = x - mean[j];
-                m2[j] += delta * delta2;
+                welfordAddOneA(x, rcp, &mean[j], &m2[j]);
                 start_ptr += VLEN;
             }
             inline for (N_A..N_U) |j| {
                 const x: f32v = @floatCast(@as(Tv, start_ptr[0..VLEN].*));
-                const delta = x - mean[j];
-                const delta_div_n = delta * rcp;
-                mean[j] += delta_div_n;
-                const delta_sq = delta * delta;
-                m2[j] += prev_count * delta_sq * rcp;
+                welfordAddOneB(x, rcp, prev_count, &mean[j], &m2[j]);
                 start_ptr += VLEN;
             }
         }
@@ -1185,19 +1207,12 @@ pub fn layerNormInner(
             rcp = rcp * (@as(f32v, @splat(@as(f32, 2))) - count * rcp);
             inline for (0..N_A) |j| {
                 const x: f32v = @floatCast(@as(Tv, start_ptr[0..VLEN].*));
-                const delta = x - mean[j];
-                mean[j] += delta * rcp;
-                const delta2 = x - mean[j];
-                m2[j] += delta * delta2;
+                welfordAddOneA(x, rcp, &mean[j], &m2[j]);
                 start_ptr += VLEN;
             }
             inline for (N_A..N_U) |j| {
                 const x: f32v = @floatCast(@as(Tv, start_ptr[0..VLEN].*));
-                const delta = x - mean[j];
-                const delta_div_n = delta * rcp;
-                mean[j] += delta_div_n;
-                const delta_sq = delta * delta;
-                m2[j] += prev_count * delta_sq * rcp;
+                welfordAddOneB(x, rcp, prev_count, &mean[j], &m2[j]);
                 start_ptr += VLEN;
             }
         }
@@ -1208,15 +1223,7 @@ pub fn layerNormInner(
             const step: usize = 1 << tree_iter;
             inline for (0..N_U) |j| {
                 if (@ctz(j) > tree_iter and j + step < N_U) {
-                    @setFloatMode(.optimized);
-                    const dmean = mean[j+step] - mean[j];
-                    const total_n = counts[j] + counts[j+step];
-                    const selfnothern = counts[j] * counts[j+step];
-                    const dmeanovern = dmean / total_n;
-                    const selfnotherndmean2overn = selfnothern * dmean * dmeanovern;
-                    counts[j] = total_n;
-                    mean[j] += counts[j+step] * dmeanovern;
-                    m2[j] += m2[j+step] + selfnotherndmean2overn;
+                    welfordMerge(f32v, &counts[j], &mean[j], &m2[j], counts[j+step], mean[j+step], m2[j+step]);
                 }
             }
         }
@@ -1230,16 +1237,7 @@ pub fn layerNormInner(
             const step: usize = 1 << tree_iter;
             inline for (0..VLEN) |j| {
                 if (@ctz(j) > tree_iter and j + step < VLEN) {
-                    @setFloatMode(.optimized);
-                    const dmean = smean[j+step] - smean[j];
-                    const total_n = scounts[j] + scounts[j+step];
-                    const selfnothern = scounts[j] * scounts[j+step];
-                    const dmeanovern = dmean / total_n;
-                    const selfnotherndmean2overn = selfnothern * dmean * dmeanovern;
-
-                    scounts[j] = total_n;
-                    smean[j] += scounts[j+step] * dmeanovern;
-                    sm2[j] += sm2[j+step] + selfnotherndmean2overn;
+                    welfordMerge(f32, &scounts[j], &smean[j], &sm2[j], scounts[j+step], smean[j+step], sm2[j+step]);
                 }
             }
         }
@@ -1250,15 +1248,7 @@ pub fn layerNormInner(
                 const non_leftover_n = VLEN * N_U - leftover_n;
                 other_count -= @as(f32, @floatFromInt(non_leftover_n));
             }
-            const other_m: f32 = 0;
-            const dmean = other_m - smean[0];
-            const total_n = scounts[0] + other_count;
-            const selfnothern = scounts[0] * other_count;
-            const dmean_over_n = dmean / total_n;
-            const selfnotherndmean2overn = selfnothern * dmean * dmean_over_n;
-            scounts[0] = total_n;
-            smean[0] += other_count * dmean_over_n;
-            sm2[0] += selfnotherndmean2overn;
+            welfordMerge(f32, &scounts[0], &smean[0], &sm2[0], other_count, 0, 0);
         }
 
         // Calculate variance from M2
