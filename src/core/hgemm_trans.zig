@@ -10,9 +10,9 @@ const ops = @import("../core/ops.zig");
 const testing = std.testing;
 const time = @import("std").time;
 
-// comptime {
-//     @setFloatMode(.optimized);
-// }
+comptime {
+    @setFloatMode(.optimized);
+}
 
 // SIMD and optimization constants
 const Vec8f = @Vector(8, f32);
@@ -50,59 +50,76 @@ const VectorThreadContext = struct {
     shared_counter: *ThreadLocalData,
 };
 
-comptime {
-    @setFloatMode(.optimized);
-}
-
 // Core computation for vector chunk
 fn processVectorChunk(start_n: usize, end_n: usize, a: []const f16, b_t: []const f16, c: []f16, K: usize) void {
     @setFloatMode(.optimized);
     @setRuntimeSafety(false);
 
     for (start_n..end_n) |n| {
-        var sum: f32 = 0;
         const row = n * K;
-
         var k: usize = 0;
-        const k_aligned = K - (K % 8);
 
-        while (k < k_aligned) : (k += 8) {
-            const a_vec = Vec8f{
-                @as(f32, @floatCast(a[k + 0])),
-                @as(f32, @floatCast(a[k + 1])),
-                @as(f32, @floatCast(a[k + 2])),
-                @as(f32, @floatCast(a[k + 3])),
-                @as(f32, @floatCast(a[k + 4])),
-                @as(f32, @floatCast(a[k + 5])),
-                @as(f32, @floatCast(a[k + 6])),
-                @as(f32, @floatCast(a[k + 7])),
-            };
+        // Use 4 separate vector accumulators to avoid horizontal reductions in the loop
+        var acc0: Vec8f = @splat(0);
+        var acc1: Vec8f = @splat(0);
+        var acc2: Vec8f = @splat(0);
+        var acc3: Vec8f = @splat(0);
 
-            const b_vec = Vec8f{
-                @as(f32, @floatCast(b_t[row + k + 0])),
-                @as(f32, @floatCast(b_t[row + k + 1])),
-                @as(f32, @floatCast(b_t[row + k + 2])),
-                @as(f32, @floatCast(b_t[row + k + 3])),
-                @as(f32, @floatCast(b_t[row + k + 4])),
-                @as(f32, @floatCast(b_t[row + k + 5])),
-                @as(f32, @floatCast(b_t[row + k + 6])),
-                @as(f32, @floatCast(b_t[row + k + 7])),
-            };
+        // Align to 32-element chunks for better vectorization
+        const k_aligned = K - (K % 32);
 
-            sum += @reduce(.Add, a_vec * b_vec);
+        while (k < k_aligned) : (k += 32) {
+            // Prefetch future data
+            if (k + 256 < K) {
+                @prefetch(&a[k + 256], .{ .locality = 3, .cache = .data, .rw = .read });
+                @prefetch(&b_t[row + k + 256], .{ .locality = 3, .cache = .data, .rw = .read });
+            }
+
+            // Process in 8-element chunks, accumulating to different vectors
+            {
+                const a_vec = Vec8f{ @as(f32, @floatCast(a[k])), @as(f32, @floatCast(a[k + 1])), @as(f32, @floatCast(a[k + 2])), @as(f32, @floatCast(a[k + 3])), @as(f32, @floatCast(a[k + 4])), @as(f32, @floatCast(a[k + 5])), @as(f32, @floatCast(a[k + 6])), @as(f32, @floatCast(a[k + 7])) };
+                const b_vec = Vec8f{ @as(f32, @floatCast(b_t[row + k])), @as(f32, @floatCast(b_t[row + k + 1])), @as(f32, @floatCast(b_t[row + k + 2])), @as(f32, @floatCast(b_t[row + k + 3])), @as(f32, @floatCast(b_t[row + k + 4])), @as(f32, @floatCast(b_t[row + k + 5])), @as(f32, @floatCast(b_t[row + k + 6])), @as(f32, @floatCast(b_t[row + k + 7])) };
+                acc0 = @mulAdd(Vec8f, a_vec, b_vec, acc0);
+            }
+
+            {
+                const a_vec = Vec8f{ @as(f32, @floatCast(a[k + 8])), @as(f32, @floatCast(a[k + 9])), @as(f32, @floatCast(a[k + 10])), @as(f32, @floatCast(a[k + 11])), @as(f32, @floatCast(a[k + 12])), @as(f32, @floatCast(a[k + 13])), @as(f32, @floatCast(a[k + 14])), @as(f32, @floatCast(a[k + 15])) };
+                const b_vec = Vec8f{ @as(f32, @floatCast(b_t[row + k + 8])), @as(f32, @floatCast(b_t[row + k + 9])), @as(f32, @floatCast(b_t[row + k + 10])), @as(f32, @floatCast(b_t[row + k + 11])), @as(f32, @floatCast(b_t[row + k + 12])), @as(f32, @floatCast(b_t[row + k + 13])), @as(f32, @floatCast(b_t[row + k + 14])), @as(f32, @floatCast(b_t[row + k + 15])) };
+                acc1 = @mulAdd(Vec8f, a_vec, b_vec, acc1);
+            }
+
+            {
+                const a_vec = Vec8f{ @as(f32, @floatCast(a[k + 16])), @as(f32, @floatCast(a[k + 17])), @as(f32, @floatCast(a[k + 18])), @as(f32, @floatCast(a[k + 19])), @as(f32, @floatCast(a[k + 20])), @as(f32, @floatCast(a[k + 21])), @as(f32, @floatCast(a[k + 22])), @as(f32, @floatCast(a[k + 23])) };
+                const b_vec = Vec8f{ @as(f32, @floatCast(b_t[row + k + 16])), @as(f32, @floatCast(b_t[row + k + 17])), @as(f32, @floatCast(b_t[row + k + 18])), @as(f32, @floatCast(b_t[row + k + 19])), @as(f32, @floatCast(b_t[row + k + 20])), @as(f32, @floatCast(b_t[row + k + 21])), @as(f32, @floatCast(b_t[row + k + 22])), @as(f32, @floatCast(b_t[row + k + 23])) };
+                acc2 = @mulAdd(Vec8f, a_vec, b_vec, acc2);
+            }
+
+            {
+                const a_vec = Vec8f{ @as(f32, @floatCast(a[k + 24])), @as(f32, @floatCast(a[k + 25])), @as(f32, @floatCast(a[k + 26])), @as(f32, @floatCast(a[k + 27])), @as(f32, @floatCast(a[k + 28])), @as(f32, @floatCast(a[k + 29])), @as(f32, @floatCast(a[k + 30])), @as(f32, @floatCast(a[k + 31])) };
+                const b_vec = Vec8f{ @as(f32, @floatCast(b_t[row + k + 24])), @as(f32, @floatCast(b_t[row + k + 25])), @as(f32, @floatCast(b_t[row + k + 26])), @as(f32, @floatCast(b_t[row + k + 27])), @as(f32, @floatCast(b_t[row + k + 28])), @as(f32, @floatCast(b_t[row + k + 29])), @as(f32, @floatCast(b_t[row + k + 30])), @as(f32, @floatCast(b_t[row + k + 31])) };
+                acc3 = @mulAdd(Vec8f, a_vec, b_vec, acc3);
+            }
         }
 
+        // Handle remaining elements scalar
+        var scalar_sum: f32 = 0;
         while (k < K) : (k += 1) {
-            sum += @as(f32, @floatCast(a[k])) * @as(f32, @floatCast(b_t[row + k]));
+            scalar_sum += @as(f32, @floatCast(a[k])) * @as(f32, @floatCast(b_t[row + k]));
         }
 
-        c[n] = @floatCast(sum);
+        // Perform horizontal reduction only once at the end
+        // Add the four vector accumulators together first
+        const combined_acc = acc0 + acc1 + acc2 + acc3;
+        const vector_sum = @reduce(.Add, combined_acc);
+
+        c[n] = @floatCast(vector_sum + scalar_sum);
     }
 }
 
 // Vector-matrix multiplication worker
 fn vectorWorker(ctx: VectorThreadContext) void {
     @setFloatMode(.optimized);
+    @setRuntimeSafety(false);
 
     while (true) {
         const chunk_idx = ctx.shared_counter.current_index.fetchAdd(1, .seq_cst);
@@ -533,6 +550,7 @@ fn matmulImpl(allocator: Allocator, a: []const f16, b_t: []const f16, c: []f16, 
     for (thread_pool.items) |thread| thread.join();
 }
 pub fn transpose(allocator: std.mem.Allocator, tensor: Tensor(f16)) !Tensor(f16) {
+    @setRuntimeSafety(false);
     @setFloatMode(.optimized);
 
     const shape = tensor.shape;
