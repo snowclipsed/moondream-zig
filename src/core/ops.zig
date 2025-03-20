@@ -1065,15 +1065,15 @@ pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Te
         // empirically determined settings for NEON (Apple M1): N_A=8, N_B=8, N_S2=4
         return layerNormInner(T, 8, 8, 4, false, input, weight, bias, eps);
     }
-    // my guess for avx2??
-    return layerNormInner(T, 6, 0, 3, false, input, weight, bias, eps);
+    // empirically determined settings for AVX2 (Haswell): N_A=2, N_B=6, N_S2=8
+    return layerNormInner(T, 2, 6, 8, false, input, weight, bias, eps);
 }
 
 pub fn layerNormCheckEverything(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
     if (builtin.cpu.arch == .aarch64) {
         return layerNormInner(T, 8, 8, 4, true, input, weight, bias, eps);
     }
-    return layerNormInner(T, 6, 0, 3, true, input, weight, bias, eps);
+    return layerNormInner(T, 2, 6, 8, true, input, weight, bias, eps);
 }
 
 inline fn welfordAddOneA(x: anytype, rcp: @TypeOf(x), mean: *@TypeOf(x), m2: *@TypeOf(x)) void {
