@@ -32,7 +32,7 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
             const self = Self{
                 .backing_allocator = backing_allocator,
                 .slabs = [_][DEQUE_SIZE]?[*]align(PAGE_ALIGN) u8{[_]?[*]align(PAGE_ALIGN) u8{null} ** DEQUE_SIZE} ** NUM_BUCKETS,
-                .tops = [_]usize{0} ** NUM_BUCKETS,
+                .tops = [_]usize{DEQUE_SIZE-1} ** NUM_BUCKETS,
                 .sizes = [_]usize{0} ** NUM_BUCKETS,
                 .size_map = std.AutoHashMap(usize, usize).init(backing_allocator),
             };
@@ -42,21 +42,16 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
         pub fn deinit(self: *Self) void {
             // Free all cached slabs
             for (0..NUM_BUCKETS) |bucket_idx| {
-                const size = self.sizeFromBucket(bucket_idx);
-                var i: usize = 0;
-                while (i < self.sizes[bucket_idx]) : (i += 1) {
-                    const index = (self.tops[bucket_idx] + DEQUE_SIZE - i - 1) % DEQUE_SIZE;
-                    if (self.slabs[bucket_idx][index]) |ptr| {
+                while (self.sizes[bucket_idx] > 0) {
+                    if (self.popSlab(bucket_idx)) |ptr| {
                         const log2_align = math.log2(PAGE_ALIGN);
                         self.backing_allocator.rawFree(
-                            ptr[0..size],
+                            ptr[0..self.sizeFromBucket(bucket_idx)],
                             log2_align,
                             @returnAddress()
                         );
                     }
                 }
-                self.tops[bucket_idx] = 0;
-                self.sizes[bucket_idx] = 0;
             }
             self.size_map.deinit();
         }
@@ -97,14 +92,9 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
 
         // Push a slab onto the top of the deque for a given bucket
         fn pushSlab(self: *Self, bucket_idx: usize, ptr: [*]align(PAGE_ALIGN) u8) void {
-            if (self.sizes[bucket_idx] < DEQUE_SIZE) {
-                const index = self.tops[bucket_idx] % DEQUE_SIZE;
-                self.slabs[bucket_idx][index] = ptr;
-                self.tops[bucket_idx] = (self.tops[bucket_idx] + 1) % DEQUE_SIZE;
-                self.sizes[bucket_idx] += 1;
-            } else {
+            if (self.sizes[bucket_idx] >= DEQUE_SIZE) {
                 // Deque is full - remove the oldest entry and replace it
-                const bottom_idx = (self.tops[bucket_idx] + DEQUE_SIZE - self.sizes[bucket_idx]) % DEQUE_SIZE;
+                const bottom_idx = (self.tops[bucket_idx] + 1) % DEQUE_SIZE;
                 const old_ptr = self.slabs[bucket_idx][bottom_idx].?;
                 const size = self.sizeFromBucket(bucket_idx);
                 const log2_align = math.log2(PAGE_ALIGN);
@@ -114,13 +104,12 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
                     log2_align,
                     @returnAddress()
                 );
-
-                // Replace with new entry at the top
-                const top_idx = self.tops[bucket_idx] % DEQUE_SIZE;
-                self.slabs[bucket_idx][top_idx] = ptr;
-                self.tops[bucket_idx] = (self.tops[bucket_idx] + 1) % DEQUE_SIZE;
-                // sizes stays the same since we replaced one entry
+                self.sizes[bucket_idx] -= 1;
             }
+            const index = (self.tops[bucket_idx] + 1) % DEQUE_SIZE;
+            self.slabs[bucket_idx][index] = ptr;
+            self.tops[bucket_idx] = index;
+            self.sizes[bucket_idx] += 1;
         }
 
         // Pop a slab from the top of the deque for a given bucket
@@ -129,8 +118,8 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
                 return null;
             }
 
-            self.tops[bucket_idx] = (self.tops[bucket_idx] + DEQUE_SIZE - 1) % DEQUE_SIZE;
             const index = self.tops[bucket_idx] % DEQUE_SIZE;
+            self.tops[bucket_idx] = (index + DEQUE_SIZE - 1) % DEQUE_SIZE;
             const ptr = self.slabs[bucket_idx][index];
             self.slabs[bucket_idx][index] = null;
             self.sizes[bucket_idx] -= 1;
