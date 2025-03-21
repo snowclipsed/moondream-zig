@@ -10,6 +10,7 @@ const StabilityError = @import("../core/tensor.zig").StabilityError;
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
+    // btw, this line applies to only this scope?
     @setFloatMode(mode);
 }
 
@@ -1060,6 +1061,372 @@ pub fn createRandomTensor(comptime T: type, allocator: std.mem.Allocator, shape:
 // ----------------------------------------------------------------------------
 
 pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+    if (builtin.cpu.arch == .aarch64) {
+        // empirically determined settings for NEON (Apple M1): N_A=8, N_B=8, N_S2=4
+        return layerNormInner(T, 8, 8, 4, false, input, weight, bias, eps);
+    }
+    // empirically determined settings for AVX2 (Haswell): N_A=2, N_B=6, N_S2=8
+    return layerNormInner(T, 2, 6, 8, false, input, weight, bias, eps);
+}
+
+pub fn layerNormCheckEverything(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+    if (builtin.cpu.arch == .aarch64) {
+        return layerNormInner(T, 8, 8, 4, true, input, weight, bias, eps);
+    }
+    return layerNormInner(T, 2, 6, 8, true, input, weight, bias, eps);
+}
+
+inline fn welfordAddOneA(x: anytype, rcp: @TypeOf(x), mean: *@TypeOf(x), m2: *@TypeOf(x)) void {
+    @setFloatMode(.optimized);
+    const delta = x - mean.*;
+    mean.* += delta * rcp;
+    const delta2 = x - mean.*;
+    m2.* += delta * delta2;
+}
+
+// basically, LLVM is a coward and will not reorder vector instructions on ARM
+// so we try to give approximately the right order by hand.
+inline fn welfordAddOneArr(
+    comptime IN_T: type,
+    comptime T: type,
+    comptime VLEN: comptime_int,
+    comptime N_A: usize,
+    comptime N_B: usize,
+    xptr: [*]IN_T,
+    rcp: @Vector(VLEN, T),
+    prev_count_rcp: @Vector(VLEN, T),
+    mean: *[N_A + N_B]@Vector(VLEN, T),
+    m2: *[N_A + N_B]@Vector(VLEN, T),
+) void {
+    @setFloatMode(.optimized);
+    const N = N_A + N_B;
+    const IN_Tv = @Vector(VLEN, IN_T);
+    const Tv = @Vector(VLEN, T);
+    var x: [N]Tv = undefined;
+    inline for (0..N) |i| {
+        x[i] = @floatCast(@as(IN_Tv,xptr[i*VLEN..(i+1)*VLEN].*));
+    }
+    var delta: [N]Tv = undefined;
+    inline for (0..N) |i| {
+        delta[N-1-i] = x[N-1-i] - mean[N-1-i];
+    }
+    var delta2: [N]Tv = undefined;
+    inline for (0..N_B) |i| {
+        delta2[N-1-i] = delta[N-1-i] * delta[N-1-i];
+    }
+    inline for (0..N) |i| {
+        mean[i] += delta[i] * rcp;
+    }
+    inline for (0..N_A) |i| {
+        delta2[i] = x[i] - mean[i];
+    }
+    inline for (N_A..N) |i| {
+        m2[i] += prev_count_rcp * delta2[i];
+    }
+    inline for (0..N_A) |i| {
+        m2[i] += delta[i] * delta2[i];
+    }
+}
+
+inline fn welfordAddOneB(x: anytype, rcp: @TypeOf(x), prev_count: @TypeOf(x), mean: *@TypeOf(x), m2: *@TypeOf(x)) void {
+    @setFloatMode(.optimized);
+    const delta = x - mean.*;
+    const delta_div_n = delta * rcp;
+    mean.* += delta_div_n;
+    const delta_sq = delta * delta;
+    m2.* += prev_count * delta_sq * rcp;
+}
+
+inline fn welfordMerge(comptime T: type, na: *T, ma: *T, m2a: *T, nb: T, mb: T, m2b: T) void {
+    @setFloatMode(.optimized);
+    const delta = mb - ma.*;
+    const total_n = na.* + nb;
+    const n_prod = na.* * nb;
+    const delta_over_n = delta / total_n;
+    const n_prod_delta2_over_n = n_prod * delta * delta_over_n;
+    na.* = total_n;
+    ma.* += nb * delta_over_n;
+    m2a.* += m2b + n_prod_delta2_over_n;
+}
+
+pub fn layerNormInner(
+    comptime T: type,
+    // number of unrolls of one type for welford's algorithm update
+    comptime N_A: usize,
+    // number of unrolls of another type for welford's algorithm update
+    comptime N_B: usize,
+    // number of unrolls for second pass
+    comptime N_S2: usize,
+    comptime CHECK_EVERYTHING: bool,
+    input: Tensor(T),
+    weight: Tensor(T),
+    bias: Tensor(T),
+    eps: T) !Tensor(T)
+{
+    // Check input stability
+    if (CHECK_EVERYTHING) {
+        try checkStability(T, input);
+        try checkStability(T, weight);
+        try checkStability(T, bias);
+    }
+
+    // Validate epsilon
+    if (eps <= 0) {
+        return error.InvalidEpsilon;
+    }
+
+    // Input validation
+    if (input.shape.len < 1) {
+        return error.InvalidShape;
+    }
+    const last_dim = input.shape[input.shape.len - 1];
+
+    if (weight.shape.len != 1 or weight.shape[0] != last_dim) {
+        return error.InvalidWeightShape;
+    }
+    if (bias.shape.len != 1 or bias.shape[0] != last_dim) {
+        return error.InvalidBiasShape;
+    }
+
+    // Calculate size of dimensions before the last dimension
+    var leading_dims: usize = 1;
+    for (input.shape[0 .. input.shape.len - 1]) |dim| {
+        leading_dims *= dim;
+    }
+
+    // Create output tensor with same shape as input
+    var output = try input.copy();
+    errdefer output.deinit();
+
+    const N_U = N_A + N_B;
+    const N_FAKE_ZEROS: f32 = 100_000;
+    // NOTE: not using AVX-512 until the gemms do.
+    // To use AVX-512, get rid of the @min.
+    const VLEN = @min(std.simd.suggestVectorLength(f32) orelse 4, 8);
+    const f32v = @Vector(VLEN, f32);
+    const Tv = @Vector(VLEN, T);
+
+    // Compute mean and variance for each feature vector using Welford's online algorithm
+    // Use f32 for intermediate computations regardless of input type
+    var i: usize = 0;
+    while (i < leading_dims) : (i += 1) {
+        const start_idx = i * last_dim;
+        const end_idx = start_idx + last_dim;
+
+        // Initialize Welford's algorithm variables
+        const leftover_n = last_dim % (VLEN * N_U);
+        var count: f32v = @splat(@as(f32, N_FAKE_ZEROS));
+        var rcp: f32v = @splat(@as(f32, 1.0/N_FAKE_ZEROS));
+        var mean: [N_U]f32v = @bitCast([1]f32{0} ** (VLEN * N_U));
+        var m2: [N_U]f32v = @bitCast([1]f32{0} ** (VLEN * N_U));
+
+        // First pass: Compute mean and M2 (sum of squared differences)
+        var start_ptr: [*]T = input.data.ptr + start_idx;
+        var end_ptr: [*]T = input.data.ptr + end_idx;
+        end_ptr = end_ptr - VLEN * N_U + 1;
+        while (@intFromPtr(start_ptr) < @intFromPtr(end_ptr)) {
+            @setFloatMode(.optimized);
+            const prev_count = count;
+            count += @splat(@as(f32, 1));
+            rcp = rcp * (@as(f32v, @splat(@as(f32, 2))) - count * rcp);
+            const prev_count_rcp = rcp * prev_count;
+            welfordAddOneArr(T, f32, VLEN, N_A, N_B, start_ptr, rcp, prev_count_rcp, &mean, &m2);
+            start_ptr += VLEN * N_U;
+        }
+        // done with the fully unrolled part - accumulate remaining elements and some fake zeros
+        if (leftover_n > 0) {
+            @setFloatMode(.optimized);
+            var fake_xs: [VLEN*N_U]T = [1]T{0} ** (VLEN * N_U);
+            @memcpy(@as([*]T, @ptrCast(&fake_xs)), start_ptr[0..leftover_n]);
+            start_ptr = @ptrCast(&fake_xs);
+            const prev_count = count;
+            count += @splat(@as(f32, 1));
+            rcp = rcp * (@as(f32v, @splat(@as(f32, 2))) - count * rcp);
+            welfordAddOneArr(T, f32, VLEN, N_A, N_B, start_ptr, rcp, prev_count, &mean, &m2);
+        }
+        // tree reduction
+        const n_tree_iters = @bitSizeOf(usize) - @clz(N_U - 1);
+        var counts: [N_U]f32v = .{count} ** N_U;
+        inline for (0..n_tree_iters) |tree_iter| {
+            const step: usize = 1 << tree_iter;
+            inline for (0..N_U) |j| {
+                if (@ctz(j) > tree_iter and j + step < N_U) {
+                    welfordMerge(f32v, &counts[j], &mean[j], &m2[j], counts[j+step], mean[j+step], m2[j+step]);
+                }
+            }
+        }
+        // add all the states in the first register together
+        var scounts: [VLEN]f32 = counts[0];
+        var smean: [VLEN]f32 = mean[0];
+        var sm2: [VLEN]f32 = m2[0];
+        // tree reduction again!
+        const n_stree_iters = @bitSizeOf(usize) - @clz(@as(usize, VLEN - 1));
+        inline for (0..n_stree_iters) |tree_iter| {
+            const step: usize = 1 << tree_iter;
+            inline for (0..VLEN) |j| {
+                if (@ctz(j) > tree_iter and j + step < VLEN) {
+                    welfordMerge(f32, &scounts[j], &smean[j], &sm2[j], scounts[j+step], smean[j+step], sm2[j+step]);
+                }
+            }
+        }
+        // subtract out the fake zeros
+        {
+            var other_count: f32 = -N_FAKE_ZEROS * VLEN * N_U;
+            if (leftover_n > 0) {
+                const non_leftover_n = VLEN * N_U - leftover_n;
+                other_count -= @as(f32, @floatFromInt(non_leftover_n));
+            }
+            welfordMerge(f32, &scounts[0], &smean[0], &sm2[0], other_count, 0, 0);
+        }
+
+        // Calculate variance from M2
+        const variance = sm2[0] / scounts[0];
+
+        // Check for numerical stability
+        if (variance < -eps) {
+            return error.NegativeVariance;
+        }
+
+        // Calculate standard deviation with epsilon for numerical stability
+        // Keep in f32 for better precision
+        const std_dev = @sqrt(variance + @as(f32, @floatCast(eps)));
+        // if (i == 0) {
+        //     std.log.err("Yolo found mean={d} and std_dev={d}", .{smean[0], std_dev});
+        // }
+
+        if (std_dev == 0) {
+            return error.ZeroStandardDeviation;
+        }
+        const rcp_std_dev = 1.0 / std_dev;
+        const mean_over_std_dev = smean[0] * rcp_std_dev;
+
+        // Normalize and apply scale and bias
+        // Do computations in f32 and cast back to T at the end
+        start_ptr = input.data.ptr + start_idx;
+        end_ptr = input.data.ptr + end_idx;
+        end_ptr = end_ptr - VLEN * N_S2 + 1;
+        var weight_ptr: [*]T = weight.data.ptr;
+        var bias_ptr: [*]T = bias.data.ptr;
+        var out_ptr: [*]T = output.data.ptr + start_idx;
+        const mean_over_std_dev_v: f32v = @splat(@as(f32, mean_over_std_dev));
+        const rcp_std_dev_v: f32v = @splat(@as(f32, rcp_std_dev));
+        while (@intFromPtr(start_ptr) < @intFromPtr(end_ptr)) {
+            @setFloatMode(.optimized);
+            var input_val: [N_S2]f32v = undefined;
+            var weight_val: [N_S2]f32v = undefined;
+            var bias_val: [N_S2]f32v = undefined;
+            var final_value: [N_S2]f32v = undefined;
+            inline for (0..N_S2) |j| {
+                // Cast all values to f32 for intermediate calculations
+                input_val[j] = @floatCast(@as(Tv, start_ptr[0..VLEN].*));
+                weight_val[j] = @floatCast(@as(Tv, weight_ptr[0..VLEN].*));
+                bias_val[j] = @floatCast(@as(Tv, bias_ptr[0..VLEN].*));
+                start_ptr = start_ptr + VLEN;
+                weight_ptr = weight_ptr + VLEN;
+                bias_ptr = bias_ptr + VLEN;
+            }
+            inline for (0..N_S2) |j| {
+                // Perform normalization in f32
+                final_value[j] = input_val[j] * rcp_std_dev_v - mean_over_std_dev_v;
+            }
+            inline for (0..N_S2) |j| {
+                final_value[j] = final_value[j] * weight_val[j] + bias_val[j];
+            }
+            if (CHECK_EVERYTHING) {
+                const check_me: [VLEN*N_S2]f32 = @bitCast(final_value);
+                for (check_me) |val| {
+                    if (std.math.isNan(val)) {
+                        return error.ComputedNaN;
+                    }
+                    if (std.math.isInf(val)) {
+                        return error.ComputedInfinity;
+                    }
+                }
+            }
+            inline for (0..N_S2) |j| {
+                // Cast back to original type T only at the end
+                out_ptr[0..VLEN].* = @as(Tv, @floatCast(final_value[j]));
+                out_ptr += VLEN;
+            }
+        }
+        end_ptr = input.data.ptr + end_idx;
+        end_ptr = end_ptr - VLEN + 1;
+        while (@intFromPtr(start_ptr) < @intFromPtr(end_ptr)) {
+            @setFloatMode(.optimized);
+            // Cast all values to f32 for intermediate calculations
+            const input_val: f32v = @floatCast(@as(Tv, start_ptr[0..VLEN].*));
+            const weight_val: f32v = @floatCast(@as(Tv, weight_ptr[0..VLEN].*));
+            const bias_val: f32v = @floatCast(@as(Tv, bias_ptr[0..VLEN].*));
+
+            // Perform normalization in f32
+            const normalized = input_val * rcp_std_dev_v - mean_over_std_dev_v;
+            const final_value = normalized * weight_val + bias_val;
+
+            if (CHECK_EVERYTHING) {
+                const check_me: [VLEN]f32 = @bitCast(final_value);
+                for (check_me) |val| {
+                    if (std.math.isNan(val)) {
+                        return error.ComputedNaN;
+                    }
+                    if (std.math.isInf(val)) {
+                        return error.ComputedInfinity;
+                    }
+                }
+            }
+
+            // Cast back to original type T only at the end
+            out_ptr[0..VLEN].* = @as(Tv, @floatCast(final_value));
+            out_ptr += VLEN;
+            start_ptr += VLEN;
+            weight_ptr += VLEN;
+            bias_ptr += VLEN;
+        }
+        end_ptr = input.data.ptr + end_idx;
+        while (@intFromPtr(start_ptr) < @intFromPtr(end_ptr)) {
+            @setFloatMode(.optimized);
+            // Cast all values to f32 for intermediate calculations
+            const input_val: f32 = @floatCast(start_ptr[0]);
+            const weight_val: f32 = @floatCast(weight_ptr[0]);
+            const bias_val: f32 = @floatCast(bias_ptr[0]);
+
+            // Perform normalization in f32
+            const normalized = input_val * rcp_std_dev - mean_over_std_dev;
+            const final_value = normalized * weight_val + bias_val;
+
+            // Check for stability of computed value
+            if (CHECK_EVERYTHING) {
+                if (std.math.isNan(final_value)) {
+                    return error.ComputedNaN;
+                }
+                if (std.math.isInf(final_value)) {
+                    return error.ComputedInfinity;
+                }
+            }
+
+            out_ptr[0] = @floatCast(final_value);
+            out_ptr += 1;
+            start_ptr += 1;
+            weight_ptr += 1;
+            bias_ptr += 1;
+        }
+    }
+
+    // Final stability check on output
+    if (CHECK_EVERYTHING) {
+        try checkStability(T, output);
+    }
+    return output;
+}
+
+pub fn layerNormOld(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+    return layerNormOldInner(T, f32, input, weight, bias, eps);
+}
+
+pub fn layerNormOldF64(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+    return layerNormOldInner(T, f64, input, weight, bias, eps);
+}
+
+pub fn layerNormOldInner(comptime T: type, comptime ET: type,input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
     // Check input stability
     try checkStability(T, input);
     try checkStability(T, weight);
@@ -1101,15 +1468,15 @@ pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Te
         const end_idx = start_idx + last_dim;
 
         // Initialize Welford's algorithm variables
-        var mean: f32 = 0;
-        var m2: f32 = 0; // Second moment
-        var count: f32 = 0;
+        var mean: ET = 0;
+        var m2: ET = 0; // Second moment
+        var count: ET = 0;
 
         // First pass: Compute mean and M2 (sum of squared differences)
         for (start_idx..end_idx) |j| {
             count += 1;
             // Cast input to f32 for higher precision intermediate calculations
-            const x: f32 = @floatCast(input.data[j]);
+            const x: ET = @floatCast(input.data[j]);
             const delta = x - mean;
             mean += delta / count;
             const delta2 = x - mean;
@@ -1126,7 +1493,10 @@ pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Te
 
         // Calculate standard deviation with epsilon for numerical stability
         // Keep in f32 for better precision
-        const std_dev = @sqrt(variance + @as(f32, @floatCast(eps)));
+        const std_dev = @sqrt(variance + @as(ET, @floatCast(eps)));
+        // if (i == 0) {
+        //     std.log.err("Normal found mean={d} and std_dev={d}", .{mean, std_dev});
+        // }
         if (std_dev == 0) {
             return error.ZeroStandardDeviation;
         }
@@ -1137,9 +1507,9 @@ pub fn layerNorm(comptime T: type, input: Tensor(T), weight: Tensor(T), bias: Te
             const feature_idx = j - start_idx;
 
             // Cast all values to f32 for intermediate calculations
-            const input_val: f32 = @floatCast(input.data[j]);
-            const weight_val: f32 = @floatCast(weight.data[feature_idx]);
-            const bias_val: f32 = @floatCast(bias.data[feature_idx]);
+            const input_val: ET = @floatCast(input.data[j]);
+            const weight_val: ET = @floatCast(weight.data[feature_idx]);
+            const bias_val: ET = @floatCast(bias.data[feature_idx]);
 
             // Perform normalization in f32
             const normalized = (input_val - mean) / std_dev;

@@ -1772,111 +1772,114 @@ test "Tensor Slice Tests" {
 
 test "layerNorm basic functionality" {
     const allocator = testing.allocator;
+    inline for (.{ops.layerNorm, ops.layerNormYolo}) |layerNorm| {
 
-    // Create test input tensor
-    var input = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-    defer input.deinit();
+        // Create test input tensor
+        var input = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+        defer input.deinit();
 
-    // Fill with test data that will have mean 0 and variance 1 after normalization
-    input.data[0] = -1.0;
-    input.data[1] = 0.0;
-    input.data[2] = 1.0;
-    input.data[3] = -1.0;
-    input.data[4] = 0.0;
-    input.data[5] = 1.0;
+        // Fill with test data that will have mean 0 and variance 1 after normalization
+        input.data[0] = -1.0;
+        input.data[1] = 0.0;
+        input.data[2] = 1.0;
+        input.data[3] = -1.0;
+        input.data[4] = 0.0;
+        input.data[5] = 1.0;
 
-    // Create weight and bias tensors
-    var weight = try Tensor(f32).init(allocator, &[_]usize{3});
-    defer weight.deinit();
-    @memset(weight.data, 1.0); // Scale factor of 1
+        // Create weight and bias tensors
+        var weight = try Tensor(f32).init(allocator, &[_]usize{3});
+        defer weight.deinit();
+        @memset(weight.data, 1.0); // Scale factor of 1
 
-    var bias = try Tensor(f32).init(allocator, &[_]usize{3});
-    defer bias.deinit();
-    @memset(bias.data, 0.0); // No bias
+        var bias = try Tensor(f32).init(allocator, &[_]usize{3});
+        defer bias.deinit();
+        @memset(bias.data, 0.0); // No bias
 
-    // Apply layer normalization
-    var result = try ops.layerNorm(f32, input, weight, bias, 1e-5);
-    defer result.deinit();
+        // Apply layer normalization
+        var result = try layerNorm(f32, input, weight, bias, 1e-5);
+        defer result.deinit();
 
-    // Verify output shape
-    try testing.expectEqual(input.shape.len, result.shape.len);
-    try testing.expectEqual(input.shape[0], result.shape[0]);
-    try testing.expectEqual(input.shape[1], result.shape[1]);
+        // Verify output shape
+        try testing.expectEqual(input.shape.len, result.shape.len);
+        try testing.expectEqual(input.shape[0], result.shape[0]);
+        try testing.expectEqual(input.shape[1], result.shape[1]);
 
-    // Verify first row is normalized (mean ≈ 0, variance ≈ 1)
-    const eps = 1e-5;
-    var mean: f32 = 0;
-    for (0..3) |i| {
-        mean += result.data[i];
+        // Verify first row is normalized (mean ≈ 0, variance ≈ 1)
+        const eps = 1e-5;
+        var mean: f32 = 0;
+        for (0..3) |i| {
+            mean += result.data[i];
+        }
+        mean /= 3;
+        try testing.expect(@abs(mean) < eps);
+
+        var variance: f32 = 0;
+        for (0..3) |i| {
+            const diff = result.data[i] - mean;
+            variance += diff * diff;
+        }
+        variance /= 3;
+        try testing.expect(@abs(variance - 1.0) < 0.01); // Allow for some numerical error
     }
-    mean /= 3;
-    try testing.expect(@abs(mean) < eps);
-
-    var variance: f32 = 0;
-    for (0..3) |i| {
-        const diff = result.data[i] - mean;
-        variance += diff * diff;
-    }
-    variance /= 3;
-    try testing.expect(@abs(variance - 1.0) < 0.01); // Allow for some numerical error
 }
 
 test "layerNorm stability checks" {
     const allocator = testing.allocator;
+    inline for (.{ops.layerNorm, ops.layerNormYoloCheckEverything}) |layerNorm| {
+        // Test case 1: Input contains NaN
+        {
+            var input = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+            defer input.deinit();
+            input.data[0] = std.math.nan(f32);
 
-    // Test case 1: Input contains NaN
-    {
-        var input = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-        defer input.deinit();
-        input.data[0] = std.math.nan(f32);
+            var weight = try Tensor(f32).init(allocator, &[_]usize{3});
+            defer weight.deinit();
+            @memset(weight.data, 1.0);
 
-        var weight = try Tensor(f32).init(allocator, &[_]usize{3});
-        defer weight.deinit();
-        @memset(weight.data, 1.0);
+            var bias = try Tensor(f32).init(allocator, &[_]usize{3});
+            defer bias.deinit();
+            @memset(bias.data, 0.0);
 
-        var bias = try Tensor(f32).init(allocator, &[_]usize{3});
-        defer bias.deinit();
-        @memset(bias.data, 0.0);
+            try testing.expectError(error.HasNaN, layerNorm(f32, input, weight, bias, 1e-5));
+        }
 
-        try testing.expectError(error.HasNaN, ops.layerNorm(f32, input, weight, bias, 1e-5));
-    }
+        // Test case 2: Zero variance
+        {
+            var input = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+            defer input.deinit();
+            @memset(input.data, 1.0); // All same values -> zero variance
 
-    // Test case 2: Zero variance
-    {
-        var input = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-        defer input.deinit();
-        @memset(input.data, 1.0); // All same values -> zero variance
+            var weight = try Tensor(f32).init(allocator, &[_]usize{3});
+            defer weight.deinit();
+            @memset(weight.data, 1.0);
 
-        var weight = try Tensor(f32).init(allocator, &[_]usize{3});
-        defer weight.deinit();
-        @memset(weight.data, 1.0);
+            var bias = try Tensor(f32).init(allocator, &[_]usize{3});
+            defer bias.deinit();
+            @memset(bias.data, 0.0);
 
-        var bias = try Tensor(f32).init(allocator, &[_]usize{3});
-        defer bias.deinit();
-        @memset(bias.data, 0.0);
+            var result = try layerNorm(f32, input, weight, bias, 1e-5);
+            defer result.deinit();
 
-        var result = try ops.layerNorm(f32, input, weight, bias, 1e-5);
-        defer result.deinit();
+            // Should still work due to epsilon
+            try testing.expect(!std.math.isNan(result.data[0]));
+        }
 
-        // Should still work due to epsilon
-        try testing.expect(!std.math.isNan(result.data[0]));
-    }
+        // Test case 3: Negative epsilon
+        {
+            var input = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
+            defer input.deinit();
+            @memset(input.data, 1.0);
 
-    // Test case 3: Negative epsilon
-    {
-        var input = try Tensor(f32).init(allocator, &[_]usize{ 2, 3 });
-        defer input.deinit();
-        @memset(input.data, 1.0);
+            var weight = try Tensor(f32).init(allocator, &[_]usize{3});
+            defer weight.deinit();
+            @memset(weight.data, 1.0);
 
-        var weight = try Tensor(f32).init(allocator, &[_]usize{3});
-        defer weight.deinit();
-        @memset(weight.data, 1.0);
+            var bias = try Tensor(f32).init(allocator, &[_]usize{3});
+            defer bias.deinit();
+            @memset(bias.data, 0.0);
 
-        var bias = try Tensor(f32).init(allocator, &[_]usize{3});
-        defer bias.deinit();
-        @memset(bias.data, 0.0);
-
-        try testing.expectError(error.InvalidEpsilon, ops.layerNorm(f32, input, weight, bias, -1e-5));
+            try testing.expectError(error.InvalidEpsilon, layerNorm(f32, input, weight, bias, -1e-5));
+        }
     }
 }
 
