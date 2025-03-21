@@ -62,7 +62,7 @@ Here is how you can build the binaries for the full project. You can skip this s
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/moondream-zig.git
+git clone https://github.com/snowclipsed/moondream-zig.git
 cd moondream-zig
 
 # Build the project
@@ -222,12 +222,4 @@ This project draws inspiration from other LLM inference implementations like [ll
 
 ## License
 
-This project is licensed under the Apache 2.0 - see the [LICENSE](LICENSE) file for details.
-
----
-
-*Note: This README is a template. Make sure to fill in the placeholders with your specific project information before publishing.*
-```bash
-cd src/
-zig build run -Doptimize=ReleaseFast
-```
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
