@@ -1,3 +1,6 @@
+tqdm
+requests
+huggingface_hub
 torch
 safetensors
 numpy
