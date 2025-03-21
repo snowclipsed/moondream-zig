@@ -1087,11 +1087,12 @@ inline fn welfordAddOneA(x: anytype, rcp: @TypeOf(x), mean: *@TypeOf(x), m2: *@T
 // basically, LLVM is a coward and will not reorder vector instructions on ARM
 // so we try to give approximately the right order by hand.
 inline fn welfordAddOneArr(
+    comptime IN_T: type,
     comptime T: type,
     comptime VLEN: comptime_int,
     comptime N_A: usize,
     comptime N_B: usize,
-    xptr: [*]T,
+    xptr: [*]IN_T,
     rcp: @Vector(VLEN, T),
     prev_count_rcp: @Vector(VLEN, T),
     mean: *[N_A + N_B]@Vector(VLEN, T),
@@ -1099,10 +1100,11 @@ inline fn welfordAddOneArr(
 ) void {
     @setFloatMode(.optimized);
     const N = N_A + N_B;
+    const IN_Tv = @Vector(VLEN, IN_T);
     const Tv = @Vector(VLEN, T);
     var x: [N]Tv = undefined;
     inline for (0..N) |i| {
-        x[i] = xptr[i*VLEN..(i+1)*VLEN].*;
+        x[i] = @floatCast(@as(IN_Tv,xptr[i*VLEN..(i+1)*VLEN].*));
     }
     var delta: [N]Tv = undefined;
     inline for (0..N) |i| {
@@ -1228,7 +1230,7 @@ pub fn layerNormInner(
             count += @splat(@as(f32, 1));
             rcp = rcp * (@as(f32v, @splat(@as(f32, 2))) - count * rcp);
             const prev_count_rcp = rcp * prev_count;
-            welfordAddOneArr(f32, VLEN, N_A, N_B, start_ptr, rcp, prev_count_rcp, &mean, &m2);
+            welfordAddOneArr(T, f32, VLEN, N_A, N_B, start_ptr, rcp, prev_count_rcp, &mean, &m2);
             start_ptr += VLEN * N_U;
         }
         // done with the fully unrolled part - accumulate remaining elements and some fake zeros
@@ -1240,7 +1242,7 @@ pub fn layerNormInner(
             const prev_count = count;
             count += @splat(@as(f32, 1));
             rcp = rcp * (@as(f32v, @splat(@as(f32, 2))) - count * rcp);
-            welfordAddOneArr(f32, VLEN, N_A, N_B, start_ptr, rcp, prev_count, &mean, &m2);
+            welfordAddOneArr(T, f32, VLEN, N_A, N_B, start_ptr, rcp, prev_count, &mean, &m2);
         }
         // tree reduction
         const n_tree_iters = @bitSizeOf(usize) - @clz(N_U - 1);
