@@ -137,13 +137,10 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
             const log2_ptr_align = @as(Allocator.Log2Align, @intCast(log2_ptr_align_u8));
 
             // Calculate the effective alignment - use at least PAGE_ALIGN for large allocations
-            const alignment = if (len > THRESHOLD)
-                @max(@as(usize, 1) << @as(math.Log2Int(usize), @intCast(log2_ptr_align)), PAGE_ALIGN)
-            else
-                @as(usize, 1) << @as(math.Log2Int(usize), @intCast(log2_ptr_align));
+            const alignment = @max(@as(usize, 1) << @as(math.Log2Int(usize), @intCast(log2_ptr_align)), PAGE_ALIGN);
 
-            // For small allocations or non-standard alignments, delegate to backing allocator
-            if (len <= THRESHOLD or (len > THRESHOLD and alignment > PAGE_ALIGN)) {
+            // For non-standard alignments, delegate to backing allocator
+            if ((len > THRESHOLD and alignment > PAGE_ALIGN)) {
                 return self.backing_allocator.rawAlloc(len, log2_ptr_align, ret_addr);
             }
 
