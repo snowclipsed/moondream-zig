@@ -27,6 +27,7 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
 
         // Tracks the original size of each allocation for later freeing
         size_map: std.AutoHashMap(usize, usize),
+        mutex: std.Thread.Mutex = .{},
 
         pub fn init(backing_allocator: Allocator) Self {
             const self = Self{
@@ -140,6 +141,9 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
             // Calculate the effective alignment - use at least PAGE_ALIGN for large allocations
             const alignment = @max(@as(usize, 1) << @as(math.Log2Int(usize), @intCast(log2_ptr_align)), PAGE_ALIGN);
 
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
             // For non-standard alignments, delegate to backing allocator
             if ((len > THRESHOLD and alignment > PAGE_ALIGN)) {
                 return self.backing_allocator.rawAlloc(len, log2_ptr_align, ret_addr);
@@ -204,6 +208,9 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
 
             // Early return for null allocations
             if (ptr.len == 0) return;
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
             // Check if this is one of our cached allocations
             if (self.size_map.get(@intFromPtr(ptr.ptr))) |size| {
