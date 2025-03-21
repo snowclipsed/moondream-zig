@@ -62,7 +62,7 @@ Here is how you can build the binaries for the full project. You can skip this s
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/moondream-zig.git
+git clone https://github.com/snowclipsed/moondream-zig.git
 cd moondream-zig
 
 # Build the project
