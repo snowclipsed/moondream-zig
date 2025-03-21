@@ -8,11 +8,10 @@ const math = std.math;
 const sgemm = @import("sgemm.zig");
 const hgemm = @import("hgemm.zig");
 const hgemm_trans = @import("hgemm_trans.zig");
-const layerNorm = @import("ops.zig").layerNorm;
-const layerNormYoloInner = @import("ops.zig").layerNormYoloInner;
 
 // Import common dependency
 const Tensor = @import("tensor.zig").Tensor;
+const SlabReusingAllocator = @import("slab_reusing_allocator.zig").SlabReusingAllocator;
 
 // ANSI color codes for terminal output
 pub const Color = struct {
@@ -333,7 +332,10 @@ pub fn main() !void {
     // Initialize allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const gpa_allocator = gpa.allocator();
+    var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
+    defer slab_reusing_allocator.deinit();
+    const allocator = slab_reusing_allocator.allocator();
 
     // Benchmarking parameters
     const num_runs = 5;

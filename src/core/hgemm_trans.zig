@@ -6,6 +6,7 @@ const ArrayList = std.ArrayList;
 
 const Tensor = @import("../core/tensor.zig").Tensor;
 const ops = @import("../core/ops.zig");
+const SlabReusingAllocator = @import("slab_reusing_allocator.zig").SlabReusingAllocator;
 
 const testing = std.testing;
 const time = @import("std").time;
@@ -608,7 +609,10 @@ pub fn main() !void {
     // Initialize allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const gpa_allocator = gpa.allocator();
+    var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
+    defer slab_reusing_allocator.deinit();
+    const allocator = slab_reusing_allocator.allocator();
 
     // Print header
     print("\nMatrix Multiplication Benchmark\n", .{});

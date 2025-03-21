@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const atomic = std.atomic;
 const math = std.math;
 const Tensor = @import("tensor.zig").Tensor;
+const SlabReusingAllocator = @import("slab_reusing_allocator.zig").SlabReusingAllocator;
 
 const time = std.time;
 const testing = std.testing;
@@ -492,7 +493,10 @@ fn printBenchmarkResults(label: []const u8, gflops: f64, M: usize, N: usize, K: 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const gpa_allocator = gpa.allocator();
+    var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
+    defer slab_reusing_allocator.deinit();
+    const allocator = slab_reusing_allocator.allocator();
 
     const num_runs = 5; // Number of timing runs for each size
 

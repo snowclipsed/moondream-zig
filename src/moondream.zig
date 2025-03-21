@@ -13,6 +13,7 @@ const sampling = @import("utils/sampling.zig");
 const Tensor = @import("core/tensor.zig").Tensor;
 const Slice = @import("core/tensor.zig").Slice;
 const ops = @import("core/ops.zig");
+const SlabReusingAllocator = @import("core/slab_reusing_allocator.zig").SlabReusingAllocator;
 
 const displayImage = @import("utils/image_display.zig").displayImage;
 const print = std.debug.print;
@@ -169,7 +170,10 @@ pub fn main() !void {
     const init_start = timer.read();
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const gpa_allocator = gpa.allocator();
+    var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
+    defer slab_reusing_allocator.deinit();
+    const allocator = slab_reusing_allocator.allocator();
 
     // Parse command line arguments
     const args = try parseArgs(allocator);
