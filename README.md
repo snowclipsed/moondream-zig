@@ -133,7 +133,7 @@ Below are performance benchmarks comparing moondream-zig with other implementati
 
 | Implementation | x86 with AVX2 (Intel i7-13620H) | ARM with NEON (Apple M3 Pro) |
 |----------------|----------------------------------|---------------------------|
-| moondream-zig  | 8                            | 14                        |
+| moondream-zig  | 8.5                            | 14                        |
 | Python (Huggingface)| 5.5                           | 10.5                      |
 
 
