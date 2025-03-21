@@ -18,13 +18,19 @@ const getColorForValue = @import("bench.zig").getColorForValue;
 const getInverseColorForValue = @import("bench.zig").getInverseColorForValue;
 const printColoredValue = @import("bench.zig").printColoredValue;
 const Color = @import("bench.zig").Color;
-const BenchmarkResult = @import("bench.zig").BenchmarkResult;
+// Updated BenchmarkResult struct that only tracks the best metrics
+// This is a redefinition of what's in bench.zig to match the new approach
+const BenchmarkResult = struct {
+    min_time_ns: u64, // Best (minimum) execution time
+    max_gflops: f64,  // Best (maximum) GFLOPS
+    max_bandwidth_gbps: f64, // Best (maximum) bandwidth in GB/s
+};
 
 fn benchmarkSLayerNormYolo(allocator: Allocator, M: usize, K: usize, num_runs: usize) !BenchmarkResult {
     return benchmarkSLayerNormInner(10, 1, allocator, M, K, num_runs);
 }
 
-fn benchmarkSLayerNormInner(comptime T: type, comptime large_unroll: usize, comptime stage2_unroll: usize, allocator: Allocator, M: usize, K: usize, num_runs: usize) !BenchmarkResult {
+fn benchmarkSLayerNormInner(comptime T: type, comptime N_A: usize, comptime N_B: usize, comptime N_S2: usize, allocator: Allocator, M: usize, K: usize, num_runs: usize) !BenchmarkResult {
     // Create tensors
     var a = try Tensor(T).init(allocator, &[_]usize{ M, K });
     defer a.deinit();
@@ -48,48 +54,35 @@ fn benchmarkSLayerNormInner(comptime T: type, comptime large_unroll: usize, comp
     const eps = 0.00001;
 
     // Warmup run
-    var warmup = try layerNormInner(T, large_unroll, large_unroll, stage2_unroll, false, a, g, b, eps);
+    var warmup = try layerNormInner(T, N_A, N_B, N_S2, false, a, g, b, eps);
     warmup.deinit();
 
     // Benchmark runs
-    var total_time: u64 = 0;
     var min_time: u64 = std.math.maxInt(u64);
-    var max_time: u64 = 0;
     var max_gflops: f64 = 0;
+    var max_bandwidth: f64 = 0;
 
     for (0..num_runs) |_| {
         var timer = try time.Timer.start();
-        var result = try layerNormInner(T, large_unroll, large_unroll, stage2_unroll, false, a, g, b, eps);
+        var result = try layerNormInner(T, N_A, N_B, N_S2, false, a, g, b, eps);
         const elapsed = timer.read();
         result.deinit();
 
-        total_time += elapsed;
         min_time = @min(min_time, elapsed);
-        max_time = @max(max_time, elapsed);
-
-        // Calculate GFLOPS for this run
-        const seconds = @as(f64, @floatFromInt(elapsed)) / 1e9;
-        const ops = 10 * M * K;
-        const gflops = @as(f64, @floatFromInt(ops)) / seconds / 1e9;
-        max_gflops = @max(max_gflops, gflops);
     }
 
-    const avg_time = total_time / num_runs;
-    const avg_seconds = @as(f64, @floatFromInt(min_time)) / 1e9;
+    const seconds = @as(f64, @floatFromInt(min_time)) / 1e9;
     const ops = 10 * M * K;
-    const avg_gflops = @as(f64, @floatFromInt(ops)) / avg_seconds / 1e9;
-
-    // Calculate memory bandwidth
+    const gflops = @as(f64, @floatFromInt(ops)) / seconds / 1e9;
+    max_gflops = @max(max_gflops, gflops);
     const bytes_accessed = @as(f64, @floatFromInt((2 * M * K) * @sizeOf(T)));
-    const avg_bandwidth = bytes_accessed / avg_seconds / 1e9;
+    const bandwidth = bytes_accessed / seconds / 1e9;
+    max_bandwidth = @max(max_bandwidth, bandwidth);
 
     return BenchmarkResult{
-        .avg_time_ns = avg_time,
         .min_time_ns = min_time,
-        .max_time_ns = max_time,
-        .avg_gflops = avg_gflops,
         .max_gflops = max_gflops,
-        .avg_bandwidth_gbps = avg_bandwidth,
+        .max_bandwidth_gbps = max_bandwidth,
     };
 }
 
@@ -121,45 +114,31 @@ fn benchmarkSLayerNormOld(T: type, allocator: Allocator, M: usize, K: usize, num
     warmup.deinit();
 
     // Benchmark runs
-    var total_time: u64 = 0;
     var min_time: u64 = std.math.maxInt(u64);
-    var max_time: u64 = 0;
     var max_gflops: f64 = 0;
+    var max_bandwidth: f64 = 0;
 
     for (0..num_runs) |_| {
-        //_ = try layerNormOldF64(T, a, g, b, eps);
         var timer = try time.Timer.start();
         var result = try layerNormOld(T, a, g, b, eps);
         const elapsed = timer.read();
         result.deinit();
 
-        total_time += elapsed;
         min_time = @min(min_time, elapsed);
-        max_time = @max(max_time, elapsed);
-
-        // Calculate GFLOPS for this run
-        const seconds = @as(f64, @floatFromInt(elapsed)) / 1e9;
-        const ops = 10 * M * K;
-        const gflops = @as(f64, @floatFromInt(ops)) / seconds / 1e9;
-        max_gflops = @max(max_gflops, gflops);
     }
 
-    const avg_time = total_time / num_runs;
-    const avg_seconds = @as(f64, @floatFromInt(avg_time)) / 1e9;
+    const seconds = @as(f64, @floatFromInt(min_time)) / 1e9;
     const ops = 10 * M * K;
-    const avg_gflops = @as(f64, @floatFromInt(ops)) / avg_seconds / 1e9;
-
-    // Calculate memory bandwidth
+    const gflops = @as(f64, @floatFromInt(ops)) / seconds / 1e9;
+    max_gflops = gflops;
     const bytes_accessed = @as(f64, @floatFromInt((2 * M * K) * @sizeOf(T)));
-    const avg_bandwidth = bytes_accessed / avg_seconds / 1e9;
+    const bandwidth = bytes_accessed / seconds / 1e9;
+    max_bandwidth = bandwidth;
 
     return BenchmarkResult{
-        .avg_time_ns = avg_time,
         .min_time_ns = min_time,
-        .max_time_ns = max_time,
-        .avg_gflops = avg_gflops,
         .max_gflops = max_gflops,
-        .avg_bandwidth_gbps = avg_bandwidth,
+        .max_bandwidth_gbps = max_bandwidth,
     };
 }
 
@@ -572,15 +551,16 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
     print("║ CPU Threads:          {d:>10}                             ║\n", .{try std.Thread.getCpuCount()});
     print("║ Batch Size (M):       {d:>10}                             ║\n", .{M});
     print("║ Iterations per test:  {d:>10}                             ║\n", .{num_runs});
-    print("║ Grid Search:          Unroll factors from 0 to 8           ║\n", .{});
+    print("║ Grid Search:          Fixed configurations                  ║\n", .{});
     print("╚══════════════════════════════════════════════════════════════╝\n\n", .{});
 
     print("Running layer normalization grid search...\n", .{});
 
     // Define a struct to hold benchmark results for a specific configuration
     const YoloConfig = struct {
-        first_unroll: u8,
-        second_unroll: u8,
+        N_A: usize,
+        N_B: usize,
+        N_S2: usize,
         result: BenchmarkResult,
     };
 
@@ -601,6 +581,10 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         all_results.deinit();
     }
 
+    const N_A_values = [_]usize{  0, 1, 0, 1, 8, 2, 6 };
+    const N_B_values = [_]usize{  1, 0, 1, 0, 8, 6, 2 };
+    const N_S2_values = [_]usize{ 4, 4, 8, 8, 4, 8, 8 };
+
     // Benchmark each dimension
     for (embed_dims) |dim_info| {
         print("  Benchmarking Layer Norm for dimension: {d} ({s})...\n", .{ dim_info.dim, dim_info.desc });
@@ -611,29 +595,31 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         // Create configs list for this dimension
         var configs = std.ArrayList(YoloConfig).init(allocator);
 
-        // Now run grid search over unroll factors (first_unroll, second_unroll)
-        // Total unroll will range from 0 to 8, divided between first and second unroll
-        inline for (8..9) |first_unroll| {
-            print("    Testing first unroll factor {d}...\n", .{first_unroll});
+        // Now run benchmarks for fixed configurations
+        inline for (0..N_A_values.len) |idx| {
+            const N_A = N_A_values[idx];
+            const N_B = N_B_values[idx];
+            const N_S2 = N_S2_values[idx];
+            print("    Testing Yolo(N_A={d}, N_B={d}, N_S2={d})...\n", .{ N_A, N_B, N_S2 });
 
-            inline for (4..5) |second_unroll| {
-                // Benchmark YoloLN with these unroll factors
-                const yolo_result = try benchmarkSLayerNormInner(
-                    T,
-                    first_unroll,
-                    second_unroll,
-                    allocator,
-                    M,
-                    dim_info.dim,
-                    num_runs*10,
-                );
+            // Benchmark YoloLN with these parameters
+            const yolo_result = try benchmarkSLayerNormInner(
+                T,
+                N_A,
+                N_B,
+                N_S2,
+                allocator,
+                M,
+                dim_info.dim,
+                num_runs*10,
+            );
 
-                try configs.append(.{
-                    .first_unroll = @intCast(first_unroll),
-                    .second_unroll = @intCast(second_unroll),
-                    .result = yolo_result,
-                });
-            }
+            try configs.append(.{
+                .N_A = N_A,
+                .N_B = N_B,
+                .N_S2 = N_S2,
+                .result = yolo_result,
+            });
         }
 
         // Add results for this dimension
@@ -667,7 +653,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
     var min_speedup: f64 = std.math.inf(f64);
     var max_speedup: f64 = 0;
     var min_time: f64 = std.math.inf(f64);
-    var max_time: f64 = 0;    // Find min/max speedups for color normalization
+    var max_time: f64 = 0;
     var min_bandwidth: f64 = std.math.inf(f64);
     var max_bandwidth: f64 = 0;
 
@@ -679,15 +665,15 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         const standard_ms = @as(f64, @floatFromInt(dim_result.standard.min_time_ns)) / 1e6;
         min_time = @min(min_time, standard_ms);
         max_time = @max(max_time, standard_ms);
-        min_bandwidth = @min(min_bandwidth, dim_result.standard.avg_bandwidth_gbps);
-        max_bandwidth = @max(max_bandwidth, dim_result.standard.avg_bandwidth_gbps);
+        min_bandwidth = @min(min_bandwidth, dim_result.standard.max_bandwidth_gbps);
+        max_bandwidth = @max(max_bandwidth, dim_result.standard.max_bandwidth_gbps);
 
         // Check all configs
         for (dim_result.configs.items) |config| {
             min_gflops = @min(min_gflops, config.result.max_gflops);
             max_gflops = @max(max_gflops, config.result.max_gflops);
-            min_bandwidth = @min(min_bandwidth, config.result.avg_bandwidth_gbps);
-            max_bandwidth = @max(max_bandwidth, config.result.avg_bandwidth_gbps);
+            min_bandwidth = @min(min_bandwidth, config.result.max_bandwidth_gbps);
+            max_bandwidth = @max(max_bandwidth, config.result.max_bandwidth_gbps);
 
             const speedup = config.result.max_gflops / dim_result.standard.max_gflops;
             min_speedup = @min(min_speedup, speedup);
@@ -723,8 +709,8 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
 
         // Format the config string
         var config_buf: [32]u8 = undefined;
-        const config_str = std.fmt.bufPrint(&config_buf, "Yolo({d},{d})", .{
-            best_config.first_unroll, best_config.second_unroll
+        const config_str = std.fmt.bufPrint(&config_buf, "Yolo({d},{d},{d})", .{
+            best_config.N_A, best_config.N_B, best_config.N_S2
         }) catch unreachable;
 
         // Print row
@@ -778,23 +764,24 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         print(" │ ", .{});
         printColoredValue(standard_ms, getInverseColorForValue(standard_ms, min_time, max_time), 15, 2);
         print(" │ {s}{s:^15}{s} │ ", .{ Color.white, "baseline", Color.reset });
-        printColoredValue(dim_result.standard.avg_bandwidth_gbps,
-            getColorForValue(dim_result.standard.avg_bandwidth_gbps, 0, max_bandwidth), 15, 2);
+        printColoredValue(dim_result.standard.max_bandwidth_gbps,
+            getColorForValue(dim_result.standard.max_bandwidth_gbps, 0, max_bandwidth), 15, 2);
         print(" │\n", .{});
 
-        // Then print all Yolo configurations, sorted by total unroll
+        // Then print all Yolo configurations
         const configs_sorted = try allocator.dupe(YoloConfig, dim_result.configs.items);
         defer allocator.free(configs_sorted);
 
-        // Sort configs by total unroll, then by first_unroll
+        // Sort configs by N_A, then by N_B, then by N_S2
         std.sort.pdq(YoloConfig, configs_sorted, {}, struct {
             pub fn lessThan(_: void, a: YoloConfig, b: YoloConfig) bool {
-                const a_total = a.first_unroll + a.second_unroll;
-                const b_total = b.first_unroll + b.second_unroll;
-                if (a_total == b_total) {
-                    return a.first_unroll < b.first_unroll;
+                if (a.N_A == b.N_A) {
+                    if (a.N_B == b.N_B) {
+                        return a.N_S2 < b.N_S2;
+                    }
+                    return a.N_B < b.N_B;
                 }
-                return a_total < b_total;
+                return a.N_A < b.N_A;
             }
         }.lessThan);
 
@@ -804,15 +791,15 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
 
             // Format the config string
             var config_buf: [32]u8 = undefined;
-            const config_str = std.fmt.bufPrint(&config_buf, "Yolo({d},{d})", .{
-                config.first_unroll, config.second_unroll
+            const config_str = std.fmt.bufPrint(&config_buf, "Yolo({d},{d},{d})", .{
+                config.N_A, config.N_B, config.N_S2
             }) catch unreachable;
 
             // Get colors
             const gflops_color = getColorForValue(config.result.max_gflops, min_gflops, max_gflops);
             const time_color = getInverseColorForValue(config_ms, min_time, max_time);
             const speedup_color = getColorForValue(speedup, min_speedup, max_speedup);
-            const bandwidth_color = getColorForValue(config.result.avg_bandwidth_gbps, 0, max_bandwidth);
+            const bandwidth_color = getColorForValue(config.result.max_bandwidth_gbps, 0, max_bandwidth);
 
             // Print row
             print("│ {s:^15} │ ", .{config_str});
@@ -822,7 +809,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
             print(" │ ", .{});
             printColoredValue(speedup, speedup_color, 15, 2);
             print("x │ ", .{});
-            printColoredValue(config.result.avg_bandwidth_gbps, bandwidth_color, 15, 2);
+            printColoredValue(config.result.max_bandwidth_gbps, bandwidth_color, 15, 2);
             print(" │\n", .{});
         }
 
@@ -838,8 +825,9 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         power: u6,
         factor: usize,
         dimensions: std.ArrayList(usize),
-        best_first_unroll: u8,
-        best_second_unroll: u8,
+        best_N_A: usize,
+        best_N_B: usize,
+        best_N_S2: usize,
         avg_speedup: f64,
     };
 
@@ -883,8 +871,9 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
 
             // Update best config if this one is better
             if (speedup > config.avg_speedup) {
-                config.best_first_unroll = best_config.first_unroll;
-                config.best_second_unroll = best_config.second_unroll;
+                config.best_N_A = best_config.N_A;
+                config.best_N_B = best_config.N_B;
+                config.best_N_S2 = best_config.N_S2;
                 config.avg_speedup = speedup;
             }
         } else {
@@ -895,8 +884,9 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
                 .power = power,
                 .factor = @as(usize, 1) << power,
                 .dimensions = dimensions,
-                .best_first_unroll = best_config.first_unroll,
-                .best_second_unroll = best_config.second_unroll,
+                .best_N_A = best_config.N_A,
+                .best_N_B = best_config.N_B,
+                .best_N_S2 = best_config.N_S2,
                 .avg_speedup = speedup,
             });
         }
@@ -964,8 +954,8 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
         var config_buf: [32]u8 = undefined;
         const config_str = std.fmt.bufPrint(
             &config_buf,
-            "Yolo({d},{d})",
-            .{config.best_first_unroll, config.best_second_unroll}
+            "Yolo({d},{d},{d})",
+            .{config.best_N_A, config.best_N_B, config.best_N_S2}
         ) catch unreachable;
 
         // Print row
@@ -982,58 +972,77 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
 
     print("└───────────────────┴───────────────────┴───────────────────┴───────────────────┴───────────────────┘\n", .{});
 
-    // ===== UNROLL FACTOR ANALYSIS =====
+// ===== CONFIGURATION ANALYSIS =====
 
-    printColoredHeader("Performance by Unroll Factor Distribution");
+    printColoredHeader("Performance by Full Configuration");
 
-    // Create a 2D grid of total_unroll vs first_unroll ratio
-    const max_unroll = 20;
-    const UnrollAnalysis = struct {
-        total_unroll: u8,
-        first_ratio: f64, // first_unroll / total_unroll
+    // Create an analysis of how each full configuration affects performance
+    const ConfigAnalysis = struct {
+        N_A: usize,
+        N_B: usize,
+        N_S2: usize,
         sample_count: usize,
         avg_speedup: f64,
     };
 
-    var unroll_grid = std.ArrayList(UnrollAnalysis).init(allocator);
-    defer unroll_grid.deinit();
+    var config_analysis = std.ArrayList(ConfigAnalysis).init(allocator);
+    defer config_analysis.deinit();
 
-    // Collect data for the grid
-    for (1..max_unroll + 1) |total_unroll| {
-        for (0..total_unroll + 1) |first_unroll| {
-            const first_ratio = if (total_unroll > 0)
-                @as(f64, @floatFromInt(first_unroll)) / @as(f64, @floatFromInt(total_unroll))
-            else
-                0.0;
+    // Create a hash map to store aggregated data for each unique configuration
+    var config_map = std.AutoHashMap(struct { N_A: usize, N_B: usize, N_S2: usize }, struct {
+        total_speedup: f64,
+        count: usize,
+    }).init(allocator);
+    defer config_map.deinit();
 
-            var sample_count: usize = 0;
-            var total_speedup: f64 = 0.0;
+    // Collect all configurations and their performance
+    for (all_results.items) |dim_result| {
+        for (dim_result.configs.items) |config| {
+            const key = .{
+                .N_A = config.N_A,
+                .N_B = config.N_B,
+                .N_S2 = config.N_S2,
+            };
 
-            // Collect all results with this unroll configuration
-            for (all_results.items) |dim_result| {
-                for (dim_result.configs.items) |config| {
-                    if (config.first_unroll + config.second_unroll == total_unroll and
-                        config.first_unroll == first_unroll) {
-                        sample_count += 1;
-                        total_speedup += config.result.max_gflops / dim_result.standard.max_gflops;
-                    }
-                }
-            }
+            const speedup = config.result.max_gflops / dim_result.standard.max_gflops;
 
-            if (sample_count > 0) {
-                try unroll_grid.append(.{
-                    .total_unroll = @intCast(total_unroll),
-                    .first_ratio = first_ratio,
-                    .sample_count = sample_count,
-                    .avg_speedup = total_speedup / @as(f64, @floatFromInt(sample_count)),
+            if (config_map.getPtr(key)) |entry| {
+                entry.total_speedup += speedup;
+                entry.count += 1;
+            } else {
+                try config_map.put(key, .{
+                    .total_speedup = speedup,
+                    .count = 1,
                 });
             }
         }
     }
 
+    // Convert map to array for sorting
+    var map_it = config_map.iterator();
+    while (map_it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+
+        try config_analysis.append(.{
+            .N_A = key.N_A,
+            .N_B = key.N_B,
+            .N_S2 = key.N_S2,
+            .sample_count = value.count,
+            .avg_speedup = value.total_speedup / @as(f64, @floatFromInt(value.count)),
+        });
+    }
+
+    // Sort configurations by average speedup (descending)
+    std.sort.pdq(ConfigAnalysis, config_analysis.items, {}, struct {
+        pub fn lessThan(_: void, a: ConfigAnalysis, b: ConfigAnalysis) bool {
+            return a.avg_speedup > b.avg_speedup; // Note: descending order
+        }
+    }.lessThan);
+
     // Print table header
     print("┌───────────────────┬───────────────────┬───────────────────┬───────────────────┬───────────────────┐\n", .{});
-    print("│ {s}{s}Total Unroll{s}    │ {s}{s}First Unroll{s}    │ {s}{s}Second Unroll{s}   │ {s}{s}First Ratio{s}     │ {s}{s}Avg Speedup{s}    │\n", .{
+    print("│ {s}{s}N_A{s}            │ {s}{s}N_B{s}            │ {s}{s}N_S2{s}           │ {s}{s}Sample Count{s}   │ {s}{s}Avg Speedup{s}    │\n", .{
         Color.bold, Color.bright_white, Color.reset,
         Color.bold, Color.bright_white, Color.reset,
         Color.bold, Color.bright_white, Color.reset,
@@ -1043,41 +1052,26 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
     print("├───────────────────┼───────────────────┼───────────────────┼───────────────────┼───────────────────┤\n", .{});
 
     // Find min/max speedup for coloring
-    var unroll_min_speedup: f64 = std.math.inf(f64);
-    var unroll_max_speedup: f64 = 0;
+    var config_min_speedup: f64 = std.math.inf(f64);
+    var config_max_speedup: f64 = 0;
 
-    for (unroll_grid.items) |analysis| {
-        unroll_min_speedup = @min(unroll_min_speedup, analysis.avg_speedup);
-        unroll_max_speedup = @max(unroll_max_speedup, analysis.avg_speedup);
+    for (config_analysis.items) |analysis| {
+        config_min_speedup = @min(config_min_speedup, analysis.avg_speedup);
+        config_max_speedup = @max(config_max_speedup, analysis.avg_speedup);
     }
 
-    // Sort by total_unroll, then by first_ratio
-    std.sort.pdq(UnrollAnalysis, unroll_grid.items, {}, struct {
-        pub fn lessThan(_: void, a: UnrollAnalysis, b: UnrollAnalysis) bool {
-            if (a.total_unroll == b.total_unroll) {
-                return a.first_ratio < b.first_ratio;
-            }
-            return a.total_unroll < b.total_unroll;
-        }
-    }.lessThan);
-
     // Print results
-    for (unroll_grid.items) |analysis| {
-        const first_unroll = @as(usize, @intFromFloat(@as(f64, @floatFromInt(analysis.total_unroll)) * analysis.first_ratio));
-        const second_unroll = analysis.total_unroll - @as(u8, @intCast(first_unroll));
-
-        print("│ {d:^15} │ {d:^15} │ {d:^15} │ ", .{
-            analysis.total_unroll,
-            first_unroll,
-            second_unroll,
+    for (config_analysis.items) |analysis| {
+        // Format the config values
+        print("│ {d:^15} │ {d:^15} │ {d:^15} │ {d:^15} │ ", .{
+            analysis.N_A,
+            analysis.N_B,
+            analysis.N_S2,
+            analysis.sample_count,
         });
 
-        // Print first_ratio as percentage
-        printColoredValue(analysis.first_ratio * 100.0, Color.white, 12, 1);
-        print("% │ ", .{});
-
         // Print speedup with color
-        printColoredValue(analysis.avg_speedup, getColorForValue(analysis.avg_speedup, unroll_min_speedup, unroll_max_speedup), 15, 2);
+        printColoredValue(analysis.avg_speedup, getColorForValue(analysis.avg_speedup, config_min_speedup, config_max_speedup), 15, 2);
         print("x │\n", .{});
     }
 
