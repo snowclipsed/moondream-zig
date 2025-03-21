@@ -2,6 +2,7 @@ const std = @import("std");
 const Tensor = @import("core/tensor.zig").Tensor;
 const Slice = @import("core/tensor.zig").Slice;
 const ops = @import("core/ops.zig");
+const SlabReusingAllocator = @import("core/slab_reusing_allocator.zig").SlabReusingAllocator;
 
 const Tokenizer = @import("preprocessing/tokenizer.zig").Tokenizer;
 
@@ -645,7 +646,10 @@ pub fn main() !void {
     // Initialize allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const gpa_allocator = gpa.allocator();
+    var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
+    defer slab_reusing_allocator.deinit();
+    const allocator = slab_reusing_allocator.allocator();
 
     // Initialize standard I/O
     const stdout = std.io.getStdOut().writer();
