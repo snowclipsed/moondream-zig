@@ -1,4 +1,5 @@
 const std = @import("std");
+const SlabReusingAllocator = @import("../core/slab_reusing_allocator.zig").SlabReusingAllocator;
 
 const c = @cImport({
     @cInclude("stb_image.h");
@@ -142,7 +143,10 @@ fn printColorBlock(upper: Pixel, lower: Pixel, current_x: usize, term_width: usi
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const gpa_allocator = gpa.allocator();
+    var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
+    defer slab_reusing_allocator.deinit();
+    const allocator = slab_reusing_allocator.allocator();
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
