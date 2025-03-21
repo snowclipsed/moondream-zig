@@ -15,7 +15,7 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
         const Self = @This();
 
         // We'll use one slot for each power of 2 (up to 64)
-        const NUM_BUCKETS = 64;
+        const NUM_BUCKETS = 32;
 
         backing_allocator: Allocator,
 
