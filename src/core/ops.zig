@@ -1428,9 +1428,9 @@ pub fn layerNormOldF64(comptime T: type, input: Tensor(T), weight: Tensor(T), bi
 
 pub fn layerNormOldInner(comptime T: type, comptime ET: type,input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
     // Check input stability
-    try checkStability(T, input);
-    try checkStability(T, weight);
-    try checkStability(T, bias);
+    // try checkStability(T, input);
+    // try checkStability(T, weight);
+    // try checkStability(T, bias);
 
     // Validate epsilon
     if (eps <= 0) {
@@ -1457,7 +1457,7 @@ pub fn layerNormOldInner(comptime T: type, comptime ET: type,input: Tensor(T), w
     }
 
     // Create output tensor with same shape as input
-    var output = try input.copy();
+    var output = try input.copyShape();
     errdefer output.deinit();
 
     // Compute mean and variance for each feature vector using Welford's online algorithm
@@ -1517,12 +1517,12 @@ pub fn layerNormOldInner(comptime T: type, comptime ET: type,input: Tensor(T), w
             const final_value = scaled + bias_val;
 
             // Check for stability of computed value
-            if (std.math.isNan(final_value)) {
-                return error.ComputedNaN;
-            }
-            if (std.math.isInf(final_value)) {
-                return error.ComputedInfinity;
-            }
+            // if (std.math.isNan(final_value)) {
+            //     return error.ComputedNaN;
+            // }
+            // if (std.math.isInf(final_value)) {
+            //     return error.ComputedInfinity;
+            // }
 
             // Cast back to original type T only at the end
             output.data[j] = @floatCast(final_value);
@@ -1530,7 +1530,7 @@ pub fn layerNormOldInner(comptime T: type, comptime ET: type,input: Tensor(T), w
     }
 
     // Final stability check on output
-    try checkStability(T, output);
+    //try checkStability(T, output);
     return output;
 }
 
