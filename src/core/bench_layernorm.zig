@@ -169,7 +169,7 @@ pub fn benchmarkLayerNormGrid(T: type) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const gpa_allocator = gpa.allocator();
-    var slab_reusing_allocator = SlabReusingAllocator(10).init(gpa_allocator);
+    var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
     defer slab_reusing_allocator.deinit();
     const allocator = slab_reusing_allocator.allocator();
 
