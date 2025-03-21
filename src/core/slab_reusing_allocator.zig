@@ -129,10 +129,11 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
 
         fn alloc(
             ctx: *anyopaque,
-            len: usize,
+            len_: usize,
             log2_ptr_align_u8: u8,
             ret_addr: usize
         ) ?[*]u8 {
+            const len = @max(len_, PAGE_ALIGN);
             const self: *Self = @ptrCast(@alignCast(ctx));
             const log2_ptr_align = @as(Allocator.Log2Align, @intCast(log2_ptr_align_u8));
 
