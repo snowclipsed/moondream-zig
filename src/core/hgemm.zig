@@ -380,7 +380,7 @@ pub fn matmul(a: Tensor(f16), b: Tensor(f16), allocator: Allocator) !Tensor(f16)
         return error.IncompatibleTensorShapes;
     }
 
-    var result = try Tensor(f16).init(allocator, &[_]usize{ M, N });
+    var result = try Tensor(f16).initWithoutMemset(allocator, &[_]usize{ M, N });
     errdefer result.deinit();
 
     const A_data = a.getSlice();

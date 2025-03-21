@@ -443,7 +443,7 @@ pub fn broadcast_add(comptime T: type, a: *Tensor(T), b: Tensor(T)) !void {
 // Helper function for broadcasting multiplication
 pub fn broadcast_multiply(comptime T: type, a: *Tensor(T), b: Tensor(T)) !void {
     // Create a temporary tensor for the result
-    var result = try a.copy();
+    var result = try a.copyShape();
     defer result.deinit();
 
     // Perform broadcasted multiplication
@@ -462,7 +462,7 @@ pub fn broadcast_multiply(comptime T: type, a: *Tensor(T), b: Tensor(T)) !void {
 
 // Helper function for broadcasting subtraction
 pub fn broadcast_subtract(comptime T: type, a: *Tensor(T), b: Tensor(T)) !void {
-    var result = try a.copy();
+    var result = try a.copyShape();
     defer result.deinit();
 
     const total_elements = a.data.len;
@@ -1195,7 +1195,7 @@ pub fn layerNormInner(
     }
 
     // Create output tensor with same shape as input
-    var output = try input.copy();
+    var output = try input.copyShape();
     errdefer output.deinit();
 
     const N_U = N_A + N_B;

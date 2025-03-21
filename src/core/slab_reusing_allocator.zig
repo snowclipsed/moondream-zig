@@ -22,17 +22,19 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
         // Our caches of free slabs, organized by size class
         // For each bucket, we have a deque implemented as a circular buffer
         slabs: [NUM_BUCKETS][DEQUE_SIZE]?[*]align(PAGE_ALIGN) u8,
-        tops: [NUM_BUCKETS]usize,  // Index of the top element + 1 (0 means empty)
+        tops: [NUM_BUCKETS]usize, // Index of the top element + 1 (0 means empty)
         sizes: [NUM_BUCKETS]usize, // Number of elements in the deque
 
         // Tracks the original size of each allocation for later freeing
         size_map: std.AutoHashMap(usize, usize),
 
+        mutex: std.Thread.Mutex = .{},
+
         pub fn init(backing_allocator: Allocator) Self {
             const self = Self{
                 .backing_allocator = backing_allocator,
                 .slabs = [_][DEQUE_SIZE]?[*]align(PAGE_ALIGN) u8{[_]?[*]align(PAGE_ALIGN) u8{null} ** DEQUE_SIZE} ** NUM_BUCKETS,
-                .tops = [_]usize{DEQUE_SIZE-1} ** NUM_BUCKETS,
+                .tops = [_]usize{DEQUE_SIZE - 1} ** NUM_BUCKETS,
                 .sizes = [_]usize{0} ** NUM_BUCKETS,
                 .size_map = std.AutoHashMap(usize, usize).init(backing_allocator),
             };
@@ -45,11 +47,7 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
                 while (self.sizes[bucket_idx] > 0) {
                     if (self.popSlab(bucket_idx)) |ptr| {
                         const log2_align = math.log2(PAGE_ALIGN);
-                        self.backing_allocator.rawFree(
-                            ptr[0..self.sizeFromBucket(bucket_idx)],
-                            log2_align,
-                            @returnAddress()
-                        );
+                        self.backing_allocator.rawFree(ptr[0..self.sizeFromBucket(bucket_idx)], log2_align, @returnAddress());
                     }
                 }
             }
@@ -99,11 +97,7 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
                 const size = self.sizeFromBucket(bucket_idx);
                 const log2_align = math.log2(PAGE_ALIGN);
                 // std.log.err("I'm calling rawFree because the deque is full!", .{});
-                self.backing_allocator.rawFree(
-                    old_ptr[0..size],
-                    log2_align,
-                    @returnAddress()
-                );
+                self.backing_allocator.rawFree(old_ptr[0..size], log2_align, @returnAddress());
                 self.sizes[bucket_idx] -= 1;
             }
             const index = (self.tops[bucket_idx] + 1) % DEQUE_SIZE;
@@ -127,18 +121,16 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
             return ptr;
         }
 
-        fn alloc(
-            ctx: *anyopaque,
-            len_: usize,
-            log2_ptr_align_u8: u8,
-            ret_addr: usize
-        ) ?[*]u8 {
+        fn alloc(ctx: *anyopaque, len_: usize, log2_ptr_align_u8: u8, ret_addr: usize) ?[*]u8 {
             const len = @max(len_, PAGE_ALIGN);
             const self: *Self = @ptrCast(@alignCast(ctx));
             const log2_ptr_align = @as(Allocator.Log2Align, @intCast(log2_ptr_align_u8));
 
             // Calculate the effective alignment - use at least PAGE_ALIGN for large allocations
             const alignment = @max(@as(usize, 1) << @as(math.Log2Int(usize), @intCast(log2_ptr_align)), PAGE_ALIGN);
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
             // For non-standard alignments, delegate to backing allocator
             if ((len > THRESHOLD and alignment > PAGE_ALIGN)) {
@@ -156,11 +148,7 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
                     self.size_map.put(@intFromPtr(ptr), size) catch {
                         // If we can't track the size, we can't reuse this allocation
                         const log2_page_align = math.log2(PAGE_ALIGN);
-                        self.backing_allocator.rawFree(
-                            ptr[0..size],
-                            log2_page_align,
-                            ret_addr
-                        );
+                        self.backing_allocator.rawFree(ptr[0..size], log2_page_align, ret_addr);
                         // Fall through to allocate a new one
                     };
 
@@ -174,11 +162,7 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
                     // Record the original size for later freeing
                     self.size_map.put(@intFromPtr(ptr), size) catch {
                         // If we can't track the size, free it and return null
-                        self.backing_allocator.rawFree(
-                            ptr[0..size],
-                            log2_page_align,
-                            ret_addr
-                        );
+                        self.backing_allocator.rawFree(ptr[0..size], log2_page_align, ret_addr);
                         return null;
                     };
 
@@ -193,17 +177,15 @@ pub fn SlabReusingAllocator(comptime DEQUE_SIZE: usize) type {
             return self.backing_allocator.rawAlloc(len, log2_ptr_align, ret_addr);
         }
 
-        fn free(
-            ctx: *anyopaque,
-            ptr: []u8,
-            log2_ptr_align_u8: u8,
-            ret_addr: usize
-        ) void {
+        fn free(ctx: *anyopaque, ptr: []u8, log2_ptr_align_u8: u8, ret_addr: usize) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const log2_ptr_align = @as(Allocator.Log2Align, @intCast(log2_ptr_align_u8));
 
             // Early return for null allocations
             if (ptr.len == 0) return;
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
             // Check if this is one of our cached allocations
             if (self.size_map.get(@intFromPtr(ptr.ptr))) |size| {
