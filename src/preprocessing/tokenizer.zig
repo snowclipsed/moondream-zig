@@ -3,6 +3,7 @@ const mem = std.mem;
 const json = std.json;
 const Allocator = mem.Allocator;
 const Thread = std.Thread;
+const gpt_encode = @import("gpt_encode.zig");
 
 // Constants for parallel processing
 pub const MIN_PARALLEL_TEXT_SIZE = 10_000;
@@ -126,7 +127,7 @@ pub const Tokenizer = struct {
             const rstrip = obj.get("rstrip").?.bool;
             const normalized = obj.get("normalized").?.bool;
 
-            const content_copy = try allocator.dupe(u8, content);
+            const content_copy = try convertFromGpt2Chars(content, allocator);
             errdefer allocator.free(content_copy);
 
             try tokenizer.special_tokens.append(.{
@@ -148,7 +149,7 @@ pub const Tokenizer = struct {
             const token = entry.key_ptr.*;
             const id: u32 = @intCast(entry.value_ptr.*.integer);
 
-            const token_copy = try allocator.dupe(u8, token);
+            const token_copy = try convertFromGpt2Chars(token, allocator);
             errdefer allocator.free(token_copy);
 
             try tokenizer.tokens.put(token_copy, id);
@@ -157,6 +158,9 @@ pub const Tokenizer = struct {
         // Load merges
         const merges = model.get("merges").?.array;
         for (merges.items) |merge| {
+            // NOTE: if you eventually want to use the merges, the way to parse
+            // them is to first split by " " to get two strings separated by " "
+            // then gpt-decode each of these strings.
             const merge_str = try allocator.dupe(u8, merge.string);
             errdefer allocator.free(merge_str);
 
@@ -285,45 +289,19 @@ pub const Tokenizer = struct {
 
     // GPT2-specific functions from original
     fn convertToGpt2Chars(text: []const u8, allocator: Allocator) ![]u8 {
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
-
-        var i: usize = 0;
-        while (i < text.len) {
-            if (text[i] == ' ') {
-                try result.appendSlice(&GPT2_SPACE_PREFIX); // Ġ
-            } else if (text[i] == '\n') {
-                try result.appendSlice(&GPT2_NEWLINE_PREFIX); // Ċ
-            } else {
-                try result.append(text[i]);
-            }
-            i += 1;
-        }
-        return result.toOwnedSlice();
+        const out_len = gpt_encode.get_encoded_len(text);
+        const result = try allocator.alloc(u8, out_len);
+        errdefer allocator.free(result);
+        _ = try gpt_encode.encode(result, text);
+        return result;
     }
 
     fn convertFromGpt2Chars(text: []const u8, allocator: Allocator) ![]u8 {
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
-
-        var i: usize = 0;
-        while (i < text.len) {
-            // Check for Ġ
-            if (i + 1 < text.len and text[i] == 0xC4) {
-                if (text[i + 1] == 0xA0) {
-                    try result.append(' '); // Replace Ġ with space
-                    i += 2;
-                    continue;
-                } else if (text[i + 1] == 0x82) {
-                    try result.append('\n'); // Replace Ċ with newline
-                    i += 2;
-                    continue;
-                }
-            }
-            try result.append(text[i]);
-            i += 1;
-        }
-        return result.toOwnedSlice();
+        const out_len = gpt_encode.get_decoded_len(text);
+        const result = try allocator.alloc(u8, out_len);
+        errdefer allocator.free(result);
+        _ = try gpt_encode.decode(result, text);
+        return result;
     }
 
     // Parallel processing functions
@@ -354,17 +332,14 @@ pub const Tokenizer = struct {
         var tokens = std.ArrayList(u32).init(self.allocator);
         errdefer tokens.deinit();
 
-        const gpt2_text = try convertToGpt2Chars(chunk, self.allocator);
-        defer self.allocator.free(gpt2_text);
-
         var current_pos: usize = 0;
-        while (current_pos < gpt2_text.len) {
+        while (current_pos < chunk.len) {
             var current_node = self.trie_root;
             var longest_match: ?struct { id: u32, len: usize } = null;
             var match_length: usize = 0;
 
-            while (current_pos + match_length < gpt2_text.len) {
-                const byte = gpt2_text[current_pos + match_length];
+            while (current_pos + match_length < chunk.len) {
+                const byte = chunk[current_pos + match_length];
                 if (current_node.children.get(byte)) |next_node| {
                     current_node = next_node;
                     match_length += 1;
@@ -378,7 +353,7 @@ pub const Tokenizer = struct {
                 try tokens.append(match.id);
                 current_pos += match.len;
             } else {
-                try tokens.append(gpt2_text[current_pos]);
+                try tokens.append(chunk[current_pos]);
                 current_pos += 1;
             }
         }
@@ -498,9 +473,7 @@ pub const Tokenizer = struct {
             var it = self.tokens.iterator();
             while (it.next()) |entry| {
                 if (entry.value_ptr.* == token_id) {
-                    const converted = try convertFromGpt2Chars(entry.key_ptr.*, self.allocator);
-                    defer self.allocator.free(converted);
-                    try decoded.appendSlice(converted);
+                    try decoded.appendSlice(entry.key_ptr.*);
                     found = true;
                     break;
                 }
