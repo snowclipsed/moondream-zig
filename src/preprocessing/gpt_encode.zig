@@ -291,11 +291,10 @@ fn make_decode_table() [0x10000]u8 {
     @memset(&ret, 0xaa);
     for (ENCODE_TABLE, 0..) |slice, i| {
         if (slice.len == 1) {
-            var high_bits: u16 = 0;
             var n: usize = 0;
             while (n < 256) : (n += 1) {
-                ret[high_bits + slice[0]] = @as(u8, @intCast(i));
-                high_bits +%= 0x100;
+                const idx: u16 = @bitCast([2]u8{slice[0], n});
+                ret[idx] = i;
             }
         }
         if (slice.len == 2) {
