@@ -12,7 +12,7 @@ const hgemm = @import("../core/hgemm.zig");
 const rearrangeBCHWtoBTC = @import("../utils/reshape_handler.zig").rearrangeBCHWtoBTC;
 const normalizePatch = @import("../utils/reshape_handler.zig").normalizePatch;
 const convertBHWCtoBCHW = @import("../utils/reshape_handler.zig").convertBHWCtoBCHW;
-const attention = @import("../core/masklessattn.zig");
+const attention = @import("../core/attention.zig");
 
 const c = @cImport({
     @cInclude("stb_image.h");
