@@ -13,6 +13,8 @@ const VisionModel = @import("model/vision_model.zig").VisionModel;
 const TextModel = @import("model/text_model.zig").TextModel;
 const KVCache = @import("model/text_model.zig").KVCache;
 
+const thread_pool = @import("core/thread_pool.zig");
+
 const sampling = @import("utils/sampling.zig");
 const displayImage = @import("utils/image_display.zig").displayImage;
 
@@ -650,6 +652,10 @@ pub fn main() !void {
     var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
     defer slab_reusing_allocator.deinit();
     const allocator = slab_reusing_allocator.allocator();
+
+    // Initialize the global thread pool
+    try thread_pool.init(allocator);
+    defer thread_pool.deinit();
 
     // Initialize standard I/O
     const stdout = std.io.getStdOut().writer();

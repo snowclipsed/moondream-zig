@@ -5,6 +5,7 @@ const ArrayList = std.ArrayList;
 
 const Tensor = @import("../core/tensor.zig").Tensor;
 const ops = @import("../core/ops.zig");
+const thread_pool_mod = @import("../core/thread_pool.zig");
 
 const testing = std.testing;
 
@@ -94,22 +95,33 @@ fn optimizedMatmulF32InPlace(
     num_threads: ?usize,
 ) !void {
     @setRuntimeSafety(false);
-
     const M = a.shape[0];
     const N = b.shape[1];
     const K = a.shape[1];
-
     const tiles_M = (M + Tile - 1) / Tile;
     const tiles_N = (N + Tile - 1) / Tile;
     const total_tiles = tiles_M * tiles_N;
-
     var shared_data = ThreadLocalData{ .current_index = atomic.Value(usize).init(0) };
 
-    const cpu_count = try std.Thread.getCpuCount();
-    const actual_num_threads = if (num_threads) |nt| blk: {
-        if (nt == 1) break :blk 1;
-        break :blk @min(nt, cpu_count);
-    } else cpu_count;
+    // If explicitly requested to use a single thread, just do the work directly
+    if (num_threads) |nt| {
+        if (nt == 1) {
+            const context = ThreadContext{
+                .a = a.data,
+                .b = b.data,
+                .c = c,
+                .M = M,
+                .N = N,
+                .K = K,
+                .tiles_M = tiles_M,
+                .tiles_N = tiles_N,
+                .total_tiles = total_tiles,
+                .shared_counter = &shared_data,
+            };
+            workerThread(context);
+            return;
+        }
+    }
 
     const context = ThreadContext{
         .a = a.data,
@@ -124,30 +136,67 @@ fn optimizedMatmulF32InPlace(
         .shared_counter = &shared_data,
     };
 
-    const WorkerFn = struct {
-        fn worker(ctx: ThreadContext) void {
-            workerThread(ctx);
+    // Define task for thread pool
+    const MatMulTask = struct {
+        context: ThreadContext,
+
+        pub fn process(self: *@This()) void {
+            workerThread(self.context);
         }
     };
 
-    if (actual_num_threads == 1) {
-        workerThread(context);
-    } else {
-        var thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, actual_num_threads);
-        defer thread_pool.deinit();
+    // Try to use the global thread pool
+    if (thread_pool_mod.getInstance()) |_| {
+        // Determine thread count for efficient nested parallelism
+        const cpu_count = try std.Thread.getCpuCount();
+        const requested_threads = num_threads orelse cpu_count;
 
-        for (0..actual_num_threads) |_| {
-            try thread_pool.append(try std.Thread.spawn(.{}, WorkerFn.worker, .{context}));
+        // Use fewer threads if we're already in a parallel context
+        const active_tasks = thread_pool_mod.global_instance.?.active_tasks.load(.acquire);
+        const effective_cpus = if (active_tasks > 1)
+            @max(1, cpu_count / active_tasks)
+        else
+            cpu_count;
+
+        const actual_thread_count = @min(requested_threads, effective_cpus);
+
+        // Create and submit tasks
+        var tasks = try allocator.alloc(MatMulTask, actual_thread_count);
+        defer allocator.free(tasks);
+
+        for (0..actual_thread_count) |i| {
+            tasks[i] = MatMulTask{ .context = context };
+            try thread_pool_mod.submitTask(MatMulTask, MatMulTask.process, &tasks[i]);
         }
 
-        for (thread_pool.items) |thread| {
+        // Wait for all tasks to complete
+        try thread_pool_mod.waitForAll();
+    } else |_| {
+        // Fall back to original implementation
+        const cpu_count = try std.Thread.getCpuCount();
+        const actual_num_threads = if (num_threads) |nt|
+            if (nt == 0) cpu_count else @min(nt, cpu_count)
+        else
+            cpu_count;
+
+        const WorkerFn = struct {
+            fn worker(ctx: ThreadContext) void {
+                workerThread(ctx);
+            }
+        };
+
+        var local_thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, actual_num_threads);
+        defer local_thread_pool.deinit();
+
+        for (0..actual_num_threads) |_| {
+            try local_thread_pool.append(try std.Thread.spawn(.{}, WorkerFn.worker, .{context}));
+        }
+
+        for (local_thread_pool.items) |thread| {
             thread.join();
         }
     }
 }
-
-// workerThread and microKernelAVX2 remain unchanged below this point
-// ... (rest of the code remains exactly the same as in the original version)
 
 fn workerThread(ctx: ThreadContext) void {
     // Unchanged body from original implementation

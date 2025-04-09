@@ -19,6 +19,8 @@ const displayImage = @import("utils/image_display.zig").displayImage;
 const print = std.debug.print;
 const Timer = std.time.Timer;
 
+const thread_pool = @import("core/thread_pool.zig");
+
 // CONSTANTS //
 
 const ENABLE_STREAMING = true; // Comptime flag to control token streaming
@@ -174,6 +176,10 @@ pub fn main() !void {
     var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
     defer slab_reusing_allocator.deinit();
     const allocator = slab_reusing_allocator.allocator();
+
+    // Initialize the global thread pool
+    try thread_pool.init(allocator);
+    defer thread_pool.deinit();
 
     // Parse command line arguments
     const args = try parseArgs(allocator);

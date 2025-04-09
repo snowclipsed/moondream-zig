@@ -13,6 +13,7 @@ const ops = @import("../core/ops.zig");
 const hgemmTrans = @import("../core/hgemm_trans.zig");
 const rope = @import("../core/rope.zig");
 const attention = @import("../core/attention.zig");
+const masked_attention = @import("../core/maskedattn.zig");
 
 const mode = std.builtin.FloatMode.optimized;
 comptime {
@@ -283,10 +284,10 @@ pub fn TextModel(comptime model_config: Config) type {
 
             if (seq_len == 1) {
                 // Single token fast path
-                attn_output = try attention.singleMaskedSDPA(qr, k_final, v_final, attn_mask, self.allocator);
+                attn_output = try masked_attention.singleMaskedSDPA(qr, k_final, v_final, attn_mask, self.allocator);
             } else {
                 // Multi-token path
-                attn_output = try attention.multiMaskedSDPA(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
+                attn_output = try masked_attention.multiMaskedSDPA(qr, k_final, v_final, attn_mask, n_heads, head_dim, self.allocator);
             }
             defer attn_output.deinit();
 
