@@ -22,6 +22,7 @@ pub const ThreadPool = struct {
     const Worker = struct {
         thread: Thread,
         pool: *ThreadPool,
+        initialized: bool = false,
     };
 
     /// Fields
@@ -47,13 +48,35 @@ pub const ThreadPool = struct {
             .running = atomic.Value(bool).init(true),
             .active_tasks = atomic.Value(usize).init(0),
         };
+
         errdefer pool.task_queue.deinit();
         errdefer allocator.free(pool.workers);
 
-        // Initialize and start worker threads
+        // Initialize worker threads but don't start them yet
         for (pool.workers) |*worker| {
             worker.pool = pool;
+            worker.initialized = false;
+        }
+
+        // Start worker threads with proper error handling
+        errdefer {
+            // Signal threads to stop
+            pool.running.store(false, .seq_cst);
+            // Wake up all threads
+            pool.mutex.lock();
+            pool.condition.broadcast();
+            pool.mutex.unlock();
+            // Join all initialized threads
+            for (pool.workers) |*worker| {
+                if (worker.initialized) {
+                    worker.thread.join();
+                }
+            }
+        }
+
+        for (pool.workers) |*worker| {
             worker.thread = try Thread.spawn(.{}, workerFn, .{worker});
+            worker.initialized = true;
         }
 
         return pool;
@@ -61,19 +84,24 @@ pub const ThreadPool = struct {
 
     /// Shut down the thread pool and clean up resources
     pub fn deinit(self: *Self) void {
+        // Wait for all tasks to complete first
+        self.waitForAll();
+
         // Signal all threads to exit
-        self.running.store(false, .release);
+        self.running.store(false, .seq_cst);
 
         // Wake up all threads
         {
             self.mutex.lock();
-            defer self.mutex.unlock();
             self.condition.broadcast();
+            self.mutex.unlock();
         }
 
         // Wait for all threads to finish
         for (self.workers) |worker| {
-            worker.thread.join();
+            if (worker.initialized) {
+                worker.thread.join();
+            }
         }
 
         // Free resources
@@ -87,45 +115,58 @@ pub const ThreadPool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // First try adding to queue, then increment active tasks only on success
         try self.task_queue.writeItem(Task{ .func = func, .context = context });
-        _ = self.active_tasks.fetchAdd(1, .monotonic);
-        self.condition.signal();
+        _ = self.active_tasks.fetchAdd(1, .seq_cst);
+
+        // Wake all threads to ensure tasks are picked up efficiently
+        self.condition.broadcast();
     }
 
     /// Worker thread function
     fn workerFn(worker: *Worker) void {
         const pool = worker.pool;
 
-        while (pool.running.load(.acquire)) {
+        while (true) {
+            // Check running state first
+            if (!pool.running.load(.seq_cst)) {
+                return;
+            }
+
             // Try to get a task
             var task: ?Task = null;
 
-            // Critical section: check for and potentially get a task
+            // Critical section for task access
             pool.mutex.lock();
-            while (pool.task_queue.readItem()) |t| {
+
+            // Check for tasks
+            if (pool.task_queue.readItem()) |t| {
                 task = t;
-                break;
-            } else if (pool.running.load(.acquire)) {
-                // Wait for new tasks
+                pool.mutex.unlock();
+            } else {
+                // Check running state again inside critical section
+                if (!pool.running.load(.seq_cst)) {
+                    pool.mutex.unlock();
+                    return;
+                }
+
+                // No tasks and still running, wait for notification
                 pool.condition.wait(&pool.mutex);
                 pool.mutex.unlock();
                 continue;
             }
-            pool.mutex.unlock();
 
-            // If we have a task, execute it
+            // Execute task (outside of critical section)
             if (task) |t| {
                 t.func(t.context);
-                const prev_count = pool.active_tasks.fetchSub(1, .release);
+
+                const prev_count = pool.active_tasks.fetchSub(1, .seq_cst);
                 if (prev_count == 1) {
                     // Last task completed, wake up anyone waiting
                     pool.waiting_mutex.lock();
-                    defer pool.waiting_mutex.unlock();
                     pool.waiting_condition.broadcast();
+                    pool.waiting_mutex.unlock();
                 }
-            } else {
-                // No tasks and not running
-                break;
             }
         }
     }
@@ -133,13 +174,13 @@ pub const ThreadPool = struct {
     /// Wait for all tasks to complete
     pub fn waitForAll(self: *Self) void {
         // Fast path - check if no tasks are active
-        if (self.active_tasks.load(.acquire) == 0) return;
+        if (self.active_tasks.load(.seq_cst) == 0) return;
 
         // Wait for tasks to complete
         self.waiting_mutex.lock();
         defer self.waiting_mutex.unlock();
 
-        while (self.active_tasks.load(.acquire) > 0) {
+        while (self.active_tasks.load(.seq_cst) > 0) {
             self.waiting_condition.wait(&self.waiting_mutex);
         }
     }
@@ -183,9 +224,13 @@ pub fn deinit() void {
 
 /// Get the global thread pool instance
 pub fn getInstance() !*ThreadPool {
+    init_mutex.lock();
+    defer init_mutex.unlock();
+
     if (global_instance) |pool| {
         return pool;
     }
+
     return error.ThreadPoolNotInitialized;
 }
 
