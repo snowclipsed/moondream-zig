@@ -1104,15 +1104,15 @@ inline fn welfordAddOneArr(
     const Tv = @Vector(VLEN, T);
     var x: [N]Tv = undefined;
     inline for (0..N) |i| {
-        x[i] = @floatCast(@as(IN_Tv,xptr[i*VLEN..(i+1)*VLEN].*));
+        x[i] = @floatCast(@as(IN_Tv, xptr[i * VLEN .. (i + 1) * VLEN].*));
     }
     var delta: [N]Tv = undefined;
     inline for (0..N) |i| {
-        delta[N-1-i] = x[N-1-i] - mean[N-1-i];
+        delta[N - 1 - i] = x[N - 1 - i] - mean[N - 1 - i];
     }
     var delta2: [N]Tv = undefined;
     inline for (0..N_B) |i| {
-        delta2[N-1-i] = delta[N-1-i] * delta[N-1-i];
+        delta2[N - 1 - i] = delta[N - 1 - i] * delta[N - 1 - i];
     }
     inline for (0..N) |i| {
         mean[i] += delta[i] * rcp;
@@ -1161,8 +1161,8 @@ pub fn layerNormInner(
     input: Tensor(T),
     weight: Tensor(T),
     bias: Tensor(T),
-    eps: T) !Tensor(T)
-{
+    eps: T,
+) !Tensor(T) {
     // Check input stability
     if (CHECK_EVERYTHING) {
         try checkStability(T, input);
@@ -1216,7 +1216,7 @@ pub fn layerNormInner(
         // Initialize Welford's algorithm variables
         const leftover_n = last_dim % (VLEN * N_U);
         var count: f32v = @splat(@as(f32, N_FAKE_ZEROS));
-        var rcp: f32v = @splat(@as(f32, 1.0/N_FAKE_ZEROS));
+        var rcp: f32v = @splat(@as(f32, 1.0 / N_FAKE_ZEROS));
         var mean: [N_U]f32v = @bitCast([1]f32{0} ** (VLEN * N_U));
         var m2: [N_U]f32v = @bitCast([1]f32{0} ** (VLEN * N_U));
 
@@ -1236,7 +1236,7 @@ pub fn layerNormInner(
         // done with the fully unrolled part - accumulate remaining elements and some fake zeros
         if (leftover_n > 0) {
             @setFloatMode(.optimized);
-            var fake_xs: [VLEN*N_U]T = [1]T{0} ** (VLEN * N_U);
+            var fake_xs: [VLEN * N_U]T = [1]T{0} ** (VLEN * N_U);
             @memcpy(@as([*]T, @ptrCast(&fake_xs)), start_ptr[0..leftover_n]);
             start_ptr = @ptrCast(&fake_xs);
             const prev_count = count;
@@ -1251,7 +1251,7 @@ pub fn layerNormInner(
             const step: usize = 1 << tree_iter;
             inline for (0..N_U) |j| {
                 if (@ctz(j) > tree_iter and j + step < N_U) {
-                    welfordMerge(f32v, &counts[j], &mean[j], &m2[j], counts[j+step], mean[j+step], m2[j+step]);
+                    welfordMerge(f32v, &counts[j], &mean[j], &m2[j], counts[j + step], mean[j + step], m2[j + step]);
                 }
             }
         }
@@ -1265,7 +1265,7 @@ pub fn layerNormInner(
             const step: usize = 1 << tree_iter;
             inline for (0..VLEN) |j| {
                 if (@ctz(j) > tree_iter and j + step < VLEN) {
-                    welfordMerge(f32, &scounts[j], &smean[j], &sm2[j], scounts[j+step], smean[j+step], sm2[j+step]);
+                    welfordMerge(f32, &scounts[j], &smean[j], &sm2[j], scounts[j + step], smean[j + step], sm2[j + step]);
                 }
             }
         }
@@ -1333,7 +1333,7 @@ pub fn layerNormInner(
                 final_value[j] = final_value[j] * weight_val[j] + bias_val[j];
             }
             if (CHECK_EVERYTHING) {
-                const check_me: [VLEN*N_S2]f32 = @bitCast(final_value);
+                const check_me: [VLEN * N_S2]f32 = @bitCast(final_value);
                 for (check_me) |val| {
                     if (std.math.isNan(val)) {
                         return error.ComputedNaN;
@@ -1426,7 +1426,7 @@ pub fn layerNormOldF64(comptime T: type, input: Tensor(T), weight: Tensor(T), bi
     return layerNormOldInner(T, f64, input, weight, bias, eps);
 }
 
-pub fn layerNormOldInner(comptime T: type, comptime ET: type,input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
+pub fn layerNormOldInner(comptime T: type, comptime ET: type, input: Tensor(T), weight: Tensor(T), bias: Tensor(T), eps: T) !Tensor(T) {
     // Check input stability
     // try checkStability(T, input);
     // try checkStability(T, weight);
@@ -1632,6 +1632,9 @@ pub fn softmax(tensor: *Tensor(f32), dim: usize, allocator: Allocator) !void {
     }
 }
 
+const ThreadPool = @import("thread_pool.zig").ThreadPool;
+const global_thread_pool = @import("thread_pool.zig");
+
 pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
     if (@typeInfo(T) != .Float) {
         @compileError("GELU operation requires floating-point tensor");
@@ -1661,8 +1664,8 @@ pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
         return;
     }
 
-    // For large tensors, use parallel processing
-    const ThreadContext = struct {
+    // Context for GELU task
+    const GeluTaskContext = struct {
         data: []T,
         start: usize,
         end: usize,
@@ -1670,10 +1673,11 @@ pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
         const_alpha: T,
     };
 
-    // Calculate thread count and ensure we don't create too many threads
-    const thread_count = @min(@min(try std.Thread.getCpuCount(), tensor.data.len / 1024), 32);
+    // Get the global thread pool
+    const pool = try global_thread_pool.getInstance();
 
-    // Ensure at least one thread
+    // Calculate the number of tasks based on thread count
+    const thread_count = @min(@min(pool.workers.len, tensor.data.len / 1024), 32);
     if (thread_count == 0) {
         // Handle the tensor with a single thread if it's too small
         for (tensor.data) |*x| {
@@ -1694,15 +1698,17 @@ pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
         return;
     }
 
-    var threads = try std.ArrayList(std.Thread).initCapacity(std.heap.page_allocator, thread_count);
-    defer threads.deinit();
-
     // Calculate chunk size ensuring it's a multiple of 16 for better alignment
     const base_chunk_size = (tensor.data.len + thread_count - 1) / thread_count;
     const chunk_size = base_chunk_size + (16 - (base_chunk_size % 16)) % 16;
 
-    const WorkerFn = struct {
-        fn worker(ctx: *const ThreadContext) void {
+    // Create task contexts
+    var contexts = try std.ArrayList(GeluTaskContext).initCapacity(std.heap.page_allocator, thread_count);
+    defer contexts.deinit();
+
+    // Worker function for GELU computation
+    const processGeluChunk = struct {
+        fn worker(ctx: *GeluTaskContext) void {
             var i = ctx.start;
             const end = ctx.end;
             const data = ctx.data;
@@ -1745,32 +1751,29 @@ pub fn gelu(comptime T: type, tensor: *Tensor(T)) !void {
                 }
             }
         }
-    };
+    }.worker;
 
-    var contexts = try std.ArrayList(ThreadContext).initCapacity(std.heap.page_allocator, thread_count);
-    defer contexts.deinit();
-
-    // Create thread contexts and spawn threads
-    var i: usize = 0;
-    while (i < thread_count) : (i += 1) {
+    // Create task contexts and submit to thread pool
+    for (0..thread_count) |i| {
         const start = i * chunk_size;
         const end = if (i == thread_count - 1) tensor.data.len else @min((i + 1) * chunk_size, tensor.data.len);
 
-        try contexts.append(ThreadContext{
+        const context = GeluTaskContext{
             .data = tensor.data,
             .start = start,
             .end = end,
             .const_sqrt_2_div_pi = sqrt_2_div_pi,
             .const_alpha = alpha,
-        });
+        };
 
-        try threads.append(try std.Thread.spawn(.{}, WorkerFn.worker, .{&contexts.items[i]}));
+        try contexts.append(context);
+
+        // Submit task to the global thread pool
+        try global_thread_pool.submitTask(GeluTaskContext, processGeluChunk, &contexts.items[i]);
     }
 
-    // Wait for all threads to complete
-    for (threads.items) |thread| {
-        thread.join();
-    }
+    // Wait for all tasks to complete
+    try global_thread_pool.waitForAll();
 }
 
 //// SIMD Operations ////
