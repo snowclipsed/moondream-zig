@@ -7,6 +7,8 @@ const ArrayList = std.ArrayList;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const ops = @import("../core/ops.zig");
 const SlabReusingAllocator = @import("slab_reusing_allocator.zig").SlabReusingAllocator;
+const ThreadPool = @import("thread_pool.zig").ThreadPool;
+const global_thread_pool = @import("thread_pool.zig");
 
 const testing = std.testing;
 const time = @import("std").time;
@@ -26,7 +28,8 @@ const ThreadLocalData = struct {
     _padding: [64 - @sizeOf(atomic.Value(usize))]u8 = undefined,
 };
 
-const ThreadContext = struct {
+// Context for matrix multiplication tasks
+const TileTaskContext = struct {
     A: []const f16,
     B_t: []const f16,
     C: []f16,
@@ -40,7 +43,7 @@ const ThreadContext = struct {
 };
 
 // Context for vector-matrix multiplication
-const VectorThreadContext = struct {
+const VectorTaskContext = struct {
     A: []const f16,
     B_t: []const f16,
     C: []f16,
@@ -117,8 +120,8 @@ fn processVectorChunk(start_n: usize, end_n: usize, a: []const f16, b_t: []const
     }
 }
 
-// Vector-matrix multiplication worker
-fn vectorWorker(ctx: VectorThreadContext) void {
+// Task function for vector-matrix multiplication
+fn vectorChunkTask(ctx: *VectorTaskContext) void {
     @setFloatMode(.optimized);
     @setRuntimeSafety(false);
 
@@ -255,7 +258,7 @@ fn computeTile(
 }
 
 fn computeTileTransposed(
-    ctx: ThreadContext,
+    ctx: TileTaskContext,
     local_C: *[T][T]f32,
     i_start: usize,
     j_start: usize,
@@ -355,8 +358,9 @@ fn computeTileTransposed(
         }
     }
 }
-// Regular matrix multiplication worker
-fn matmulWorker(ctx: ThreadContext) void {
+
+// Task function for matrix multiplication
+fn tileTask(ctx: *TileTaskContext) void {
     @setFloatMode(.optimized);
     @setRuntimeSafety(false);
 
@@ -382,7 +386,7 @@ fn matmulWorker(ctx: ThreadContext) void {
         var k: usize = 0;
         while (k < ctx.K) : (k += T) {
             const k_end = @min(k + T, ctx.K);
-            computeTileTransposed(ctx, &local_C, i_start, j_start, k, i_end, j_end, k_end);
+            computeTileTransposed(ctx.*, &local_C, i_start, j_start, k, i_end, j_end, k_end);
         }
 
         // Store results
@@ -426,12 +430,18 @@ pub fn matmul(a: Tensor(f16), b_transposed: Tensor(f16), allocator: Allocator) !
     const B_t_data = b_transposed.getSlice();
     const C_data = result.getSlice();
 
+    // Make sure the global thread pool is initialized
+    const pool = try global_thread_pool.getInstance();
+
     // Special fast path for vector-matrix multiplication
     if (M == 1) {
         const chunk_size = 32;
         var shared_data = ThreadLocalData{ .current_index = atomic.Value(usize).init(0) };
 
-        const vec_context = VectorThreadContext{
+        const vec_context = try allocator.create(VectorTaskContext);
+        defer allocator.destroy(vec_context);
+
+        vec_context.* = VectorTaskContext{
             .A = A_data,
             .B_t = B_t_data,
             .C = C_data,
@@ -442,15 +452,16 @@ pub fn matmul(a: Tensor(f16), b_transposed: Tensor(f16), allocator: Allocator) !
             .shared_counter = &shared_data,
         };
 
-        const num_threads = try std.Thread.getCpuCount();
-        var thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, num_threads);
-        defer thread_pool.deinit();
+        // Submit tasks to the global thread pool
+        const num_threads = pool.workers.len;
+        const task_count = @min(num_threads, vec_context.total_chunks);
 
-        for (0..num_threads) |_| {
-            try thread_pool.append(try std.Thread.spawn(.{}, vectorWorker, .{vec_context}));
+        for (0..task_count) |_| {
+            try global_thread_pool.submitTask(VectorTaskContext, vectorChunkTask, vec_context);
         }
 
-        for (thread_pool.items) |thread| thread.join();
+        // Wait for all tasks to complete
+        try global_thread_pool.waitForAll();
         return result;
     }
 
@@ -461,7 +472,10 @@ pub fn matmul(a: Tensor(f16), b_transposed: Tensor(f16), allocator: Allocator) !
 
     var shared_data = ThreadLocalData{ .current_index = atomic.Value(usize).init(0) };
 
-    const context = ThreadContext{
+    const tile_context = try allocator.create(TileTaskContext);
+    defer allocator.destroy(tile_context);
+
+    tile_context.* = TileTaskContext{
         .A = A_data,
         .B_t = B_t_data,
         .C = C_data,
@@ -474,15 +488,16 @@ pub fn matmul(a: Tensor(f16), b_transposed: Tensor(f16), allocator: Allocator) !
         .shared_counter = &shared_data,
     };
 
-    const num_threads = try std.Thread.getCpuCount();
-    var thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, num_threads);
-    defer thread_pool.deinit();
+    // Submit tasks to the global thread pool
+    const num_threads = pool.workers.len;
+    const task_count = @min(num_threads, total_tiles);
 
-    for (0..num_threads) |_| {
-        try thread_pool.append(try std.Thread.spawn(.{}, matmulWorker, .{context}));
+    for (0..task_count) |_| {
+        try global_thread_pool.submitTask(TileTaskContext, tileTask, tile_context);
     }
 
-    for (thread_pool.items) |thread| thread.join();
+    // Wait for all tasks to complete
+    try global_thread_pool.waitForAll();
 
     return result;
 }
@@ -492,12 +507,18 @@ fn matmulImpl(allocator: Allocator, a: []const f16, b_t: []const f16, c: []f16, 
     @setFloatMode(.optimized);
     @setRuntimeSafety(false);
 
+    // Make sure the global thread pool is initialized
+    const pool = try global_thread_pool.getInstance();
+
     // Fast path for vector-matrix multiplication
     if (M == 1) {
         const chunk_size = 32;
         var shared_data = ThreadLocalData{ .current_index = atomic.Value(usize).init(0) };
 
-        const vec_context = VectorThreadContext{
+        const vec_context = try allocator.create(VectorTaskContext);
+        defer allocator.destroy(vec_context);
+
+        vec_context.* = VectorTaskContext{
             .A = a,
             .B_t = b_t,
             .C = c,
@@ -508,15 +529,16 @@ fn matmulImpl(allocator: Allocator, a: []const f16, b_t: []const f16, c: []f16, 
             .shared_counter = &shared_data,
         };
 
-        const num_threads = try std.Thread.getCpuCount();
-        var thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, num_threads);
-        defer thread_pool.deinit();
+        // Submit tasks to the global thread pool
+        const num_threads = pool.workers.len;
+        const task_count = @min(num_threads, vec_context.total_chunks);
 
-        for (0..num_threads) |_| {
-            try thread_pool.append(try std.Thread.spawn(.{}, vectorWorker, .{vec_context}));
+        for (0..task_count) |_| {
+            try global_thread_pool.submitTask(VectorTaskContext, vectorChunkTask, vec_context);
         }
 
-        for (thread_pool.items) |thread| thread.join();
+        // Wait for all tasks to complete
+        try global_thread_pool.waitForAll();
         return;
     }
 
@@ -527,7 +549,10 @@ fn matmulImpl(allocator: Allocator, a: []const f16, b_t: []const f16, c: []f16, 
 
     var shared_data = ThreadLocalData{ .current_index = atomic.Value(usize).init(0) };
 
-    const context = ThreadContext{
+    const tile_context = try allocator.create(TileTaskContext);
+    defer allocator.destroy(tile_context);
+
+    tile_context.* = TileTaskContext{
         .A = a,
         .B_t = b_t,
         .C = c,
@@ -540,16 +565,18 @@ fn matmulImpl(allocator: Allocator, a: []const f16, b_t: []const f16, c: []f16, 
         .shared_counter = &shared_data,
     };
 
-    const num_threads = try std.Thread.getCpuCount();
-    var thread_pool = try std.ArrayList(std.Thread).initCapacity(allocator, num_threads);
-    defer thread_pool.deinit();
+    // Submit tasks to the global thread pool
+    const num_threads = pool.workers.len;
+    const task_count = @min(num_threads, total_tiles);
 
-    for (0..num_threads) |_| {
-        try thread_pool.append(try std.Thread.spawn(.{}, matmulWorker, .{context}));
+    for (0..task_count) |_| {
+        try global_thread_pool.submitTask(TileTaskContext, tileTask, tile_context);
     }
 
-    for (thread_pool.items) |thread| thread.join();
+    // Wait for all tasks to complete
+    try global_thread_pool.waitForAll();
 }
+
 pub fn transpose(allocator: std.mem.Allocator, tensor: Tensor(f16)) !Tensor(f16) {
     @setRuntimeSafety(false);
     @setFloatMode(.optimized);
@@ -613,6 +640,10 @@ pub fn main() !void {
     var slab_reusing_allocator = SlabReusingAllocator(100).init(gpa_allocator);
     defer slab_reusing_allocator.deinit();
     const allocator = slab_reusing_allocator.allocator();
+
+    // Initialize the global thread pool
+    try global_thread_pool.init(allocator);
+    defer global_thread_pool.deinit();
 
     // Print header
     print("\nMatrix Multiplication Benchmark\n", .{});
