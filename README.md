@@ -4,6 +4,9 @@ A custom implementation of the Moondream2 VLM in Zig.
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+## Hire me this summer!
+I am a machine learning engineer specializing in deep learning architecture research and inference optimization on consumer and large-scale hardware. I have research experience in Computer Vision, NLP and Medical AI. If you are looking to hire ML engineers, hit me up!
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -205,8 +208,6 @@ Contributions are welcome! Please feel free to Fork the repository submit a Pull
 - [ ] Batch processing support for higher throughput
 - [ ] AVX-512 kernel optimizations
 
-## Hire me this summer!
-I am a machine learning engineer specializing in deep learning architecture research and inference optimization on consumer and large-scale hardware. I have research experience in Computer Vision, NLP and Medical AI. If you are looking to hire ML engineers, hit me up!
 
 ## Acknowledgements
 
