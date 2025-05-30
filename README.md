@@ -40,7 +40,7 @@ moondream-zig is a high-performance implementation of the Moondream2 vision-lang
 
 ### Prerequisites
 
-- Zig 0.13.0 or later
+- Zig 0.13.0
 - Python 3.10.0 or later
 
 We require some python libraries to run a script that will convert safetensors files into a custom format.
